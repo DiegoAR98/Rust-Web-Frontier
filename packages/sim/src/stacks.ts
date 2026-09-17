@@ -73,6 +73,28 @@ export function removeFromInventory(
   return { slots: next, removed: quantity - remaining };
 }
 
+/**
+ * How much of one item the slot array can still accept: headroom in existing
+ * partial stacks plus every empty slot at the full stack limit. Callers that
+ * change the world before adding (decrementing a node budget, completing a
+ * craft unit) must check this first -- otherwise they pay the cost and
+ * addToInventory reports an overflow that has nowhere to go.
+ *
+ * Exactly predicts addToInventory's overflow: adding this much overflows 0,
+ * adding one more overflows 1.
+ */
+export function countFreeCapacity(slots: Slot[], definitionId: string, stackLimit: number): number {
+  let capacity = 0;
+  for (const slot of slots) {
+    if (slot === null) {
+      capacity += stackLimit;
+    } else if (slot.definitionId === definitionId && stackLimit > 1) {
+      capacity += Math.max(0, stackLimit - slot.quantity);
+    }
+  }
+  return capacity;
+}
+
 /** Sums quantity across every stack of one item. */
 export function countInInventory(slots: Slot[], definitionId: string): number {
   let total = 0;

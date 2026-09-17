@@ -7,6 +7,7 @@ import {
   computeExposureDamage,
   computeExposureIntake,
   computeStarvationDamage,
+  countFreeCapacity,
   countInInventory,
   decayExposure,
   drainCalories,
@@ -317,17 +318,32 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       return { ...base, accepted: false, reasonCode: 'not_found' };
     }
 
-    const { node: nextNode, result } = harvestNode(node, config.yieldPerHit);
-    this.resourceNodes.set(nodeId, nextNode);
-    this.store.saveNodeState(nodeId, config.definitionId, nextNode.remaining);
-
-    if (result.granted <= 0) {
+    // Peek at the harvest before committing it: decrementing the node budget
+    // and then discarding what the backpack cannot hold would destroy the
+    // resource outright (stacks.ts is explicit that overflow must be routed
+    // or the action refused, never dropped).
+    const { result: preview } = harvestNode(node, config.yieldPerHit);
+    if (preview.granted <= 0) {
       return { ...base, accepted: false, reasonCode: 'depleted' };
     }
 
     const stackLimit = getItem(config.definitionId)?.stack ?? 1;
     const currentSlots = this.playerSlots.get(accountId) ?? new Array(BACKPACK_SLOTS).fill(null);
-    const { slots: nextSlots } = addToInventory(currentSlots, config.definitionId, result.granted, stackLimit);
+    if (countFreeCapacity(currentSlots, config.definitionId, stackLimit) < preview.granted) {
+      // GDD section 8: a full pack refuses the gather rather than voiding it.
+      return { ...base, accepted: false, reasonCode: 'insufficient_resources' };
+    }
+
+    const { node: nextNode, result } = harvestNode(node, config.yieldPerHit);
+    this.resourceNodes.set(nodeId, nextNode);
+    this.store.saveNodeState(nodeId, config.definitionId, nextNode.remaining);
+
+    const { slots: nextSlots, overflow } = addToInventory(currentSlots, config.definitionId, result.granted, stackLimit);
+    if (overflow > 0) {
+      // The capacity check above makes this unreachable; failing loudly beats
+      // silently destroying a resource if the two ever disagree.
+      throw new Error(`harvest overflow of ${overflow} ${config.definitionId} despite a capacity check`);
+    }
     this.playerSlots.set(accountId, nextSlots);
     this.store.savePlayerSlots(accountId, nextSlots);
 
@@ -399,17 +415,24 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   /** Advances every account's active crafting entry by dt seconds. */
   private tickCrafting(dt: number): void {
     for (const [accountId, entry] of this.craftingByAccount) {
-      const { entry: nextEntry, producedUnits } = tickQueueEntry(entry, dt, Infinity);
+      const stackLimit = getItem(entry.recipe.outputId)?.stack ?? 1;
+      const currentSlots = this.playerSlots.get(accountId) ?? new Array(BACKPACK_SLOTS).fill(null);
+      // Real capacity, not Infinity: tickQueueEntry only completes units it can
+      // deliver, so a full pack pauses the entry and retains escrow (GDD
+      // section 9) instead of marking units done and dropping their output.
+      const capacity = countFreeCapacity(currentSlots, entry.recipe.outputId, stackLimit);
+      const { entry: nextEntry, producedUnits } = tickQueueEntry(entry, dt, capacity);
 
       if (producedUnits > 0) {
-        const stackLimit = getItem(nextEntry.recipe.outputId)?.stack ?? 1;
-        const currentSlots = this.playerSlots.get(accountId) ?? new Array(BACKPACK_SLOTS).fill(null);
-        const { slots } = addToInventory(
+        const { slots, overflow } = addToInventory(
           currentSlots,
           nextEntry.recipe.outputId,
           producedUnits * nextEntry.recipe.outputQuantityPerUnit,
           stackLimit,
         );
+        if (overflow > 0) {
+          throw new Error(`craft overflow of ${overflow} ${nextEntry.recipe.outputId} despite a capacity check`);
+        }
         this.playerSlots.set(accountId, slots);
         this.store.savePlayerSlots(accountId, slots);
         this.clientsByAccount.get(accountId)?.send('inventory', { slots });
@@ -435,6 +458,19 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   /** Test-only: advances crafting by dt seconds directly, bypassing the real tick timer. */
   advanceCraftingForTest(dt: number): void {
     this.tickCrafting(dt);
+  }
+
+  /** Test-only read accessors; no client-facing binding. */
+  nodeRemainingForTest(nodeId: string): number | undefined {
+    return this.resourceNodes.get(nodeId)?.remaining;
+  }
+
+  countForTest(accountId: string, definitionId: string): number {
+    return countInInventory(this.playerSlots.get(accountId) ?? [], definitionId);
+  }
+
+  craftingEntryForTest(accountId: string): QueueEntry | undefined {
+    return this.craftingByAccount.get(accountId);
   }
 
   private tick(dt: number): void {
