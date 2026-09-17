@@ -3,6 +3,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import appConfig from '@rwf/server/app.config';
 import { PROTOCOL_VERSION } from '@rwf/protocol';
 import { WALK_SPEED } from '@rwf/sim';
+import { MOVE_INTENT_GRACE_TICKS, TICK_RATE_HZ } from '@rwf/server/world-room';
 
 let colyseus: ColyseusTestServer;
 
@@ -67,9 +68,18 @@ describe('WorldRoom movement (T01)', () => {
     const observedMover = observer.state.players.get('acct_a');
     expect(observedMover).toBeDefined();
     expect(observedMover!.z).toBeGreaterThan(0);
-    // Two 50ms ticks at WALK_SPEED bound the maximum legal displacement,
-    // regardless of what the client claimed in its command.
-    expect(observedMover!.z).toBeLessThanOrEqual(WALK_SPEED * 0.1 + 1e-6);
+    // The point of the assertion is that the server integrates its own
+    // movement at its own speed rather than trusting whatever the client
+    // claimed -- so bound it by something the server actually guarantees.
+    //
+    // One move command stays live for at most MOVE_INTENT_GRACE_TICKS + 1
+    // ticks before expiry neutralizes it (see expireStaleMoveIntents), so
+    // that, times WALK_SPEED, is the most displacement one command can ever
+    // buy. A bound of exactly two ticks would instead be a bet on scheduler
+    // timing, and would fail whenever a third tick slipped in.
+    const maxTicksOneCommandCanDrive = MOVE_INTENT_GRACE_TICKS + 1;
+    const maxDisplacement = WALK_SPEED * (maxTicksOneCommandCanDrive / TICK_RATE_HZ);
+    expect(observedMover!.z).toBeLessThanOrEqual(maxDisplacement + 1e-6);
 
     mover.leave();
     observer.leave();

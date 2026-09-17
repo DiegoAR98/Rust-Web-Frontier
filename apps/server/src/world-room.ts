@@ -31,7 +31,7 @@ import { WorldStore, type Vec3 } from './persistence.js';
 import { PlayerState, WorldItemState, WorldState } from './world-state.js';
 
 /** Matches TECHNICAL section 3's simulation budget: 20 fixed ticks/s. */
-const TICK_RATE_HZ = 20;
+export const TICK_RATE_HZ = 20;
 /** TECHNICAL section 7: continuous state checkpoints every 5 seconds. */
 export const CHECKPOINT_INTERVAL_TICKS = 5 * TICK_RATE_HZ;
 /** GDD section 8: 24 backpack slots per player. */
@@ -41,7 +41,7 @@ const BACKPACK_SLOTS = 24;
  * 20Hz (one per tick), so 5 ticks absorbs 250ms of jitter or packet loss
  * before the avatar stops. See expireStaleMoveIntents.
  */
-const MOVE_INTENT_GRACE_TICKS = 5;
+export const MOVE_INTENT_GRACE_TICKS = 5;
 /**
  * Per-resource gather rate (CONTENT section 4). Keyed by the resource
  * produced rather than a node-type ID: today every node producing a given
@@ -214,21 +214,34 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.store.close();
   }
 
-  /** Persists the tick counter and every known player's transform. Public for tests/ops. */
+  /**
+   * Persists the tick counter, every known player's transform and vitals, and
+   * in-flight crafting progress -- TECHNICAL section 7's class-2 continuous
+   * state, checkpointed rather than written per tick. Public for tests/ops.
+   *
+   * One transaction rather than 1 + 2N bare statements: under synchronous =
+   * FULL each statement is its own fsync, so a per-account loop would put a
+   * growing stall on the game-loop thread every 5 seconds.
+   */
   checkpoint(): void {
-    this.store.saveWorldTick(this.state.tick);
-    for (const [accountId, movement] of this.movementByAccount) {
-      this.store.savePlayerCheckpoint(accountId, {
-        x: movement.position.x,
-        y: movement.position.y,
-        z: movement.position.z,
-        yaw: this.state.players.get(accountId)?.yaw ?? 0,
-        grounded: movement.grounded,
-      });
-    }
-    for (const [accountId, vitals] of this.playerVitals) {
-      this.store.savePlayerVitals(accountId, vitals);
-    }
+    this.store.runInTransaction(() => {
+      this.store.saveWorldTick(this.state.tick);
+      for (const [accountId, movement] of this.movementByAccount) {
+        this.store.savePlayerCheckpoint(accountId, {
+          x: movement.position.x,
+          y: movement.position.y,
+          z: movement.position.z,
+          yaw: this.state.players.get(accountId)?.yaw ?? 0,
+          grounded: movement.grounded,
+        });
+      }
+      for (const [accountId, vitals] of this.playerVitals) {
+        this.store.savePlayerVitals(accountId, vitals);
+      }
+      for (const [accountId, entry] of this.craftingByAccount) {
+        this.persistCrafting(accountId, entry);
+      }
+    });
   }
 
   /** Seeds a world item for tests/tools; not a player-facing command. */
@@ -569,9 +582,13 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         this.store.deleteCraftingEntry(accountId);
       } else {
         this.craftingByAccount.set(accountId, nextEntry);
-        // Only write when something actually moved: a paused entry (full pack)
-        // returns unchanged every tick and must not rewrite the row at 20Hz.
-        if (nextEntry !== entry) this.persistCrafting(accountId, nextEntry);
+        // Persist only when a unit actually landed. TECHNICAL section 7:
+        // a delivered unit is class-1 (durable at commit), while a partially
+        // elapsed unit is class-2 continuous state that checkpoint() covers
+        // every 5s. tickQueueEntry returns a fresh object whenever progressS
+        // moves, so writing on every change would put an fsync on the 20Hz
+        // game-loop thread for every crafting player.
+        if (producedUnits > 0) this.persistCrafting(accountId, nextEntry);
       }
     }
   }

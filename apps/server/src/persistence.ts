@@ -309,6 +309,15 @@ export class WorldStore {
     return result;
   }
 
+  /**
+   * Runs several of this store's writes as one commit. Under synchronous =
+   * FULL each bare statement costs an fsync, so a caller writing a row per
+   * account (checkpoint) needs them batched rather than serialized.
+   */
+  runInTransaction(work: () => void): void {
+    this.db.transaction(work)();
+  }
+
   /** Persists the simulation's own tick counter. Never derived from wall-clock time. */
   saveWorldTick(tick: number): void {
     this.db
