@@ -123,13 +123,19 @@ export const MOVE_INTENT_GRACE_TICKS = 5;
  */
 const DEFAULT_YIELD_PER_HIT: Record<string, number> = { wood: 10 };
 /**
- * Client-side placeholder hazard zone (GDD section 6's hot-ore exposure),
- * centered on spawn so it's immediately exercisable without needing real
- * authored terrain/zone geometry yet. No worn-armor protection is modeled
- * (0), since armor doesn't exist until M3.
+ * Placeholder hazard zone (GDD section 6's hot-ore exposure), standing in for
+ * authored zone geometry. No worn-armor protection is modeled (0), since armor
+ * does not exist until M3.
+ *
+ * Deliberately not on the spawn point any more. It was, for convenience, which
+ * meant every new player began taking exposure the instant they joined. GDD
+ * section 12 requires a respawn to be placed "outside structures/hazards", and
+ * there is no reading of that where a first spawn should be worse. Twenty
+ * metres east: still a short walk to exercise, and clear of the seeded item,
+ * the nodes and the stations.
  */
-const HAZARD_ZONE_CENTER = { x: 0, z: 0 };
-const HAZARD_ZONE_RADIUS_M = 5;
+export const HAZARD_ZONE_CENTER = { x: 20, z: 0 };
+export const HAZARD_ZONE_RADIUS_M = 5;
 /** GDD section 5: how far a player can reach to take or hit something. */
 const INTERACT_REACH_M = 2.5;
 /**

@@ -185,6 +185,25 @@ const itemMesh = MeshBuilder.CreateBox('item_1', { size: 0.4 }, scene);
 itemMesh.position.copyFrom(ITEM_WORLD_POSITION);
 itemMesh.material = itemMaterial;
 
+/**
+ * The hot-ore zone (GDD section 6). It used to sit on the spawn point, where
+ * being invisible did not matter because everyone was already in it; now that
+ * a player has to walk to it, an unmarked patch of ground that quietly damages
+ * them would be the worst of both.
+ */
+const HAZARD_ZONE = { x: 20, z: 0, radius: 5 };
+const hazardMaterial = new StandardMaterial('hazardMat', scene);
+hazardMaterial.diffuseColor = new Color3(0.8, 0.45, 0.15);
+hazardMaterial.alpha = 0.35;
+const hazardMesh = MeshBuilder.CreateGround(
+  'hazardZone',
+  { width: HAZARD_ZONE.radius * 2, height: HAZARD_ZONE.radius * 2 },
+  scene,
+);
+hazardMesh.position.set(HAZARD_ZONE.x, 0.02, HAZARD_ZONE.z);
+hazardMesh.material = hazardMaterial;
+hazardMesh.isPickable = false;
+
 const nodeMaterial = new StandardMaterial('nodeMat', scene);
 nodeMaterial.diffuseColor = new Color3(0.4, 0.3, 0.15);
 for (const node of NODES) {
@@ -1108,6 +1127,10 @@ function describeNearest(): string {
   if (station) {
     parts.push(`${station.label} ${Vector3.Distance(camera.position, station.position).toFixed(1)}m`);
   }
+  // Only while it matters: a warning that is always on the screen stops being
+  // read long before the player is standing in the thing it warns about.
+  const toHazard = Math.hypot(camera.position.x - HAZARD_ZONE.x, camera.position.z - HAZARD_ZONE.z);
+  if (toHazard <= HAZARD_ZONE.radius) parts.push('IN THE HOT-ORE ZONE');
   return parts.join('  ');
 }
 
