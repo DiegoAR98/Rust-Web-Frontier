@@ -405,6 +405,8 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
    * structural links and changes whenever a piece goes up or comes down.
    */
   private readonly buildAccess = new Map<string, Set<string>>();
+  /** Invalidated whenever a piece goes up or a door swings; see barriers(). */
+  private barrierCache: GroundSegment[] | null = null;
 
   onCreate(): void {
     // TECHNICAL section 17: the world keeps running even when nobody is
@@ -555,6 +557,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     // GDD section 10: "Permissions persist and can be revoked immediately."
     for (const [key, list] of this.store.loadDoorAccess()) this.doorAccess.set(key, list);
     for (const [owner, list] of this.store.loadBuildAccess()) this.buildAccess.set(owner, list);
+    this.barrierCache = null;
     // Rebuilt after every piece is back, because a link needs both ends to
     // exist and the rows come out of SQLite in no particular order.
     for (const [key, piece] of this.buildingPieces) {
@@ -1217,6 +1220,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       if (linkedSiteKeys(other.site).includes(key)) this.linkPieces(key, otherKey);
     }
 
+    this.barrierCache = null; // a new wall or doorway changes what blocks a reach
     const replicated = new BuildingPieceState();
     replicated.definitionId = definitionId;
     replicated.ownerAccountId = accountId;
@@ -1286,7 +1290,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     if (!this.mayBuildOn(accountId, this.buildingFrom([key]))) {
       return { ...base, accepted: false, reasonCode: 'forbidden' };
     }
-    if (!this.isWithinReach(accountId, worldPositionOf(site) as Vec3)) {
+    if (!this.canReachThrough(accountId, worldPositionOf(site) as Vec3)) {
       return { ...base, accepted: false, reasonCode: 'out_of_range' };
     }
 
@@ -1305,6 +1309,8 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       installedAtTick: this.state.tick,
     });
 
+    // A doorway that now holds a shut door blocks reaches it did not before.
+    this.barrierCache = null;
     const placedHp = DOOR_PLACED_HP[definitionId] ?? 0;
     const replicated = new DoorState();
     replicated.definitionId = definitionId;
@@ -1355,7 +1361,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     const key = siteKey(site);
     const door = this.doors.get(key);
     if (!door) return { ...base, accepted: false, reasonCode: 'not_found' };
-    if (!this.isWithinReach(accountId, worldPositionOf(site) as Vec3)) {
+    if (!this.canReachThrough(accountId, worldPositionOf(site) as Vec3)) {
       return { ...base, accepted: false, reasonCode: 'out_of_range' };
     }
     if (!this.mayOperateDoor(accountId, key)) {
@@ -1363,6 +1369,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     }
 
     door.open = open;
+    this.barrierCache = null;
     const replicated = this.state.doors.get(key);
     if (replicated) replicated.open = open;
     this.store.saveDoor(key, {
@@ -1392,7 +1399,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     if (!door) return { ...base, accepted: false, reasonCode: 'not_found' };
     // Only the owner hands out keys; a guest cannot invite their friends in.
     if (door.ownerAccountId !== accountId) return { ...base, accepted: false, reasonCode: 'forbidden' };
-    if (!this.isWithinReach(accountId, worldPositionOf(site) as Vec3)) {
+    if (!this.canReachThrough(accountId, worldPositionOf(site) as Vec3)) {
       return { ...base, accepted: false, reasonCode: 'out_of_range' };
     }
 
@@ -1450,7 +1457,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   ): { definitionId: string; ownerAccountId: string; position: Point3; placedAtTick: number; slots: Slot[] } | CommandResult['reasonCode'] {
     const deployable = this.deployables.get(containerId);
     if (!deployable) return 'not_found';
-    if (!this.isWithinReach(accountId, { ...deployable.position })) return 'out_of_range';
+    if (!this.canReachThrough(accountId, { ...deployable.position })) return 'out_of_range';
     return deployable;
   }
 
@@ -1676,7 +1683,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     const base = { sequence, serverTick: this.state.tick };
     const corpse = this.corpses.get(corpseId);
     if (!corpse) return { ...base, accepted: false, reasonCode: 'not_found' };
-    if (!this.isWithinReach(accountId, { ...corpse.position })) {
+    if (!this.canReachThrough(accountId, { ...corpse.position })) {
       return { ...base, accepted: false, reasonCode: 'out_of_range' };
     }
 
@@ -2070,19 +2077,31 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
    * absorbs the latency between the client deciding it is in range and the
    * command landing.
    */
+  /** Plain distance. What a swing uses; see canReachThrough for the rest. */
   private isWithinReach(accountId: string, target: Vec3): boolean {
     const movement = this.movementByAccount.get(accountId);
     if (!movement) return false;
     const dx = movement.position.x - target.x;
     const dy = movement.position.y + EYE_HEIGHT_M - target.y;
     const dz = movement.position.z - target.z;
-    if (Math.sqrt(dx * dx + dy * dy + dz * dz) > INTERACT_REACH_M + INTERACT_REACH_TOLERANCE_M) {
-      return false;
-    }
-    // T11's "through-wall loot denied". Close enough is not the same as
-    // reachable: without this a base's walls are decoration and its door is
-    // the only thing doing any work, which contradicts GDD section 8's
-    // "doors supply security".
+    return Math.sqrt(dx * dx + dy * dy + dz * dz) <= INTERACT_REACH_M + INTERACT_REACH_TOLERANCE_M;
+  }
+
+  /**
+   * Distance *and* a clear line to it. T11's "through-wall loot denied":
+   * close enough is not the same as reachable, or a base's walls are
+   * decoration and its door is the only thing doing any work, which
+   * contradicts GDD section 8's "doors supply security".
+   *
+   * Used by everything that reaches *for* something -- containers, corpses,
+   * stations, doors and world items. Swings deliberately do not: GDD has no
+   * rule against hitting what is on the far side of a wall, and T20's "no
+   * wall attacks" constrains animals rather than players, so denying it would
+   * be inventing a rule. It also keeps the wall scan off the 20 Hz swing path.
+   */
+  private canReachThrough(accountId: string, target: Vec3): boolean {
+    if (!this.isWithinReach(accountId, target)) return false;
+    const movement = this.movementByAccount.get(accountId)!;
     return !isReachBlocked(movement.position, target, this.barriers());
   }
 
@@ -2090,8 +2109,13 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
    * The walls standing between people and things. A doorway counts only while
    * it holds a shut door: GDD section 10 says "a door left open lets anyone
    * walk through", and an empty frame is a hole rather than security.
+   *
+   * Cached, because the list only changes when a piece goes up or a door
+   * swings, and rebuilding it per reach check would put a full scan of every
+   * wall in the world on each one.
    */
   private barriers(): GroundSegment[] {
+    if (this.barrierCache) return this.barrierCache;
     const segments: GroundSegment[] = [];
     for (const [key, piece] of this.buildingPieces) {
       if (piece.site.form === 'wall') {
@@ -2102,6 +2126,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       const door = this.doors.get(key);
       if (door && !door.open) segments.push(wallSegment(piece.site));
     }
+    this.barrierCache = segments;
     return segments;
   }
 
@@ -2437,7 +2462,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     const station = this.stations.get(stationId);
     const config = this.stationConfigs.get(stationId);
     if (!station || !config) return 'not_found';
-    if (!this.isWithinReach(accountId, config.position)) return 'out_of_range';
+    if (!this.canReachThrough(accountId, config.position)) return 'out_of_range';
     return { station, config };
   }
 
@@ -2574,7 +2599,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     const position = this.itemPositions.get(itemInstanceId);
     // Checked before the claim so an out-of-reach attempt neither takes the
     // item nor reveals whether it was still unclaimed.
-    if (position && !this.isWithinReach(accountId, position)) {
+    if (position && !this.canReachThrough(accountId, position)) {
       return { ...base, accepted: false, reasonCode: 'out_of_range' };
     }
 

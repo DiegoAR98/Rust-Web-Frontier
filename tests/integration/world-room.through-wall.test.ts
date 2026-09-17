@@ -181,29 +181,43 @@ describe('WorldRoom reaching through a wall (T11)', () => {
     raider.leave();
   });
 
-  it('denies a raider the door handle through the wall beside it', async () => {
-    // The same rule has to cover the door itself, or a raider standing
-    // outside can work the lock they cannot reach.
+  it('denies even the owner their own door handle through a different wall', async () => {
+    // The occlusion rule has to cover the door commands too. Tested against
+    // the owner on purpose: a stranger would be refused by the access list
+    // whatever the geometry said, so only the owner can show that it was the
+    // wall that stopped them.
     const room = (await colyseus.createRoom('world', {})) as WorldRoom;
     const owner = await wallUp(room, 'acct_handle', DOORWAY, 'wood_doorway');
     room.teleportForTest('acct_handle', { x: 42, y: 0, z: 41 });
     room.grantForTest('acct_handle', 'wood_door', 1);
     owner.send('command', command({ type: 'installDoor', definitionId: 'wood_door', ...DOORWAY }));
-    await owner.waitForMessage('commandResult');
+    expect((await owner.waitForMessage('commandResult')).accepted).toBe(true);
 
-    // Around the side, with the z-edge wall of the neighbouring cell between.
-    const raider = await at(room, 'acct_reach', { x: 42, y: 0, z: 39 });
-    raider.send('command', command({ type: 'operateDoor', open: true, ...DOORWAY }));
-    const result = await raider.waitForMessage('commandResult');
+    // A second wall along the cell's x = 40 edge, which needs the pillar at
+    // its far corner.
+    room.grantForTest('acct_handle', 'wood_pillar', 1);
+    room.grantForTest('acct_handle', 'wood_wall', 1);
+    owner.send(
+      'command',
+      command({ type: 'placeBuildingPiece', definitionId: 'wood_pillar', form: 'pillar', storey: 0, i: CELL.i, k: CELL.k + 1, axis: null }),
+    );
+    expect((await owner.waitForMessage('commandResult')).accepted).toBe(true);
+    owner.send(
+      'command',
+      command({ type: 'placeBuildingPiece', definitionId: 'wood_wall', form: 'wall', storey: 0, i: CELL.i, k: CELL.k, axis: 'z' }),
+    );
+    expect((await owner.waitForMessage('commandResult')).accepted).toBe(true);
+
+    // West of that wall, close enough to the door to reach it in open ground.
+    room.teleportForTest('acct_handle', { x: 39.5, y: 0, z: 41 });
+    owner.send('command', command({ type: 'operateDoor', open: true, ...DOORWAY }));
+    const result = await owner.waitForMessage('commandResult');
 
     expect(result.accepted).toBe(false);
-    // Forbidden, not out of range: the door's own site is on the wall line,
-    // so what stops them is the access list, which is the point of a door.
-    expect(result.reasonCode).toBe('forbidden');
+    expect(result.reasonCode).toBe('out_of_range');
     expect(room.doorForTest(DOORWAY)!.open).toBe(false);
 
     owner.leave();
-    raider.leave();
   });
 });
 
@@ -226,6 +240,30 @@ describe('WorldRoom reaching a corpse through a wall (T11)', () => {
 
     owner.leave();
     raider.leave();
+  });
+});
+
+/**
+ * Occlusion is for reaching *for* things. GDD gives no rule against swinging
+ * at what is on the other side of a wall, and T20's "no wall attacks" is a
+ * constraint on animals rather than on players -- so the swing commands stay
+ * on the plain distance check.
+ */
+describe('WorldRoom swinging near a wall (D64)', () => {
+  it('still lets a player hit a node on the far side of their own wall', async () => {
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const owner = await wallUp(room, 'acct_swing', WALL, 'wood_wall');
+    // A wood pile just outside the wall, with the player just inside it.
+    room.spawnNode('node_wall', 'wood', 150, 10, { x: 42, y: 0.5, z: 39 });
+    room.teleportForTest('acct_swing', { x: 42, y: 0, z: 41 });
+
+    owner.send('command', command({ type: 'hitNode', nodeId: 'node_wall' }));
+    const result = await owner.waitForMessage('commandResult');
+
+    expect(result.accepted, result.reasonCode).toBe(true);
+    expect(room.countForTest('acct_swing', 'wood')).toBeGreaterThan(0);
+
+    owner.leave();
   });
 });
 
