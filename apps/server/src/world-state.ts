@@ -73,6 +73,27 @@ export const CorpseState = schema(
 );
 export type CorpseState = SchemaType<typeof CorpseState>;
 
+/**
+ * A placed deployable (GDD section 10). Existence, position, owner and health
+ * are public -- a crate is something anyone can walk up to, and section 8 is
+ * explicit that "boxes are not magically private". Its contents are not here:
+ * they travel as targeted messages like every other container (TECHNICAL
+ * section 3). The owner is carried for the per-owner cap and for decay, not
+ * for access control.
+ */
+export const DeployableState = schema(
+  {
+    definitionId: t.string().default(''),
+    ownerAccountId: t.string().default(''),
+    x: t.number().default(0),
+    y: t.number().default(0),
+    z: t.number().default(0),
+    health: t.number().default(0),
+  },
+  'DeployableState',
+);
+export type DeployableState = SchemaType<typeof DeployableState>;
+
 export const WorldState = schema(
   {
     players: t.map(PlayerState),
@@ -80,6 +101,7 @@ export const WorldState = schema(
     creatures: t.map(CreatureState),
     carcasses: t.map(CarcassState),
     corpses: t.map(CorpseState),
+    deployables: t.map(DeployableState),
     tick: t.number().default(0),
   },
   'WorldState',

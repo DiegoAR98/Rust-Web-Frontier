@@ -1,6 +1,6 @@
 import { Room, type Client } from '@colyseus/core';
 import { CommandSchema, type Command, type CommandResult } from '@rwf/protocol';
-import { getConsumable, getItem, getRecipe } from '@rwf/content';
+import { getConsumable, getDeployable, getItem, getRecipe } from '@rwf/content';
 import {
   addToInventory,
   applyBleedWound,
@@ -10,6 +10,7 @@ import {
   CORPSE_SLOTS,
   chooseRespawnAnchor,
   pageOverflowIn,
+  validateDeployablePlacement,
   type CorpseInventory,
   type ItemStack,
   type RespawnAnchor,
@@ -70,6 +71,7 @@ import {
   CarcassState,
   CorpseState,
   CreatureState,
+  DeployableState,
   PlayerState,
   WorldItemState,
   WorldState,
@@ -333,6 +335,16 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private readonly deadAccounts = new Map<string, number>();
   /** Who is currently standing over which corpse; see sendCorpsesToArrivals. */
   private readonly corpseViewers = new Map<string, Set<string>>();
+  /**
+   * Placed deployables (GDD section 10). Contents stay here rather than on the
+   * schema, the same as stations and corpses (TECHNICAL section 3).
+   */
+  private readonly deployables = new Map<
+    string,
+    { definitionId: string; ownerAccountId: string; position: Point3; placedAtTick: number; slots: Slot[] }
+  >();
+  private readonly deployableViewers = new Map<string, Set<string>>();
+  private nextDeployableId = 1;
 
   onCreate(): void {
     // TECHNICAL section 17: the world keeps running even when nobody is
@@ -404,6 +416,31 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       replicated.y = record.position.y;
       replicated.z = record.position.z;
       this.state.corpses.set(corpseId, replicated);
+    }
+    for (const [deployableId, record] of this.store.loadDeployables()) {
+      const definition = getDeployable(record.definitionId);
+      if (!definition) continue; // a deployable kind that left CONTENT; leave the row alone
+      this.deployables.set(deployableId, {
+        definitionId: record.definitionId,
+        ownerAccountId: record.ownerAccountId,
+        position: record.position,
+        placedAtTick: record.placedAtTick,
+        slots: padSlots(record.slots, definition.slots),
+      });
+      const replicated = new DeployableState();
+      replicated.definitionId = record.definitionId;
+      replicated.ownerAccountId = record.ownerAccountId;
+      replicated.x = record.position.x;
+      replicated.y = record.position.y;
+      replicated.z = record.position.z;
+      replicated.health = record.health;
+      this.state.deployables.set(deployableId, replicated);
+      // Keep issuing fresh ids after a restart rather than colliding with a
+      // restored one.
+      const restoredNumber = Number(deployableId.replace('deployable_', ''));
+      if (Number.isFinite(restoredNumber)) {
+        this.nextDeployableId = Math.max(this.nextDeployableId, restoredNumber + 1);
+      }
     }
     for (const [accountId, diedAtTick] of this.store.loadDeadAccounts()) {
       // The checkpoint above restored a live body for every account with a
@@ -858,6 +895,216 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     // Tells whoever was standing over it that it is gone, then forgets them;
     // a viewer set that outlived its corpse would leak one entry per death.
     this.sendCorpse(corpseId);
+  }
+
+  /**
+   * GDD section 10's placement. The item is consumed only after every rule
+   * passes -- "Reaching a cap produces an understandable error before
+   * consumption", which is the same capacity-before-consume shape hitNode,
+   * takeItem and the station commands already use.
+   */
+  private resolvePlaceDeployable(
+    accountId: string,
+    definitionId: string,
+    position: Point3,
+    sequence: number,
+  ): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    const definition = getDeployable(definitionId);
+    if (!definition) return { ...base, accepted: false, reasonCode: 'not_found' };
+
+    const slots = this.playerSlots.get(accountId) ?? [];
+    if (countInInventory(slots, definitionId) < 1) {
+      return { ...base, accepted: false, reasonCode: 'insufficient_resources' };
+    }
+
+    const movement = this.movementByAccount.get(accountId);
+    if (!movement) return { ...base, accepted: false, reasonCode: 'not_found' };
+
+    // Everything section 10 says a placement must not overlap: other players,
+    // placed deployables, stations and resource anchors. Bodies are excluded
+    // deliberately -- a corpse is temporary, and a crate that cannot be put
+    // down where someone died is a worse rule than one that can.
+    const occupied: Point3[] = [];
+    for (const [otherId, other] of this.movementByAccount) {
+      if (otherId === accountId) continue;
+      occupied.push(other.position);
+    }
+    for (const placed of this.deployables.values()) occupied.push(placed.position);
+    for (const config of this.stationConfigs.values()) occupied.push(config.position);
+    for (const config of this.nodeConfigs.values()) occupied.push(config.position);
+
+    let ownerDeployableCount = 0;
+    for (const placed of this.deployables.values()) {
+      if (placed.ownerAccountId === accountId) ownerDeployableCount += 1;
+    }
+
+    const refusal = validateDeployablePlacement({
+      position,
+      actorPosition: movement.position,
+      reachM: INTERACT_REACH_M + INTERACT_REACH_TOLERANCE_M,
+      occupied,
+      ownerDeployableCount,
+      worldEntityCount: this.deployables.size,
+    });
+    if (refusal === 'out_of_range') return { ...base, accepted: false, reasonCode: 'out_of_range' };
+    if (refusal === 'overlap') return { ...base, accepted: false, reasonCode: 'overlap' };
+    if (refusal) return { ...base, accepted: false, reasonCode: 'cap_reached' };
+
+    const { slots: remaining } = removeFromInventory(slots, definitionId, 1);
+    this.playerSlots.set(accountId, remaining);
+
+    const deployableId = `deployable_${this.nextDeployableId++}`;
+    this.deployables.set(deployableId, {
+      definitionId,
+      ownerAccountId: accountId,
+      position: { ...position },
+      placedAtTick: this.state.tick,
+      slots: new Array(definition.slots).fill(null),
+    });
+
+    const replicated = new DeployableState();
+    replicated.definitionId = definitionId;
+    replicated.ownerAccountId = accountId;
+    replicated.x = position.x;
+    replicated.y = position.y;
+    replicated.z = position.z;
+    replicated.health = definition.placedHp;
+    this.state.deployables.set(deployableId, replicated);
+
+    this.store.runInTransaction(() => {
+      this.store.savePlayerSlots(accountId, remaining);
+      this.persistDeployable(deployableId);
+    });
+    return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  private persistDeployable(deployableId: string): void {
+    const deployable = this.deployables.get(deployableId);
+    if (!deployable) return;
+    this.store.saveDeployable(deployableId, {
+      definitionId: deployable.definitionId,
+      ownerAccountId: deployable.ownerAccountId,
+      position: deployable.position,
+      health: this.state.deployables.get(deployableId)?.health ?? 0,
+      placedAtTick: deployable.placedAtTick,
+      slots: deployable.slots,
+    });
+  }
+
+  /**
+   * A container command's preamble. Reach is the only gate: GDD section 8 says
+   * "Boxes are not magically private. Any person who reaches a box can open
+   * it; doors supply security."
+   */
+  private resolveContainerAccess(
+    accountId: string,
+    containerId: string,
+  ): { definitionId: string; ownerAccountId: string; position: Point3; placedAtTick: number; slots: Slot[] } | CommandResult['reasonCode'] {
+    const deployable = this.deployables.get(containerId);
+    if (!deployable) return 'not_found';
+    if (!this.isWithinReach(accountId, { ...deployable.position })) return 'out_of_range';
+    return deployable;
+  }
+
+  private resolveContainerInsert(
+    accountId: string,
+    containerId: string,
+    definitionId: string,
+    quantity: number,
+    sequence: number,
+  ): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    const access = this.resolveContainerAccess(accountId, containerId);
+    if (typeof access === 'string') return { ...base, accepted: false, reasonCode: access };
+
+    const slots = this.playerSlots.get(accountId) ?? [];
+    const available = Math.min(quantity, countInInventory(slots, definitionId));
+    if (available < 1) return { ...base, accepted: false, reasonCode: 'insufficient_resources' };
+
+    const stackLimit = getItem(definitionId)?.stack ?? 1;
+    const room = countFreeCapacity(access.slots, definitionId, stackLimit);
+    if (room < 1) return { ...base, accepted: false, reasonCode: 'no_space' };
+
+    // Only as much as the crate can hold leaves the pack; the rest stays put
+    // rather than being taken and then dropped.
+    const moving = Math.min(available, room);
+    const { slots: afterRemove } = removeFromInventory(slots, definitionId, moving);
+    access.slots = addToInventory(access.slots, definitionId, moving, stackLimit).slots;
+    this.playerSlots.set(accountId, afterRemove);
+
+    this.store.runInTransaction(() => {
+      this.store.savePlayerSlots(accountId, afterRemove);
+      this.persistDeployable(containerId);
+    });
+    return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  private resolveContainerTake(accountId: string, containerId: string, sequence: number): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    const access = this.resolveContainerAccess(accountId, containerId);
+    if (typeof access === 'string') return { ...base, accepted: false, reasonCode: access };
+
+    const { source, destination, moved } = moveAllThatFits(
+      access.slots,
+      this.playerSlots.get(accountId) ?? new Array(BACKPACK_SLOTS).fill(null),
+      (id) => getItem(id)?.stack ?? 1,
+    );
+    if (moved === 0) {
+      return {
+        ...base,
+        accepted: false,
+        reasonCode: access.slots.some((slot) => slot) ? 'no_space' : 'depleted',
+      };
+    }
+
+    access.slots = source;
+    this.playerSlots.set(accountId, destination);
+    this.store.runInTransaction(() => {
+      this.store.savePlayerSlots(accountId, destination);
+      this.persistDeployable(containerId);
+    });
+    return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  private deployablePayload(containerId: string): unknown {
+    const deployable = this.deployables.get(containerId);
+    return {
+      containerId,
+      definitionId: deployable?.definitionId ?? '',
+      ownerAccountId: deployable?.ownerAccountId ?? '',
+      slots: deployable?.slots ?? [],
+      removed: !deployable,
+    };
+  }
+
+  private sendDeployable(containerId: string): void {
+    const deployable = this.deployables.get(containerId);
+    const payload = this.deployablePayload(containerId);
+    const audience = deployable
+      ? [...this.connectedAccounts].filter((accountId) =>
+          this.isWithinReach(accountId, { ...deployable.position }),
+        )
+      : [...(this.deployableViewers.get(containerId) ?? [])];
+    for (const accountId of audience) {
+      this.clientsByAccount.get(accountId)?.send('container', payload);
+    }
+    if (!deployable) this.deployableViewers.delete(containerId);
+  }
+
+  /** The same arrival rule stations and corpses use: an untouched crate never changes. */
+  private sendDeployablesToArrivals(): void {
+    for (const [containerId, deployable] of this.deployables) {
+      const previous = this.deployableViewers.get(containerId) ?? new Set<string>();
+      const current = new Set<string>();
+      for (const accountId of this.connectedAccounts) {
+        if (!this.isWithinReach(accountId, { ...deployable.position })) continue;
+        current.add(accountId);
+        if (previous.has(accountId)) continue;
+        this.clientsByAccount.get(accountId)?.send('container', this.deployablePayload(containerId));
+      }
+      this.deployableViewers.set(containerId, current);
+    }
   }
 
   /**
@@ -1522,6 +1769,38 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       return;
     }
 
+    if (command.action.type === 'placeDeployable') {
+      const { definitionId, x, y, z } = command.action;
+      const encoded = this.store.commitOutcome(key, () =>
+        JSON.stringify(this.resolvePlaceDeployable(accountId, definitionId, { x, y, z }, command.sequence)),
+      );
+      client.send('commandResult', JSON.parse(encoded) as CommandResult);
+      client.send('inventory', { slots: this.playerSlots.get(accountId) });
+      return;
+    }
+
+    if (command.action.type === 'containerInsert' || command.action.type === 'containerTake') {
+      const action = command.action;
+      const containerId = action.containerId;
+      const encoded = this.store.commitOutcome(key, () =>
+        JSON.stringify(
+          action.type === 'containerInsert'
+            ? this.resolveContainerInsert(
+                accountId,
+                containerId,
+                action.definitionId,
+                action.quantity,
+                command.sequence,
+              )
+            : this.resolveContainerTake(accountId, containerId, command.sequence),
+        ),
+      );
+      client.send('commandResult', JSON.parse(encoded) as CommandResult);
+      client.send('inventory', { slots: this.playerSlots.get(accountId) });
+      this.sendDeployable(containerId);
+      return;
+    }
+
     if (command.action.type === 'corpseTake') {
       const corpseId = command.action.corpseId;
       const encoded = this.store.commitOutcome(key, () =>
@@ -2078,6 +2357,10 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     return this.corpses.get(corpseId);
   }
 
+  containerForTest(containerId: string): Slot[] | undefined {
+    return this.deployables.get(containerId)?.slots;
+  }
+
   corpseIdForTest(ownerAccountId: string): string | undefined {
     return [...this.corpses].find(([, corpse]) => corpse.ownerAccountId === ownerAccountId)?.[0];
   }
@@ -2132,6 +2415,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.expireCarcasses();
     this.expireCorpses();
     this.sendCorpsesToArrivals();
+    this.sendDeployablesToArrivals();
 
     // Before tickSurvival, so a bite landing this tick is reflected in the
     // vitals message that goes out at the end of it.

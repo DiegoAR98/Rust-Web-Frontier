@@ -12,14 +12,21 @@ export interface RecipeDefinition {
   durationS: number;
 }
 
-// Transcribed from CONTENT.md section 2. Starting with the single recipe
-// M1's crafting vertical needs; expand as later milestones need more.
+// Transcribed from CONTENT.md section 2, added as each vertical makes a
+// recipe reachable rather than all at once.
 export const RECIPES: RecipeDefinition[] = [
   {
     id: 'stone_hatchet',
     outputId: 'stone_hatchet',
     outputQuantityPerUnit: 1,
     inputs: { wood: 15, stone: 10 },
+    durationS: 10,
+  },
+  {
+    id: 'small_crate',
+    outputId: 'small_crate',
+    outputQuantityPerUnit: 1,
+    inputs: { wood: 40 },
     durationS: 10,
   },
 ];

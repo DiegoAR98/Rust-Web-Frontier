@@ -100,6 +100,39 @@ interface DeadAccountRow {
   died_at_tick: number;
 }
 
+export interface DeployableRecord {
+  definitionId: string;
+  ownerAccountId: string;
+  position: Vec3;
+  health: number;
+  /**
+   * GDD section 10's demolition window is "120 seconds after placement", and
+   * decay counts from a cluster's activity. Neither is implemented yet, but a
+   * row that never recorded when it was placed cannot acquire the fact later
+   * without a migration.
+   */
+  placedAtTick: number;
+  slots: Slot[];
+}
+
+interface DeployableRow {
+  deployable_id: string;
+  definition_id: string;
+  owner_account_id: string;
+  x: number;
+  y: number;
+  z: number;
+  health: number;
+  placed_at_tick: number;
+}
+
+interface DeployableSlotRow {
+  deployable_id: string;
+  slot_index: number;
+  definition_id: string;
+  quantity: number;
+}
+
 export interface StationRecord {
   kind: StationKind;
   lit: boolean;
@@ -308,6 +341,23 @@ export class WorldStore {
       CREATE TABLE IF NOT EXISTS dead_accounts (
         account_id TEXT PRIMARY KEY,
         died_at_tick INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS deployables (
+        deployable_id TEXT PRIMARY KEY,
+        definition_id TEXT NOT NULL,
+        owner_account_id TEXT NOT NULL,
+        x REAL NOT NULL,
+        y REAL NOT NULL,
+        z REAL NOT NULL,
+        health REAL NOT NULL,
+        placed_at_tick INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS deployable_slots (
+        deployable_id TEXT NOT NULL,
+        slot_index INTEGER NOT NULL,
+        definition_id TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        PRIMARY KEY (deployable_id, slot_index)
       );
     `);
 
@@ -836,6 +886,84 @@ export class WorldStore {
          ON CONFLICT(account_id) DO UPDATE SET died_at_tick = excluded.died_at_tick`,
       )
       .run(accountId, diedAtTick);
+  }
+
+  /**
+   * Replaces a deployable's whole durable state. Class-1 like a station's
+   * (TECHNICAL section 7): a placement consumes an item and an insert is a
+   * committed transfer, so both are on disk at the commit rather than at the
+   * next checkpoint.
+   */
+  saveDeployable(deployableId: string, deployable: DeployableRecord): void {
+    const replace = this.db.transaction((record: DeployableRecord) => {
+      this.db
+        .prepare(
+          `INSERT INTO deployables
+             (deployable_id, definition_id, owner_account_id, x, y, z, health, placed_at_tick)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(deployable_id) DO UPDATE SET
+             definition_id = excluded.definition_id, owner_account_id = excluded.owner_account_id,
+             x = excluded.x, y = excluded.y, z = excluded.z, health = excluded.health,
+             placed_at_tick = excluded.placed_at_tick`,
+        )
+        .run(
+          deployableId,
+          record.definitionId,
+          record.ownerAccountId,
+          record.position.x,
+          record.position.y,
+          record.position.z,
+          record.health,
+          record.placedAtTick,
+        );
+      this.db.prepare('DELETE FROM deployable_slots WHERE deployable_id = ?').run(deployableId);
+      const insert = this.db.prepare(
+        'INSERT INTO deployable_slots (deployable_id, slot_index, definition_id, quantity) VALUES (?, ?, ?, ?)',
+      );
+      record.slots.forEach((slot, index) => {
+        if (slot) insert.run(deployableId, index, slot.definitionId, slot.quantity);
+      });
+    });
+    replace(deployable);
+  }
+
+  deleteDeployable(deployableId: string): void {
+    const remove = this.db.transaction(() => {
+      this.db.prepare('DELETE FROM deployable_slots WHERE deployable_id = ?').run(deployableId);
+      this.db.prepare('DELETE FROM deployables WHERE deployable_id = ?').run(deployableId);
+    });
+    remove();
+  }
+
+  loadDeployables(): Map<string, DeployableRecord> {
+    const rows = this.db
+      .prepare(
+        'SELECT deployable_id, definition_id, owner_account_id, x, y, z, health, placed_at_tick FROM deployables',
+      )
+      .all() as DeployableRow[];
+    const slotRows = this.db
+      .prepare('SELECT deployable_id, slot_index, definition_id, quantity FROM deployable_slots')
+      .all() as DeployableSlotRow[];
+
+    const result = new Map<string, DeployableRecord>();
+    for (const row of rows) {
+      result.set(row.deployable_id, {
+        definitionId: row.definition_id,
+        ownerAccountId: row.owner_account_id,
+        position: { x: row.x, y: row.y, z: row.z },
+        health: row.health,
+        placedAtTick: row.placed_at_tick,
+        // Sparse on purpose: only occupied slots are stored, so the room pads
+        // back out to the definition's slot count when it restores.
+        slots: [],
+      });
+    }
+    for (const slot of slotRows) {
+      const deployable = result.get(slot.deployable_id);
+      if (!deployable) continue;
+      deployable.slots[slot.slot_index] = { definitionId: slot.definition_id, quantity: slot.quantity };
+    }
+    return result;
   }
 
   loadDeadAccounts(): Map<string, number> {

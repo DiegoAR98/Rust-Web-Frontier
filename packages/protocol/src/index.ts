@@ -81,6 +81,39 @@ export const CorpseTakeIntentSchema = z.object({
 });
 export type CorpseTakeIntent = z.infer<typeof CorpseTakeIntentSchema>;
 
+/**
+ * Places a crafted deployable at a point (GDD section 10: "equip it and place
+ * its ghost. A server-accepted placement consumes one item"). The client
+ * proposes where; the server checks reach, spacing and the caps, and is the
+ * only thing that decides whether it happens.
+ */
+export const PlaceDeployableIntentSchema = z.object({
+  type: z.literal('placeDeployable'),
+  definitionId: z.string().min(1).max(64),
+  x: finite(),
+  y: finite(),
+  z: finite(),
+});
+export type PlaceDeployableIntent = z.infer<typeof PlaceDeployableIntentSchema>;
+
+const containerId = () => z.string().min(1).max(64);
+
+/** Moves items from the pack into a placed container (GDD section 8). */
+export const ContainerInsertIntentSchema = z.object({
+  type: z.literal('containerInsert'),
+  containerId: containerId(),
+  definitionId: z.string().min(1).max(64),
+  quantity: z.number().int().min(1).max(250),
+});
+export type ContainerInsertIntent = z.infer<typeof ContainerInsertIntentSchema>;
+
+/** Empties a placed container into the pack, as far as it fits. */
+export const ContainerTakeIntentSchema = z.object({
+  type: z.literal('containerTake'),
+  containerId: containerId(),
+});
+export type ContainerTakeIntent = z.infer<typeof ContainerTakeIntentSchema>;
+
 const stationId = () => z.string().min(1).max(64);
 
 /**
@@ -124,6 +157,9 @@ export const ActionPayloadSchema = z.discriminatedUnion('type', [
   UseItemIntentSchema,
   RespawnIntentSchema,
   CorpseTakeIntentSchema,
+  PlaceDeployableIntentSchema,
+  ContainerInsertIntentSchema,
+  ContainerTakeIntentSchema,
 ]);
 export type ActionPayload = z.infer<typeof ActionPayloadSchema>;
 
@@ -156,6 +192,10 @@ export const REASON_CODES = [
   'dead',
   // ...and a living player has no death to recover from.
   'not_dead',
+  // GDD section 10's placement refusals, kept apart so the ghost can say
+  // which rule it broke rather than just turning red.
+  'overlap',
+  'cap_reached',
 ] as const;
 export type ReasonCode = (typeof REASON_CODES)[number];
 
