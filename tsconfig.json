@@ -3,6 +3,7 @@
   "references": [
     { "path": "packages/protocol" },
     { "path": "packages/sim" },
+    { "path": "packages/content" },
     { "path": "apps/server" },
     { "path": "apps/client" }
   ]
