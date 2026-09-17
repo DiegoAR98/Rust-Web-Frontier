@@ -5,7 +5,9 @@
     "rootDir": "src",
     "composite": true,
     "declaration": true,
-    "types": ["vite/client"]
+    "types": ["vite/client"],
+    "module": "ESNext",
+    "moduleResolution": "bundler"
   },
   "include": ["src"],
   "references": [{ "path": "../../packages/protocol" }]
