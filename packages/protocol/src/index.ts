@@ -35,11 +35,44 @@ export const CraftIntentSchema = z.object({
 });
 export type CraftIntent = z.infer<typeof CraftIntentSchema>;
 
+const stationId = () => z.string().min(1).max(64);
+
+/**
+ * Moves items between the player's pack and a station (CONTENT section 3).
+ * The destination slot is not named: no station in this baseline accepts wood
+ * as an input, so wood can only mean the fuel slot and an ore or a raw food
+ * can only mean an input slot. The server routes it.
+ */
+export const StationInsertIntentSchema = z.object({
+  type: z.literal('stationInsert'),
+  stationId: stationId(),
+  definitionId: z.string().min(1).max(64),
+  // One insert moves at most one stack; CONTENT section 1's largest is 250.
+  quantity: z.number().int().min(1).max(250),
+});
+export type StationInsertIntent = z.infer<typeof StationInsertIntentSchema>;
+
+export const StationTakeIntentSchema = z.object({
+  type: z.literal('stationTake'),
+  stationId: stationId(),
+});
+export type StationTakeIntent = z.infer<typeof StationTakeIntentSchema>;
+
+export const StationLightIntentSchema = z.object({
+  type: z.literal('stationLight'),
+  stationId: stationId(),
+  lit: z.boolean(),
+});
+export type StationLightIntent = z.infer<typeof StationLightIntentSchema>;
+
 export const ActionPayloadSchema = z.discriminatedUnion('type', [
   MoveIntentSchema,
   TakeItemIntentSchema,
   HitNodeIntentSchema,
   CraftIntentSchema,
+  StationInsertIntentSchema,
+  StationTakeIntentSchema,
+  StationLightIntentSchema,
 ]);
 export type ActionPayload = z.infer<typeof ActionPayloadSchema>;
 

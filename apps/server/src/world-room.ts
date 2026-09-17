@@ -24,12 +24,18 @@ import {
   removeFromInventory,
   startQueueEntry,
   stepMovement,
+  stepStation,
   takeItem as simTakeItem,
   tickQueueEntry,
+  FUEL_DEFINITION_ID,
+  STATION_SPECS,
   type MovementState,
   type QueueEntry,
   type ResourceNode,
   type Slot,
+  type StationKind,
+  type StationSpec,
+  type StationState,
   type WorldItem,
 } from '@rwf/sim';
 import { WorldStore, type Vec3 } from './persistence.js';
@@ -102,8 +108,65 @@ interface NodeConfig {
   position: Vec3;
 }
 
+interface StationConfig {
+  kind: StationKind;
+  spec: StationSpec;
+  position: Vec3;
+}
+
 type RoomClient = Client<{ userData: ClientUserData }>;
 type MoveAction = Extract<Command['action'], { type: 'move' }>;
+
+/** Fills a sparse slot array out to a fixed size, empty slots as null. */
+function padSlots(slots: Slot[], size: number): Slot[] {
+  const padded: Slot[] = new Array(size).fill(null);
+  for (let i = 0; i < size; i++) padded[i] = slots[i] ?? null;
+  return padded;
+}
+
+function fuelQuantity(station: StationState): number {
+  return station.fuel?.quantity ?? 0;
+}
+
+/**
+ * Spreads a quantity as evenly as it can across the slots that will take it,
+ * rather than filling the first to its stack limit. A station converts one
+ * unit per input slot per quantum (CONTENT section 3), so where the items land
+ * decides the throughput: 24 ore in one furnace slot smelts at half the rate
+ * of 12 in each, which is why CONTENT's worked example specifies "12 metal_ore
+ * in each input".
+ */
+function spreadAcrossSlots(
+  slots: Slot[],
+  definitionId: string,
+  quantity: number,
+  stackLimit: number,
+): { slots: Slot[]; overflow: number } {
+  const next = slots.slice();
+  let remaining = quantity;
+
+  /** How many of this item a slot holds; Infinity if it is not usable at all. */
+  const heldIn = (slot: Slot | undefined): number => {
+    if (slot === null || slot === undefined) return 0;
+    return slot.definitionId === definitionId ? slot.quantity : Infinity;
+  };
+
+  while (remaining > 0) {
+    let target = -1;
+    let targetHeld = Infinity;
+    for (let i = 0; i < next.length; i++) {
+      const held = heldIn(next[i]);
+      if (held >= stackLimit || held >= targetHeld) continue;
+      target = i;
+      targetHeld = held;
+    }
+    if (target === -1) break; // every slot is full or holds something else
+    next[target] = { definitionId, quantity: targetHeld + 1 };
+    remaining -= 1;
+  }
+
+  return { slots: next, overflow: remaining };
+}
 
 export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private store!: WorldStore;
@@ -119,6 +182,8 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private readonly clientsByAccount = new Map<string, RoomClient>();
   private readonly craftingByAccount = new Map<string, QueueEntry>();
   private readonly lastSwingTick = new Map<string, number>();
+  private readonly stations = new Map<string, StationState>();
+  private readonly stationConfigs = new Map<string, StationConfig>();
 
   onCreate(): void {
     // TECHNICAL section 17: the world keeps running even when nobody is
@@ -176,6 +241,22 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     for (const [accountId, vitals] of this.store.loadPlayerVitals()) {
       this.playerVitals.set(accountId, vitals);
     }
+    for (const [stationId, record] of this.store.loadStations()) {
+      const spec = STATION_SPECS[record.kind];
+      if (!spec) continue; // a station kind that left CONTENT; leave the row alone
+      this.stationConfigs.set(stationId, { kind: record.kind, spec, position: record.position });
+      this.stations.set(stationId, {
+        lit: record.lit,
+        // Only occupied slots are stored, so pad each compartment back out to
+        // the spec's size -- a furnace with one ore left still has two slots.
+        inputs: padSlots(record.inputs, spec.inputSlots),
+        fuel: record.fuel,
+        outputs: padSlots(record.outputs, spec.outputSlots),
+        // Restored rather than reset, so a stopped host resumes the quantum it
+        // was part-way through instead of discarding it (T17).
+        progressS: record.progressS,
+      });
+    }
     for (const [accountId, record] of this.store.loadCraftingEntries()) {
       const recipe = getRecipe(record.recipeId);
       if (!recipe) {
@@ -205,6 +286,15 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     if (!this.resourceNodes.has('node_1')) {
       // CONTENT section 4: wood pile
       this.spawnNode('node_1', 'wood', 150, 10, { x: -2, y: 0.5, z: 2 });
+    }
+    // Placed outside HAZARD_ZONE_RADIUS_M so tending a fire is not also a
+    // stint in the hot-ore zone. Built stations arrive with M2's building
+    // system; until then the world starts with one of each.
+    if (!this.stations.has('furnace_1')) {
+      this.spawnStation('furnace_1', 'furnace', { x: 6, y: 0.5, z: 0 });
+    }
+    if (!this.stations.has('campfire_1')) {
+      this.spawnStation('campfire_1', 'campfire', { x: -6, y: 0.5, z: 0 });
     }
 
     this.onMessage('command', CommandSchema, (client, command) => {
@@ -246,7 +336,29 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       for (const [accountId, entry] of this.craftingByAccount) {
         this.persistCrafting(accountId, entry);
       }
+      for (const [stationId, station] of this.stations) {
+        // Class-2 only: the partially elapsed quantum. Contents were already
+        // written at the commit that changed them.
+        this.store.saveStationProgress(stationId, station.progressS, station.lit);
+      }
     });
+  }
+
+  /** Test-only read/write accessors for the station vertical. */
+  stationForTest(stationId: string): StationState | undefined {
+    return this.stations.get(stationId);
+  }
+
+  setStationOutputsForTest(stationId: string, outputs: Slot[]): void {
+    const station = this.stations.get(stationId);
+    if (!station) return;
+    station.outputs = outputs;
+    this.persistStation(stationId); // seeded like grantForTest: durable, not just in memory
+  }
+
+  /** Test-only: runs the station loop for dt seconds without the real tick timer. */
+  advanceStationsForTest(dt: number): void {
+    this.tickStations(dt);
   }
 
   /** Seeds a world item for tests/tools; not a player-facing command. */
@@ -270,6 +382,36 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.resourceNodes.set(nodeId, { nodeId, remaining: totalBudget });
     this.nodeConfigs.set(nodeId, { definitionId, yieldPerHit, position });
     this.store.saveNodeState(nodeId, definitionId, totalBudget, yieldPerHit, position);
+  }
+
+  /** Seeds a furnace or campfire; not a player-facing command until M2 building. */
+  spawnStation(stationId: string, kind: StationKind, position: Vec3 = { x: 0, y: 0, z: 0 }): void {
+    const spec = STATION_SPECS[kind];
+    const station: StationState = {
+      lit: false,
+      inputs: new Array(spec.inputSlots).fill(null),
+      fuel: null,
+      outputs: new Array(spec.outputSlots).fill(null),
+      progressS: 0,
+    };
+    this.stationConfigs.set(stationId, { kind, spec, position });
+    this.stations.set(stationId, station);
+    this.persistStation(stationId);
+  }
+
+  private persistStation(stationId: string): void {
+    const station = this.stations.get(stationId);
+    const config = this.stationConfigs.get(stationId);
+    if (!station || !config) return;
+    this.store.saveStation(stationId, {
+      kind: config.kind,
+      lit: station.lit,
+      progressS: station.progressS,
+      position: config.position,
+      inputs: station.inputs,
+      fuel: station.fuel,
+      outputs: station.outputs,
+    });
   }
 
   /**
@@ -401,13 +543,178 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       return;
     }
 
-    const { recipeId, quantity } = command.action;
-    const encoded = this.store.commitOutcome(key, () =>
-      JSON.stringify(this.resolveCraft(accountId, recipeId, quantity, command.sequence)),
-    );
+    if (command.action.type === 'craft') {
+      const { recipeId, quantity } = command.action;
+      const encoded = this.store.commitOutcome(key, () =>
+        JSON.stringify(this.resolveCraft(accountId, recipeId, quantity, command.sequence)),
+      );
+      client.send('commandResult', JSON.parse(encoded) as CommandResult);
+      client.send('inventory', { slots: this.playerSlots.get(accountId) });
+      this.sendCrafting(accountId);
+      return;
+    }
+
+    // The three station commands (CONTENT section 3). Insert and take move
+    // items, so they are transactions like takeItem and craft and go through
+    // commitOutcome; lighting is keyed the same way purely for uniformity.
+    const action = command.action;
+    const stationId = action.stationId;
+    const encoded = this.store.commitOutcome(key, () => {
+      if (action.type === 'stationInsert') {
+        return JSON.stringify(
+          this.resolveStationInsert(accountId, stationId, action.definitionId, action.quantity, command.sequence),
+        );
+      }
+      if (action.type === 'stationTake') {
+        return JSON.stringify(this.resolveStationTake(accountId, stationId, command.sequence));
+      }
+      return JSON.stringify(this.resolveStationLight(accountId, stationId, action.lit, command.sequence));
+    });
     client.send('commandResult', JSON.parse(encoded) as CommandResult);
     client.send('inventory', { slots: this.playerSlots.get(accountId) });
-    this.sendCrafting(accountId);
+    this.sendStation(stationId);
+  }
+
+  /** A station command's common preamble: it must exist and be within arm's reach. */
+  private resolveStationAccess(
+    accountId: string,
+    stationId: string,
+  ): { station: StationState; config: StationConfig } | CommandResult['reasonCode'] {
+    const station = this.stations.get(stationId);
+    const config = this.stationConfigs.get(stationId);
+    if (!station || !config) return 'not_found';
+    if (!this.isWithinReach(accountId, config.position)) return 'out_of_range';
+    return { station, config };
+  }
+
+  /**
+   * Moves items from the player's pack into a station. The destination slot is
+   * inferred, not chosen: wood is fuel and nothing else (CONTENT section 3's
+   * "no charcoal duplication from simultaneously counting wood as input and
+   * fuel" is exactly that rule), and anything the spec converts is an input.
+   * Inputs spread evenly across the station's input slots, because each slot
+   * converts one unit per quantum -- piling 24 ore into one furnace slot would
+   * halve the throughput CONTENT's worked example expects. A real per-slot
+   * station UI arrives with M2's containers.
+   */
+  private resolveStationInsert(
+    accountId: string,
+    stationId: string,
+    definitionId: string,
+    quantity: number,
+    sequence: number,
+  ): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    const access = this.resolveStationAccess(accountId, stationId);
+    if (typeof access === 'string') return { ...base, accepted: false, reasonCode: access };
+    const { station, config } = access;
+
+    const isFuel = definitionId === FUEL_DEFINITION_ID;
+    if (!isFuel && !config.spec.conversions[definitionId]) {
+      return { ...base, accepted: false, reasonCode: 'not_found' };
+    }
+
+    const slots = this.playerSlots.get(accountId) ?? new Array(BACKPACK_SLOTS).fill(null);
+    if (countInInventory(slots, definitionId) < quantity) {
+      return { ...base, accepted: false, reasonCode: 'insufficient_resources' };
+    }
+
+    const stackLimit = getItem(definitionId)?.stack ?? 1;
+    // Capacity first: taking the items out of the pack and then discovering
+    // the station is full would destroy them.
+    const destination = isFuel
+      ? addToInventory([station.fuel], definitionId, quantity, stackLimit)
+      : spreadAcrossSlots(station.inputs, definitionId, quantity, stackLimit);
+    if (destination.overflow > 0) {
+      return { ...base, accepted: false, reasonCode: 'insufficient_resources' };
+    }
+
+    if (isFuel) {
+      station.fuel = destination.slots[0] ?? null;
+    } else {
+      station.inputs = destination.slots;
+    }
+    this.playerSlots.set(accountId, removeFromInventory(slots, definitionId, quantity).slots);
+    this.store.savePlayerSlots(accountId, this.playerSlots.get(accountId)!);
+    this.persistStation(stationId);
+    return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  /** Empties a station's outputs into the player's pack, as far as they fit. */
+  private resolveStationTake(accountId: string, stationId: string, sequence: number): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    const access = this.resolveStationAccess(accountId, stationId);
+    if (typeof access === 'string') return { ...base, accepted: false, reasonCode: access };
+    const { station } = access;
+
+    let slots = this.playerSlots.get(accountId) ?? new Array(BACKPACK_SLOTS).fill(null);
+    const remaining: Slot[] = [];
+    let moved = 0;
+    for (const slot of station.outputs) {
+      if (!slot) {
+        remaining.push(null);
+        continue;
+      }
+      const stackLimit = getItem(slot.definitionId)?.stack ?? 1;
+      const result = addToInventory(slots, slot.definitionId, slot.quantity, stackLimit);
+      slots = result.slots;
+      moved += slot.quantity - result.overflow;
+      // Whatever will not fit stays in the station rather than being dropped.
+      remaining.push(result.overflow > 0 ? { definitionId: slot.definitionId, quantity: result.overflow } : null);
+    }
+
+    if (moved === 0) {
+      return {
+        ...base,
+        accepted: false,
+        reasonCode: station.outputs.some((slot) => slot) ? 'insufficient_resources' : 'depleted',
+      };
+    }
+
+    station.outputs = remaining;
+    this.playerSlots.set(accountId, slots);
+    this.store.savePlayerSlots(accountId, slots);
+    this.persistStation(stationId);
+    return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  private resolveStationLight(
+    accountId: string,
+    stationId: string,
+    lit: boolean,
+    sequence: number,
+  ): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    const access = this.resolveStationAccess(accountId, stationId);
+    if (typeof access === 'string') return { ...base, accepted: false, reasonCode: access };
+
+    access.station.lit = lit;
+    this.store.saveStationProgress(stationId, access.station.progressS, lit);
+    return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  /**
+   * Station contents are container contents, which TECHNICAL section 3 keeps
+   * off the shared schema, so this is a targeted message -- and only to
+   * players standing at the station, who are the ones who could open it.
+   */
+  private sendStation(stationId: string): void {
+    const station = this.stations.get(stationId);
+    const config = this.stationConfigs.get(stationId);
+    if (!station || !config) return;
+    const payload = {
+      stationId,
+      kind: config.kind,
+      lit: station.lit,
+      progressS: station.progressS,
+      inputs: station.inputs,
+      fuel: station.fuel,
+      outputs: station.outputs,
+    };
+    for (const accountId of this.connectedAccounts) {
+      if (!this.isWithinReach(accountId, config.position)) continue;
+      this.clientsByAccount.get(accountId)?.send('station', payload);
+    }
   }
 
   private resolveTakeItem(accountId: string, itemInstanceId: string, sequence: number): CommandResult {
@@ -731,8 +1038,33 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
 
     this.tickCrafting(dt);
 
+    this.tickStations(dt);
+
     if (this.state.tick % CHECKPOINT_INTERVAL_TICKS === 0) {
       this.checkpoint();
+    }
+  }
+
+  /**
+   * Advances every lit station by dt (CONTENT section 3). Time reaches a
+   * station only through here, so a stopped host stops its fuel exactly as
+   * T17 requires -- there is no wall-clock reading to catch up from.
+   */
+  private tickStations(dt: number): void {
+    for (const [stationId, station] of this.stations) {
+      const config = this.stationConfigs.get(stationId);
+      if (!config) continue;
+
+      const next = stepStation(station, config.spec, (id) => getItem(id)?.stack ?? 1, dt);
+      this.stations.set(stationId, next);
+
+      // A completed quantum always burns exactly one fuel, so this is the
+      // cheapest true test of "did anything actually move". Progress alone is
+      // class-2 continuous state that checkpoint() covers; writing on every
+      // tick would put an fsync on the game loop for each lit station.
+      if (fuelQuantity(next) === fuelQuantity(station)) continue;
+      this.persistStation(stationId);
+      this.sendStation(stationId);
     }
   }
 

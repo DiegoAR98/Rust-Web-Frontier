@@ -105,6 +105,29 @@ describe('CommandSchema', () => {
     ).toBe(false);
   });
 
+  it('accepts the three station commands (T09, CONTENT section 3)', () => {
+    for (const action of [
+      { type: 'stationInsert', stationId: 'furnace_1', definitionId: 'metal_ore', quantity: 12 },
+      { type: 'stationTake', stationId: 'furnace_1' },
+      { type: 'stationLight', stationId: 'furnace_1', lit: true },
+    ]) {
+      expect(CommandSchema.safeParse(validMoveCommand({ action })).success).toBe(true);
+    }
+  });
+
+  it('rejects a station insert quantity outside one stack', () => {
+    // CONTENT section 1's largest stack is 250; an insert moves at most one.
+    for (const quantity of [0, 251, 1.5]) {
+      expect(
+        CommandSchema.safeParse(
+          validMoveCommand({
+            action: { type: 'stationInsert', stationId: 'furnace_1', definitionId: 'wood', quantity },
+          }),
+        ).success,
+      ).toBe(false);
+    }
+  });
+
   it('rejects an unknown action type', () => {
     const result = CommandSchema.safeParse(
       validMoveCommand({ action: { type: 'noclip', itemInstanceId: 'item_123' } }),

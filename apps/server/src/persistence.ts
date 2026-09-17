@@ -1,7 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import Database from 'better-sqlite3';
-import type { Slot, TransactionKey } from '@rwf/sim';
+import type { Slot, StationKind, TransactionKey } from '@rwf/sim';
 
 interface SessionRow {
   epoch: number;
@@ -51,6 +51,34 @@ interface ItemClaimRow {
   x: number;
   y: number;
   z: number;
+}
+
+export interface StationRecord {
+  kind: StationKind;
+  lit: boolean;
+  progressS: number;
+  position: Vec3;
+  inputs: Slot[];
+  fuel: Slot;
+  outputs: Slot[];
+}
+
+interface StationRow {
+  station_id: string;
+  kind: string;
+  lit: number;
+  progress_s: number;
+  x: number;
+  y: number;
+  z: number;
+}
+
+interface StationSlotRow {
+  station_id: string;
+  compartment: string;
+  slot_index: number;
+  definition_id: string;
+  quantity: number;
 }
 
 export interface NodeState {
@@ -189,6 +217,23 @@ export class WorldStore {
         calories REAL NOT NULL,
         health REAL NOT NULL,
         exposure REAL NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS stations (
+        station_id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        lit INTEGER NOT NULL,
+        progress_s REAL NOT NULL,
+        x REAL NOT NULL DEFAULT 0,
+        y REAL NOT NULL DEFAULT 0,
+        z REAL NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS station_slots (
+        station_id TEXT NOT NULL,
+        compartment TEXT NOT NULL,
+        slot_index INTEGER NOT NULL,
+        definition_id TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        PRIMARY KEY (station_id, compartment, slot_index)
       );
     `);
 
@@ -501,6 +546,91 @@ export class WorldStore {
     const result = new Map<string, PlayerVitals>();
     for (const row of rows) {
       result.set(row.account_id, { calories: row.calories, health: row.health, exposure: row.exposure });
+    }
+    return result;
+  }
+
+  /**
+   * Replaces a station's whole durable state: the row and every occupied slot.
+   * Contents changes are class-1 (TECHNICAL section 7) -- an insert or a take
+   * is a committed transfer, and a delivered output is a produced item -- so
+   * this runs at commit rather than waiting for a checkpoint. The progress
+   * toward the next quantum riding along is class-2 and merely convenient;
+   * saveStationProgress is what the checkpoint calls.
+   */
+  saveStation(stationId: string, station: StationRecord): void {
+    const replace = this.db.transaction((record: StationRecord) => {
+      this.db
+        .prepare(
+          `INSERT INTO stations (station_id, kind, lit, progress_s, x, y, z) VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(station_id) DO UPDATE SET
+             kind = excluded.kind, lit = excluded.lit, progress_s = excluded.progress_s,
+             x = excluded.x, y = excluded.y, z = excluded.z`,
+        )
+        .run(
+          stationId,
+          record.kind,
+          record.lit ? 1 : 0,
+          record.progressS,
+          record.position.x,
+          record.position.y,
+          record.position.z,
+        );
+      this.db.prepare('DELETE FROM station_slots WHERE station_id = ?').run(stationId);
+      const insert = this.db.prepare(
+        'INSERT INTO station_slots (station_id, compartment, slot_index, definition_id, quantity) VALUES (?, ?, ?, ?, ?)',
+      );
+      const write = (compartment: string, slots: Slot[]): void => {
+        slots.forEach((slot, index) => {
+          if (slot) insert.run(stationId, compartment, index, slot.definitionId, slot.quantity);
+        });
+      };
+      write('input', record.inputs);
+      write('fuel', [record.fuel]);
+      write('output', record.outputs);
+    });
+    replace(station);
+  }
+
+  /** Class-2 half only: the partially elapsed quantum and the lit flag. */
+  saveStationProgress(stationId: string, progressS: number, lit: boolean): void {
+    this.db
+      .prepare('UPDATE stations SET progress_s = ?, lit = ? WHERE station_id = ?')
+      .run(progressS, lit ? 1 : 0, stationId);
+  }
+
+  loadStations(): Map<string, StationRecord> {
+    const rows = this.db
+      .prepare('SELECT station_id, kind, lit, progress_s, x, y, z FROM stations')
+      .all() as StationRow[];
+    const slotRows = this.db
+      .prepare('SELECT station_id, compartment, slot_index, definition_id, quantity FROM station_slots')
+      .all() as StationSlotRow[];
+
+    const result = new Map<string, StationRecord>();
+    for (const row of rows) {
+      result.set(row.station_id, {
+        kind: row.kind as StationKind,
+        lit: row.lit !== 0,
+        progressS: row.progress_s,
+        position: { x: row.x, y: row.y, z: row.z },
+        inputs: [],
+        fuel: null,
+        outputs: [],
+      });
+    }
+    for (const slot of slotRows) {
+      const station = result.get(slot.station_id);
+      if (!station) continue;
+      const stack = { definitionId: slot.definition_id, quantity: slot.quantity };
+      if (slot.compartment === 'fuel') {
+        station.fuel = stack;
+      } else {
+        // Sparse on purpose: only occupied slots are stored, so the room pads
+        // each compartment out to its spec's size when it restores.
+        const target = slot.compartment === 'input' ? station.inputs : station.outputs;
+        target[slot.slot_index] = stack;
+      }
     }
     return result;
   }
