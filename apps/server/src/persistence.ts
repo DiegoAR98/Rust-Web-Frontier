@@ -60,6 +60,17 @@ interface PlayerSlotRow {
   quantity: number;
 }
 
+export interface PlayerVitals {
+  calories: number;
+  health: number;
+}
+
+interface PlayerVitalsRow {
+  account_id: string;
+  calories: number;
+  health: number;
+}
+
 /**
  * Durable backing store for session epochs, committed transaction outcomes
  * and the world tick counter (TECHNICAL section 7). A single writer opens
@@ -119,6 +130,11 @@ export class WorldStore {
         definition_id TEXT NOT NULL,
         quantity INTEGER NOT NULL,
         PRIMARY KEY (account_id, slot_index)
+      );
+      CREATE TABLE IF NOT EXISTS player_vitals (
+        account_id TEXT PRIMARY KEY,
+        calories REAL NOT NULL,
+        health REAL NOT NULL
       );
     `);
   }
@@ -303,6 +319,27 @@ export class WorldStore {
       }
     }
     return slots;
+  }
+
+  /** Continuous-state checkpoint for survival vitals, same class as savePlayerCheckpoint. */
+  savePlayerVitals(accountId: string, vitals: PlayerVitals): void {
+    this.db
+      .prepare(
+        `INSERT INTO player_vitals (account_id, calories, health) VALUES (?, ?, ?)
+         ON CONFLICT(account_id) DO UPDATE SET calories = excluded.calories, health = excluded.health`,
+      )
+      .run(accountId, vitals.calories, vitals.health);
+  }
+
+  loadPlayerVitals(): Map<string, PlayerVitals> {
+    const rows = this.db
+      .prepare('SELECT account_id, calories, health FROM player_vitals')
+      .all() as PlayerVitalsRow[];
+    const result = new Map<string, PlayerVitals>();
+    for (const row of rows) {
+      result.set(row.account_id, { calories: row.calories, health: row.health });
+    }
+    return result;
   }
 
   close(): void {

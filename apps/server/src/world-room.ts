@@ -3,6 +3,11 @@ import { CommandSchema, type Command, type CommandResult } from '@rwf/protocol';
 import { getItem } from '@rwf/content';
 import {
   addToInventory,
+  CALORIE_SPAWN,
+  computeStarvationDamage,
+  drainCalories,
+  HEALTH_MAX,
+  HEALTH_SPAWN,
   harvestNode,
   stepMovement,
   takeItem as simTakeItem,
@@ -50,6 +55,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private readonly resourceNodes = new Map<string, ResourceNode>();
   private readonly nodeConfigs = new Map<string, NodeConfig>();
   private readonly playerSlots = new Map<string, Slot[]>();
+  private readonly playerVitals = new Map<string, { calories: number; health: number }>();
+  private readonly connectedAccounts = new Set<string>();
+  private readonly clientsByAccount = new Map<string, RoomClient>();
 
   onCreate(): void {
     // TECHNICAL section 17: the world keeps running even when nobody is
@@ -98,6 +106,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         yieldPerHit: DEFAULT_YIELD_PER_HIT[node.definitionId] ?? 0,
       });
     }
+    for (const [accountId, vitals] of this.store.loadPlayerVitals()) {
+      this.playerVitals.set(accountId, vitals);
+    }
 
     // Seed the M0/M1 proof-of-mechanism content on a genuinely fresh world
     // only -- never re-seed over a restored (possibly claimed/depleted)
@@ -132,6 +143,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         yaw: this.state.players.get(accountId)?.yaw ?? 0,
         grounded: movement.grounded,
       });
+    }
+    for (const [accountId, vitals] of this.playerVitals) {
+      this.store.savePlayerVitals(accountId, vitals);
     }
   }
 
@@ -178,16 +192,27 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     if (!this.playerSlots.has(accountId)) {
       this.playerSlots.set(accountId, this.store.loadPlayerSlots(accountId, BACKPACK_SLOTS));
     }
-    // Private per TECHNICAL section 3: inventory contents never ride the
+    if (!this.playerVitals.has(accountId)) {
+      this.playerVitals.set(accountId, { calories: CALORIE_SPAWN, health: HEALTH_SPAWN });
+    }
+    this.connectedAccounts.add(accountId); // sleepers (disconnected) do not drain, GDD section 12
+    this.clientsByAccount.set(accountId, client);
+
+    // Private per TECHNICAL section 3: inventory/vitals never ride the
     // shared replicated schema. Sent the same tick as 'session' for the
     // same reason (avoid racing the client's post-join listener setup).
-    this.clock.setTimeout(() => client.send('inventory', { slots: this.playerSlots.get(accountId) }), 0);
+    this.clock.setTimeout(() => {
+      client.send('inventory', { slots: this.playerSlots.get(accountId) });
+      client.send('vitals', this.playerVitals.get(accountId));
+    }, 0);
   }
 
   onLeave(client: RoomClient): void {
     const accountId = client.userData?.accountId;
     if (accountId) {
       this.pendingMove.delete(accountId);
+      this.connectedAccounts.delete(accountId);
+      this.clientsByAccount.delete(accountId);
     }
     // The player entity stays in state.players and movementByAccount: a
     // disconnect leaves a sleeper (GDD section 12), not a removed entity.
@@ -290,6 +315,20 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       player.z = next.position.z;
       player.yaw = action.yaw;
       player.grounded = next.grounded;
+    }
+
+    for (const accountId of this.connectedAccounts) {
+      const vitals = this.playerVitals.get(accountId);
+      if (!vitals) continue;
+
+      const sprinting = this.pendingMove.get(accountId)?.sprint ?? false;
+      const calories = drainCalories(vitals.calories, dt, sprinting);
+      const starvation = computeStarvationDamage(calories, dt);
+      const health = Math.max(0, Math.min(HEALTH_MAX, vitals.health - starvation));
+      const next = { calories, health };
+      this.playerVitals.set(accountId, next);
+
+      this.clientsByAccount.get(accountId)?.send('vitals', next);
     }
 
     if (this.state.tick % CHECKPOINT_INTERVAL_TICKS === 0) {

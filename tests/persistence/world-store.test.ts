@@ -220,3 +220,37 @@ describe('WorldStore player inventory durability', () => {
     expect(slots).toEqual([null, { definitionId: 'stone', quantity: 5 }]);
   });
 });
+
+describe('WorldStore player vitals checkpoints (survival continuous state)', () => {
+  it('restores a player at their last checkpointed calories and health', () => {
+    const before = new WorldStore(dbFile);
+    before.savePlayerVitals('acct_a', { calories: 1185, health: 100 });
+    before.close();
+
+    const after = new WorldStore(dbFile);
+    const vitals = after.loadPlayerVitals();
+    after.close();
+
+    expect(vitals.get('acct_a')).toEqual({ calories: 1185, health: 100 });
+  });
+
+  it('overwrites the prior checkpoint rather than accumulating history', () => {
+    const store = new WorldStore(dbFile);
+    store.savePlayerVitals('acct_a', { calories: 1200, health: 100 });
+    store.savePlayerVitals('acct_a', { calories: 1185, health: 95 });
+
+    const vitals = store.loadPlayerVitals();
+    store.close();
+
+    expect(vitals.size).toBe(1);
+    expect(vitals.get('acct_a')).toEqual({ calories: 1185, health: 95 });
+  });
+
+  it('returns no vitals for a brand-new world', () => {
+    const store = new WorldStore(dbFile);
+    const vitals = store.loadPlayerVitals();
+    store.close();
+
+    expect(vitals.size).toBe(0);
+  });
+});
