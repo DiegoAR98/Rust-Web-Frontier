@@ -312,3 +312,7 @@ Three fixes and one addition that finish the milestone's deliverables. PRODUCTIO
 | D76 | A fresh spawn is placed clear of hazards | Required reading. §12 places a *respawn* "outside structures/hazards"; there is no reading where a player's first spawn should be worse than the one they get after dying |
 
 **Still open and not a gate clause for M2:** demolition's 120-second window (`placed_at_tick` is recorded, so it needs no migration), §10's metal tier swap, and the no-build polygons. The metal tier itself is Learn/Bench and waits on research (M3), as do windows, stairs, ramps and steps (D62).
+
+| ID | Decision | Status and reason |
+|---|---|---|
+| D77 | Repair has no cooldown of its own; the two-second hold is the limiter | Proposed, and checked rather than assumed. GDD §10 gives repair a hold and no cooldown, so adding one would invent a rule. One repair runs at a time, which bounds a player to one `savePlayerSlots` every two seconds — recorded against **D27** as a deliberate rate rather than an inherited one, and well under the un-cooldowned cases that entry tracks |

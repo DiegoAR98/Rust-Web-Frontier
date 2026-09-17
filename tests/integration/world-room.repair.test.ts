@@ -185,6 +185,31 @@ describe('WorldRoom repairing a structure (GDD section 10)', () => {
     client.leave();
   });
 
+  it('holds one repair at a time, so the two-second hold is the rate limit', async () => {
+    // GDD section 10 gives repair no cooldown of its own; the hold is the
+    // only limiter, which is worth pinning because it is also what bounds
+    // how often a repair writes to disk.
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const client = await damagedWall(room, 'acct_spam');
+    room.grantForTest('acct_spam', 'wood', 40);
+
+    client.send('command', repair(WALL));
+    expect((await client.waitForMessage('commandResult')).accepted).toBe(true);
+    client.send('command', repair(WALL));
+    const second = await client.waitForMessage('commandResult');
+
+    expect(second.accepted).toBe(false);
+    expect(second.reasonCode).toBe('busy');
+    expect(healthOf(room, WALL)).toBe(500);
+
+    // ...and the next one is allowed the moment the first finishes.
+    room.advanceChannelsForTest(REPAIR_CHANNEL_S + 0.1);
+    client.send('command', repair(WALL));
+    expect((await client.waitForMessage('commandResult')).accepted).toBe(true);
+
+    client.leave();
+  });
+
   it('cancels a repair that is interrupted, spending nothing', async () => {
     // The same rule as a bandage (D36): a hold that does not finish costs
     // nothing at all.
