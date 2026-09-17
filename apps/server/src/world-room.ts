@@ -6,9 +6,11 @@ import {
   applyBleedWound,
   CALORIE_SPAWN,
   CREATURE_SPECS,
+  harvestCarcassHit,
   spawnCreature as simSpawnCreature,
   stepCreature,
   tickBleed,
+  type CarcassState as SimCarcassState,
   type BleedWound,
   type CreatureKind,
   type CreatureState as SimCreatureState,
@@ -48,7 +50,7 @@ import {
   type WorldItem,
 } from '@rwf/sim';
 import { WorldStore, type Vec3 } from './persistence.js';
-import { CreatureState, PlayerState, WorldItemState, WorldState } from './world-state.js';
+import { CarcassState, CreatureState, PlayerState, WorldItemState, WorldState } from './world-state.js';
 
 /** Matches TECHNICAL section 3's simulation budget: 20 fixed ticks/s. */
 export const TICK_RATE_HZ = 20;
@@ -113,6 +115,21 @@ const MAX_MESSAGES_PER_SECOND = 60;
 const BITE_BLEED_CHANCE = 0.2;
 const BITE_BLEED_RATE_PER_S = 0.5;
 const BLEED_DURATION_S = 10;
+/**
+ * CONTENT section 5's tool melee table: "rock 10, stone hatchet 15, iron
+ * hatchet 25, pickaxe 20". Which one a player is swinging needs the equip/belt
+ * system the gather rate is also waiting on, so it is the rock everyone starts
+ * with.
+ */
+const MELEE_DAMAGE = 10;
+/**
+ * How long a hurt animal stays alarmed. GDD section 7 says prey "flee when
+ * approached or hurt" and that "damage alerts the victim independently of
+ * detection", but gives no duration; this is the project's number.
+ */
+const ALARM_DURATION_S = 5;
+/** GDD section 7: "Unharvested carcasses expire after 10 online minutes." */
+const CARCASS_LIFETIME_TICKS = 10 * 60 * TICK_RATE_HZ;
 
 interface ClientUserData {
   accountId: string;
@@ -204,6 +221,10 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   /** Who was last within reach of each station, so arrivals can be detected. */
   private readonly stationViewers = new Map<string, Set<string>>();
   private readonly creatures = new Map<string, SimCreatureState>();
+  private readonly carcasses = new Map<
+    string,
+    { kind: CreatureKind; position: Point3; state: SimCarcassState; diedAtTick: number }
+  >();
   private readonly woundsByAccount = new Map<string, BleedWound>();
   /**
    * GDD section 6 makes the bleed chance a server roll. Injectable so a test
@@ -330,6 +351,16 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     if (!this.stations.has('campfire_1')) {
       this.spawnStation('campfire_1', 'campfire', { x: -6, y: 0.5, z: 0 });
     }
+    // A handful of CONTENT section 4's budget of 24. The wolf is anchored
+    // beyond its own 25 m notice range from spawn, so joining the world is not
+    // immediately an ambush. Nothing respawns: CONTENT's rule (at least 15
+    // minutes and no player within 30 m of the anchor) needs a spawn director
+    // this does not have, so a hunted-out world stays empty until a restart.
+    if (this.creatures.size === 0) {
+      this.spawnCreature('deer_1', 'deer', { x: 12, y: 0, z: 12 });
+      this.spawnCreature('deer_2', 'deer', { x: -12, y: 0, z: 8 });
+      this.spawnCreature('wolf_1', 'wolf', { x: 0, y: 0, z: 30 });
+    }
 
     this.onMessage('command', CommandSchema, (client, command) => {
       this.handleCommand(client, command);
@@ -381,6 +412,23 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   /** Test-only accessors for the wildlife and bleeding verticals. */
   creatureForTest(creatureId: string): SimCreatureState | undefined {
     return this.creatures.get(creatureId);
+  }
+
+  carcassForTest(carcassId: string): SimCarcassState | undefined {
+    return this.carcasses.get(carcassId)?.state;
+  }
+
+  tickForTest(): number {
+    return this.state.tick;
+  }
+
+  /** Test-only: lets a test take consecutive swings without waiting out the 1s interval. */
+  clearSwingCooldownForTest(accountId: string): void {
+    this.lastSwingTick.delete(accountId);
+  }
+
+  expireCarcassesForTest(): void {
+    this.expireCarcasses();
   }
 
   woundForTest(accountId: string): BleedWound | null {
@@ -539,6 +587,138 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       if (!vitals || damage <= 0) continue;
       this.playerVitals.set(accountId, { ...vitals, health: Math.max(0, vitals.health - damage) });
     }
+  }
+
+  /** Seeds a carcass directly; the world normally makes them by killing something. */
+  spawnCarcass(carcassId: string, kind: CreatureKind, position: Point3): void {
+    this.carcasses.set(carcassId, {
+      kind,
+      position: { ...position },
+      state: { hitsUsed: 0 },
+      diedAtTick: this.state.tick,
+    });
+    const replicated = new CarcassState();
+    replicated.kind = kind;
+    replicated.x = position.x;
+    replicated.y = position.y;
+    replicated.z = position.z;
+    this.state.carcasses.set(carcassId, replicated);
+  }
+
+  private removeCarcass(carcassId: string): void {
+    this.carcasses.delete(carcassId);
+    this.state.carcasses.delete(carcassId);
+  }
+
+  /**
+   * A melee swing at an animal. Damage is the rock's 10 (CONTENT section 5's
+   * tool melee table): which tool a player is swinging needs the equip/belt
+   * system that the gather rate is waiting on too, so everyone punches with a
+   * rock for now.
+   */
+  private resolveAttackCreature(accountId: string, creatureId: string, sequence: number): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    const creature = this.creatures.get(creatureId);
+    if (!creature) return { ...base, accepted: false, reasonCode: 'not_found' };
+    if (!this.isWithinReach(accountId, creature.position)) {
+      return { ...base, accepted: false, reasonCode: 'out_of_range' };
+    }
+    if (this.isSwingOnCooldown(accountId)) return { ...base, accepted: false, reasonCode: 'rate_limited' };
+    this.lastSwingTick.set(accountId, this.state.tick);
+
+    const health = creature.health - MELEE_DAMAGE;
+    // GDD section 7: "Prey flee when approached or hurt", and "damage alerts
+    // the victim independently of detection" -- so being hit has to make an
+    // animal run even from a player it never noticed. GDD gives no duration
+    // for that alarm; five seconds is this project's number.
+    this.creatures.set(creatureId, { ...creature, health, alarmS: ALARM_DURATION_S });
+
+    if (health <= 0) {
+      this.creatures.delete(creatureId);
+      this.state.creatures.delete(creatureId);
+      this.spawnCarcass(creatureId, creature.kind, creature.position);
+      return { ...base, accepted: true, reasonCode: 'ok' };
+    }
+
+    const replicated = this.state.creatures.get(creatureId);
+    if (replicated) replicated.health = health;
+    return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  /**
+   * One of the four tool hits a carcass pays out over (GDD section 7). The
+   * pool is spent by the carcass, not by the player, so two people taking
+   * turns still only ever extract one animal's worth.
+   */
+  private resolveHarvestCarcass(accountId: string, carcassId: string, sequence: number): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    const carcass = this.carcasses.get(carcassId);
+    if (!carcass) return { ...base, accepted: false, reasonCode: 'not_found' };
+    if (!this.isWithinReach(accountId, carcass.position)) {
+      return { ...base, accepted: false, reasonCode: 'out_of_range' };
+    }
+    if (this.isSwingOnCooldown(accountId)) return { ...base, accepted: false, reasonCode: 'rate_limited' };
+
+    const totals = CREATURE_SPECS[carcass.kind].harvest;
+    const { state, granted } = harvestCarcassHit(carcass.state, totals);
+    const entries = Object.entries(granted).filter(([, quantity]) => quantity > 0);
+    if (entries.length === 0) {
+      this.removeCarcass(carcassId);
+      return { ...base, accepted: false, reasonCode: 'depleted' };
+    }
+
+    // Capacity for the whole hit before any of it is taken, same rule as a
+    // gather: a full pack refuses rather than voiding part of the pool.
+    let slots = this.playerSlots.get(accountId) ?? new Array(BACKPACK_SLOTS).fill(null);
+    for (const [definitionId, quantity] of entries) {
+      if (countFreeCapacity(slots, definitionId, getItem(definitionId)?.stack ?? 1) < quantity) {
+        return { ...base, accepted: false, reasonCode: 'no_space' };
+      }
+    }
+
+    this.lastSwingTick.set(accountId, this.state.tick);
+    for (const [definitionId, quantity] of entries) {
+      const { slots: next, overflow } = addToInventory(
+        slots,
+        definitionId,
+        quantity,
+        getItem(definitionId)?.stack ?? 1,
+      );
+      if (overflow > 0) {
+        throw new Error(`harvest overflow of ${overflow} ${definitionId} despite a capacity check`);
+      }
+      slots = next;
+    }
+    this.playerSlots.set(accountId, slots);
+    this.store.savePlayerSlots(accountId, slots);
+
+    const replicated = this.state.carcasses.get(carcassId);
+    if (replicated) replicated.hitsUsed = state.hitsUsed;
+    if (state.hitsUsed >= 4) {
+      // A spent pool is gone, rather than lingering for a fifth hit to find.
+      this.removeCarcass(carcassId);
+    } else {
+      this.carcasses.set(carcassId, { ...carcass, state });
+    }
+    return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  /**
+   * GDD section 7: "Unharvested carcasses expire after 10 online minutes."
+   * Counted in ticks, so a stopped host does not rot the world (T17). The
+   * clock runs from death and is not reset by a partial harvest -- GDD says
+   * "unharvested", which does not say what a half-skinned one does.
+   */
+  private expireCarcasses(): void {
+    for (const [carcassId, carcass] of this.carcasses) {
+      if (this.state.tick - carcass.diedAtTick < CARCASS_LIFETIME_TICKS) continue;
+      this.removeCarcass(carcassId);
+    }
+  }
+
+  private isSwingOnCooldown(accountId: string): boolean {
+    const lastSwing = this.lastSwingTick.get(accountId);
+    return lastSwing !== undefined && this.state.tick - lastSwing < SWING_INTERVAL_TICKS;
   }
 
   /** Seeds a furnace or campfire; not a player-facing command until M2 building. */
@@ -708,6 +888,25 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       client.send('commandResult', JSON.parse(encoded) as CommandResult);
       client.send('inventory', { slots: this.playerSlots.get(accountId) });
       this.sendCrafting(accountId);
+      return;
+    }
+
+    if (command.action.type === 'attackCreature') {
+      const creatureId = command.action.creatureId;
+      const encoded = this.store.commitOutcome(key, () =>
+        JSON.stringify(this.resolveAttackCreature(accountId, creatureId, command.sequence)),
+      );
+      client.send('commandResult', JSON.parse(encoded) as CommandResult);
+      return;
+    }
+
+    if (command.action.type === 'harvestCarcass') {
+      const carcassId = command.action.carcassId;
+      const encoded = this.store.commitOutcome(key, () =>
+        JSON.stringify(this.resolveHarvestCarcass(accountId, carcassId, command.sequence)),
+      );
+      client.send('commandResult', JSON.parse(encoded) as CommandResult);
+      client.send('inventory', { slots: this.playerSlots.get(accountId) });
       return;
     }
 
@@ -1204,6 +1403,8 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     }
 
     this.tickCreatures(dt);
+
+    this.expireCarcasses();
 
     // Before tickSurvival, so a bite landing this tick is reflected in the
     // vitals message that goes out at the end of it.

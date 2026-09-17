@@ -35,6 +35,20 @@ export const CraftIntentSchema = z.object({
 });
 export type CraftIntent = z.infer<typeof CraftIntentSchema>;
 
+/** A melee swing at an animal (GDD section 7); reach and rate are the server's. */
+export const AttackCreatureIntentSchema = z.object({
+  type: z.literal('attackCreature'),
+  creatureId: z.string().min(1).max(64),
+});
+export type AttackCreatureIntent = z.infer<typeof AttackCreatureIntentSchema>;
+
+/** One of the four tool hits a carcass's harvest pool is paid over. */
+export const HarvestCarcassIntentSchema = z.object({
+  type: z.literal('harvestCarcass'),
+  carcassId: z.string().min(1).max(64),
+});
+export type HarvestCarcassIntent = z.infer<typeof HarvestCarcassIntentSchema>;
+
 const stationId = () => z.string().min(1).max(64);
 
 /**
@@ -73,6 +87,8 @@ export const ActionPayloadSchema = z.discriminatedUnion('type', [
   StationInsertIntentSchema,
   StationTakeIntentSchema,
   StationLightIntentSchema,
+  AttackCreatureIntentSchema,
+  HarvestCarcassIntentSchema,
 ]);
 export type ActionPayload = z.infer<typeof ActionPayloadSchema>;
 

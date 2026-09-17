@@ -1,6 +1,7 @@
 import { boot, type ColyseusTestServer } from '@colyseus/testing';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import appConfig from '@rwf/server/app.config';
+import { PROTOCOL_VERSION } from '@rwf/protocol';
 import { HEALTH_SPAWN } from '@rwf/sim';
 import type { WorldRoom } from '@rwf/server/world-room';
 
@@ -26,6 +27,8 @@ afterAll(async () => {
 function advance(room: WorldRoom, seconds: number): void {
   for (let i = 0; i < Math.round(seconds / 0.05); i++) room.advanceCreaturesForTest(0.05);
 }
+
+let sequence = 0;
 
 /** Players spawn at the origin; this is inside a wolf's 25 m notice range. */
 const NEARBY = { x: 10, y: 0, z: 0 };
@@ -179,5 +182,145 @@ describe('WorldRoom bleeding (T08, GDD section 6)', () => {
     expect(room.woundForTest('acct_clot')).toBeNull();
 
     client.leave();
+  });
+});
+
+function attack(creatureId: string) {
+  sequence += 1;
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    sessionEpoch: 1,
+    sequence,
+    clientTick: 0,
+    action: { type: 'attackCreature', creatureId },
+  };
+}
+
+function harvest(carcassId: string) {
+  sequence += 1;
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    sessionEpoch: 1,
+    sequence,
+    clientTick: 0,
+    action: { type: 'harvestCarcass', carcassId },
+  };
+}
+
+/**
+ * T20: "Animals detect, chase, lose path and die; two players harvest final
+ * hit -> no wall attacks/teleports; finite harvest paid once; wildlife budgets
+ * maintained." GDD section 7: "Harvesting consumes the pool over four valid
+ * tool hits; each hit grants one quarter with integer remainders assigned to
+ * the final hit."
+ */
+describe('WorldRoom carcasses (T20, GDD section 7)', () => {
+  it('leaves a carcass where the animal died, and removes the animal', async () => {
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    room.spawnCreature('deer_t', 'deer', { x: 1, y: 0, z: 0 });
+    const client = await colyseus.connectTo(room, { accountId: 'acct_hunt' });
+    await client.waitForMessage('session');
+
+    // A deer has 60 HP and a rock does 10, so six swings.
+    for (let i = 0; i < 6; i++) {
+      client.send('command', attack('deer_t'));
+      await client.waitForMessage('commandResult');
+      room.clearSwingCooldownForTest('acct_hunt');
+    }
+
+    expect(room.creatureForTest('deer_t')).toBeUndefined();
+    expect(room.carcassForTest('deer_t')).toBeDefined();
+    expect(room.carcassForTest('deer_t')!.hitsUsed).toBe(0);
+
+    client.leave();
+  });
+
+  it('pays a deer out over exactly four hits and no more', async () => {
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    room.spawnCarcass('carcass_t', 'deer', { x: 1, y: 0, z: 0 });
+    const client = await colyseus.connectTo(room, { accountId: 'acct_skin' });
+    await client.waitForMessage('session');
+
+    for (let i = 0; i < 5; i++) {
+      client.send('command', harvest('carcass_t'));
+      await client.waitForMessage('commandResult');
+      room.clearSwingCooldownForTest('acct_skin');
+    }
+
+    // CONTENT section 4's deer pool, paid once in total.
+    expect(room.countForTest('acct_skin', 'raw_meat')).toBe(8);
+    expect(room.countForTest('acct_skin', 'cloth')).toBe(8);
+    expect(room.countForTest('acct_skin', 'hide')).toBe(4);
+    expect(room.countForTest('acct_skin', 'fat')).toBe(4);
+    // Spent pools do not linger for a fifth hit to find.
+    expect(room.carcassForTest('carcass_t')).toBeUndefined();
+
+    client.leave();
+  });
+
+  it('cannot pay the same pool twice to two competing players', async () => {
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    room.spawnCarcass('carcass_t', 'deer', { x: 1, y: 0, z: 0 });
+    const a = await colyseus.connectTo(room, { accountId: 'acct_x' });
+    await a.waitForMessage('session');
+    const b = await colyseus.connectTo(room, { accountId: 'acct_y' });
+    await b.waitForMessage('session');
+
+    for (let i = 0; i < 4; i++) {
+      const client = i % 2 === 0 ? a : b;
+      const accountId = i % 2 === 0 ? 'acct_x' : 'acct_y';
+      client.send('command', harvest('carcass_t'));
+      await client.waitForMessage('commandResult');
+      room.clearSwingCooldownForTest(accountId);
+    }
+
+    const meat = room.countForTest('acct_x', 'raw_meat') + room.countForTest('acct_y', 'raw_meat');
+    expect(meat).toBe(8); // the pool, split between them, never doubled
+
+    a.leave();
+    b.leave();
+  });
+
+  it('makes a hurt deer run even though the player is no threat by distance', async () => {
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    room.spawnCreature('deer_t', 'deer', { x: 2, y: 0, z: 0 });
+    const client = await colyseus.connectTo(room, { accountId: 'acct_spook' });
+    await client.waitForMessage('session');
+
+    client.send('command', attack('deer_t'));
+    await client.waitForMessage('commandResult');
+
+    // GDD section 7: "Prey flee when approached or hurt."
+    expect(room.creatureForTest('deer_t')!.alarmS).toBeGreaterThan(0);
+    expect(room.creatureForTest('deer_t')!.health).toBe(50);
+
+    client.leave();
+  });
+
+  it('refuses a swing at an animal across the map', async () => {
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    room.spawnCreature('deer_far', 'deer', { x: 1000, y: 0, z: 1000 });
+    const client = await colyseus.connectTo(room, { accountId: 'acct_sniper' });
+    await client.waitForMessage('session');
+
+    client.send('command', attack('deer_far'));
+    const result = await client.waitForMessage('commandResult');
+
+    expect(result.accepted).toBe(false);
+    expect(result.reasonCode).toBe('out_of_range');
+    expect(room.creatureForTest('deer_far')!.health).toBe(60);
+
+    client.leave();
+  });
+
+  it('clears a carcass nobody came back for', async () => {
+    // GDD section 7: "Unharvested carcasses expire after 10 online minutes."
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    room.spawnCarcass('carcass_t', 'deer', { x: 1, y: 0, z: 0 });
+
+    room.setTickForTest(room.tickForTest() + 10 * 60 * 20 + 1);
+    room.expireCarcassesForTest();
+
+    expect(room.carcassForTest('carcass_t')).toBeUndefined();
   });
 });

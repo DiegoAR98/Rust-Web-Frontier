@@ -80,6 +80,18 @@ const remoteMeshes = new Map<string, ReturnType<typeof MeshBuilder.CreateCapsule
 const remoteLastTransform = new Map<string, Transform>();
 const remoteTargetTransform = new Map<string, Transform>();
 
+const creatureMeshes = new Map<string, ReturnType<typeof MeshBuilder.CreateBox>>();
+const creaturePositions = new Map<string, Vector3>();
+const carcassMeshes = new Map<string, ReturnType<typeof MeshBuilder.CreateBox>>();
+const carcassPositions = new Map<string, Vector3>();
+
+const deerMaterial = new StandardMaterial('deerMat', scene);
+deerMaterial.diffuseColor = new Color3(0.65, 0.5, 0.3);
+const wolfMaterial = new StandardMaterial('wolfMat', scene);
+wolfMaterial.diffuseColor = new Color3(0.35, 0.35, 0.38);
+const carcassMaterial = new StandardMaterial('carcassMat', scene);
+carcassMaterial.diffuseColor = new Color3(0.5, 0.15, 0.15);
+
 const itemMaterial = new StandardMaterial('itemMat', scene);
 itemMaterial.diffuseColor = new Color3(0.7, 0.5, 0.2);
 const itemMesh = MeshBuilder.CreateBox('item_1', { size: 0.4 }, scene);
@@ -219,7 +231,7 @@ window.addEventListener('mousemove', (e) => {
 // GDD section 5: "Use/aim | Left/right mouse". Gathering is a tool-use
 // action, not the E interact key that takeItem uses.
 window.addEventListener('mousedown', (e) => {
-  if (entered && e.button === 0) attemptHitNode();
+  if (entered && e.button === 0) attemptSwing();
 });
 
 // Mouse-look needs pointer lock, but a lock rejection/delay must never block
@@ -317,6 +329,35 @@ async function connect(): Promise<void> {
     remoteTargetTransform.delete(key);
   });
 
+  // Animals and carcasses are public world state, so unlike station contents
+  // they arrive on the replicated schema like other players do.
+  interface ReplicatedCreature {
+    kind: string;
+    x: number;
+    y: number;
+    z: number;
+  }
+  $(joined.state).creatures!.onAdd((creature: ReplicatedCreature, key: string) => {
+    const mesh = MeshBuilder.CreateBox(`creature_${key}`, { width: 0.7, height: 1, depth: 1.6 }, scene);
+    mesh.material = creature.kind === 'wolf' ? wolfMaterial : deerMaterial;
+    creatureMeshes.set(key, mesh);
+  });
+  $(joined.state).creatures!.onRemove((_creature: ReplicatedCreature, key: string) => {
+    creatureMeshes.get(key)?.dispose();
+    creatureMeshes.delete(key);
+    creaturePositions.delete(key);
+  });
+  $(joined.state).carcasses!.onAdd((_carcass: ReplicatedCreature, key: string) => {
+    const mesh = MeshBuilder.CreateBox(`carcass_${key}`, { width: 1.2, height: 0.4, depth: 1.6 }, scene);
+    mesh.material = carcassMaterial;
+    carcassMeshes.set(key, mesh);
+  });
+  $(joined.state).carcasses!.onRemove((_carcass: ReplicatedCreature, key: string) => {
+    carcassMeshes.get(key)?.dispose();
+    carcassMeshes.delete(key);
+    carcassPositions.delete(key);
+  });
+
   joined.onStateChange(() => {
     patchAtMs = performance.now();
     const local = joined.state.players.get(accountId);
@@ -334,6 +375,22 @@ async function connect(): Promise<void> {
       if (!player) continue;
       remoteLastTransform.set(key, target);
       remoteTargetTransform.set(key, { x: player.x, y: player.y, z: player.z, yaw: player.yaw });
+    }
+
+    // Animals move every tick; the meshes follow the server directly rather
+    // than being interpolated, which is a visible step at 20Hz but keeps what
+    // the HUD calls "in reach" identical to what the server will accept.
+    for (const [key, mesh] of creatureMeshes) {
+      const creature = joined.state.creatures.get(key);
+      if (!creature) continue;
+      mesh.position.set(creature.x, creature.y + 0.5, creature.z);
+      creaturePositions.set(key, new Vector3(creature.x, creature.y, creature.z));
+    }
+    for (const [key, mesh] of carcassMeshes) {
+      const carcass = joined.state.carcasses.get(key);
+      if (!carcass) continue;
+      mesh.position.set(carcass.x, carcass.y + 0.2, carcass.z);
+      carcassPositions.set(key, new Vector3(carcass.x, carcass.y, carcass.z));
     }
   });
 }
@@ -385,9 +442,35 @@ function nearestOf<T extends { position: Vector3 }>(candidates: readonly T[]): T
 
 const nearestStation = () => nearestOf(STATIONS);
 
-function attemptHitNode(): void {
-  const node = nearestOf(NODES);
-  if (node) send({ type: 'hitNode', nodeId: node.id });
+/**
+ * One swing key for everything you swing at. Picks whatever is closest --
+ * animal, carcass or node -- rather than making the player remember a
+ * different key per target type. The server still decides whether it was in
+ * reach, and says so in the HUD's `last:` line when it was not.
+ */
+function attemptSwing(): void {
+  const candidates: Array<{ distance: number; action: Record<string, unknown> }> = [];
+  for (const [id, position] of creaturePositions) {
+    candidates.push({
+      distance: Vector3.Distance(camera.position, position),
+      action: { type: 'attackCreature', creatureId: id },
+    });
+  }
+  for (const [id, position] of carcassPositions) {
+    candidates.push({
+      distance: Vector3.Distance(camera.position, position),
+      action: { type: 'harvestCarcass', carcassId: id },
+    });
+  }
+  for (const node of NODES) {
+    candidates.push({
+      distance: Vector3.Distance(camera.position, node.position),
+      action: { type: 'hitNode', nodeId: node.id },
+    });
+  }
+
+  const nearest = candidates.sort((a, b) => a.distance - b.distance)[0];
+  if (nearest) send(nearest.action);
 }
 
 /** Sums one item across the pack, so a keypress can move everything you carry. */
@@ -517,7 +600,7 @@ engine.runRenderLoop(() => {
           `near: ${describeNearest()}`,
           `station: ${describeStation()}`,
           `last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : `  (${lookError ?? 'click canvas to look'})`}`,
-          'WASD move : shift sprint : space jump : LMB gather : E take : C craft hatchet',
+          'WASD move : shift sprint : space jump : LMB swing at what you face : E take : C craft hatchet',
           'at a station -- F add fuel : R add input : G light/snuff : T take output',
         ].join('\n')
       : disconnectReason
