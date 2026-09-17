@@ -1,0 +1,73 @@
+import { describe, expect, it } from 'vitest';
+import { CommandSchema, PROTOCOL_VERSION } from '@rwf/protocol';
+
+function validMoveCommand(overrides: Record<string, unknown> = {}) {
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    sessionEpoch: 1,
+    sequence: 1,
+    clientTick: 100,
+    action: {
+      type: 'move',
+      axisX: 1,
+      axisY: 0,
+      yaw: 0,
+      sprint: false,
+      crouch: false,
+      jump: false,
+    },
+    ...overrides,
+  };
+}
+
+describe('CommandSchema', () => {
+  it('accepts a well-formed move command', () => {
+    const result = CommandSchema.safeParse(validMoveCommand());
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects an axis value forged outside the -1..1 range', () => {
+    const result = CommandSchema.safeParse(
+      validMoveCommand({ action: { ...validMoveCommand().action, axisX: 999 } }),
+    );
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a NaN axis value', () => {
+    const result = CommandSchema.safeParse(
+      validMoveCommand({ action: { ...validMoveCommand().action, axisX: Number.NaN } }),
+    );
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects an Infinity axis value', () => {
+    const result = CommandSchema.safeParse(
+      validMoveCommand({ action: { ...validMoveCommand().action, axisY: Number.POSITIVE_INFINITY } }),
+    );
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a mismatched protocol version', () => {
+    const result = CommandSchema.safeParse(validMoveCommand({ protocolVersion: 999 }));
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a negative sequence number', () => {
+    const result = CommandSchema.safeParse(validMoveCommand({ sequence: -1 }));
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts a well-formed take-item command', () => {
+    const result = CommandSchema.safeParse(
+      validMoveCommand({ action: { type: 'takeItem', itemInstanceId: 'item_123' } }),
+    );
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects an unknown action type', () => {
+    const result = CommandSchema.safeParse(
+      validMoveCommand({ action: { type: 'noclip', itemInstanceId: 'item_123' } }),
+    );
+    expect(result.success).toBe(false);
+  });
+});
