@@ -1,0 +1,113 @@
+import Database from 'better-sqlite3';
+import type { TransactionKey } from '@rwf/sim';
+
+interface SessionRow {
+  epoch: number;
+}
+
+interface TransactionRow {
+  outcome: string;
+}
+
+interface WorldClockRow {
+  tick: number;
+}
+
+/**
+ * Durable backing store for session epochs, committed transaction outcomes
+ * and the world tick counter (TECHNICAL section 7). A single writer opens
+ * this file; every mutation here is a plain synchronous SQLite statement,
+ * so a commit either lands durably or the process never observed success.
+ */
+export class WorldStore {
+  private readonly db: Database.Database;
+
+  constructor(filename: string) {
+    this.db = new Database(filename);
+    this.db.pragma('journal_mode = WAL');
+    this.migrate();
+  }
+
+  private migrate(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        account_id TEXT PRIMARY KEY,
+        epoch INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS transactions (
+        account_id TEXT NOT NULL,
+        session_epoch INTEGER NOT NULL,
+        sequence INTEGER NOT NULL,
+        outcome TEXT NOT NULL,
+        PRIMARY KEY (account_id, session_epoch, sequence)
+      );
+      CREATE TABLE IF NOT EXISTS world_clock (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        tick INTEGER NOT NULL
+      );
+    `);
+  }
+
+  beginSession(accountId: string): number {
+    const row = this.db
+      .prepare('SELECT epoch FROM sessions WHERE account_id = ?')
+      .get(accountId) as SessionRow | undefined;
+    const next = (row?.epoch ?? 0) + 1;
+    this.db
+      .prepare(
+        `INSERT INTO sessions (account_id, epoch) VALUES (?, ?)
+         ON CONFLICT(account_id) DO UPDATE SET epoch = excluded.epoch`,
+      )
+      .run(accountId, next);
+    return next;
+  }
+
+  isSessionActive(accountId: string, sessionEpoch: number): boolean {
+    const row = this.db
+      .prepare('SELECT epoch FROM sessions WHERE account_id = ?')
+      .get(accountId) as SessionRow | undefined;
+    return row?.epoch === sessionEpoch;
+  }
+
+  commitOutcome(key: TransactionKey, outcome: string): string {
+    if (!Number.isSafeInteger(key.sessionEpoch) || !Number.isSafeInteger(key.sequence)) {
+      throw new RangeError('transaction key requires safe-integer sessionEpoch and sequence');
+    }
+    const existing = this.db
+      .prepare(
+        'SELECT outcome FROM transactions WHERE account_id = ? AND session_epoch = ? AND sequence = ?',
+      )
+      .get(key.accountId, key.sessionEpoch, key.sequence) as TransactionRow | undefined;
+    if (existing) {
+      return existing.outcome;
+    }
+    this.db
+      .prepare(
+        'INSERT INTO transactions (account_id, session_epoch, sequence, outcome) VALUES (?, ?, ?, ?)',
+      )
+      .run(key.accountId, key.sessionEpoch, key.sequence, outcome);
+    return outcome;
+  }
+
+  /** Persists the simulation's own tick counter. Never derived from wall-clock time. */
+  saveWorldTick(tick: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO world_clock (id, tick) VALUES (1, ?)
+         ON CONFLICT(id) DO UPDATE SET tick = excluded.tick`,
+      )
+      .run(tick);
+  }
+
+  /** Resumes at exactly the last persisted tick; downtime is discarded, never caught up. */
+  loadWorldTick(): number {
+    const row = this.db.prepare('SELECT tick FROM world_clock WHERE id = 1').get() as
+      | WorldClockRow
+      | undefined;
+    return row?.tick ?? 0;
+  }
+
+  close(): void {
+    this.db.close();
+  }
+}
