@@ -82,6 +82,7 @@ import {
   CorpseState,
   CreatureState,
   DeployableState,
+  DoorState,
   PlayerState,
   WorldItemState,
   WorldState,
@@ -132,6 +133,12 @@ const INTERACT_REACH_TOLERANCE_M = 1;
  * them build the cell they occupy and the one next to it, and no further.
  */
 const BUILD_REACH_M = 6;
+/**
+ * CONTENT section 7's insert table: "wood_door | 500", "metal_door | 1000".
+ * Only the wood door is craftable so far; the iron one is Bench/Default and
+ * needs metal a player cannot smelt enough of yet.
+ */
+const DOOR_PLACED_HP: Record<string, number> = { wood_door: 500, metal_door: 1000 };
 /** Camera offset above the player's feet; the client measures reach from here. */
 const EYE_HEIGHT_M = 1.7;
 /**
@@ -378,6 +385,23 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
    * would go stale the first time a collapse split a building in two.
    */
   private readonly pieceLinks = new Map<string, Set<string>>();
+  /** Doors, keyed by the doorway site they hang in. */
+  private readonly doors = new Map<
+    string,
+    { definitionId: string; ownerAccountId: string; open: boolean; site: PieceSite; installedAtTick: number }
+  >();
+  /**
+   * Who may work each door besides its owner (GDD section 10). Per door, not
+   * per owner: the section grants access "through a local interaction", which
+   * is a thing you do standing at one door.
+   */
+  private readonly doorAccess = new Map<string, Set<string>>();
+  /**
+   * Section 10's "explicit builder", per owner rather than per building: a
+   * building has no stable identity to key on -- membership is walked from the
+   * structural links and changes whenever a piece goes up or comes down.
+   */
+  private readonly buildAccess = new Map<string, Set<string>>();
 
   onCreate(): void {
     // TECHNICAL section 17: the world keeps running even when nobody is
@@ -500,6 +524,34 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       replicated.health = record.health;
       this.state.buildingPieces.set(key, replicated);
     }
+    for (const [key, record] of this.store.loadDoors()) {
+      this.doors.set(key, {
+        definitionId: record.definitionId,
+        ownerAccountId: record.ownerAccountId,
+        open: record.open,
+        site: {
+          form: 'doorway',
+          storey: record.storey,
+          i: record.i,
+          k: record.k,
+          axis: record.axis === '' ? null : (record.axis as 'x' | 'z'),
+        },
+        installedAtTick: record.installedAtTick,
+      });
+      const replicated = new DoorState();
+      replicated.definitionId = record.definitionId;
+      replicated.ownerAccountId = record.ownerAccountId;
+      replicated.open = record.open;
+      replicated.storey = record.storey;
+      replicated.i = record.i;
+      replicated.k = record.k;
+      replicated.axis = record.axis;
+      replicated.health = record.health;
+      this.state.doors.set(key, replicated);
+    }
+    // GDD section 10: "Permissions persist and can be revoked immediately."
+    for (const [key, list] of this.store.loadDoorAccess()) this.doorAccess.set(key, list);
+    for (const [owner, list] of this.store.loadBuildAccess()) this.buildAccess.set(owner, list);
     // Rebuilt after every piece is back, because a link needs both ends to
     // exist and the rows come out of SQLite in no particular order.
     for (const [key, piece] of this.buildingPieces) {
@@ -1126,12 +1178,8 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
 
     const links = linkedSiteKeys(site).filter((key) => this.buildingPieces.has(key));
     const building = this.buildingFrom(links);
-    for (const key of building) {
-      if (this.buildingPieces.get(key)!.ownerAccountId !== accountId) {
-        // "Only a building owner or explicit builder can attach to its grid";
-        // there is no builder list yet, so it is the owner alone.
-        return { ...base, accepted: false, reasonCode: 'forbidden' };
-      }
+    if (!this.mayBuildOn(accountId, building)) {
+      return { ...base, accepted: false, reasonCode: 'forbidden' };
     }
 
     let ownerPieceCount = 0;
@@ -1191,6 +1239,180 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         placedAtTick: this.state.tick,
       });
     });
+    return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  /**
+   * Whether this account may attach to the building the seeds belong to
+   * (GDD section 10: "Only a building owner or explicit builder can attach to
+   * its grid"). An empty building -- bare ground -- is open to anyone.
+   */
+  private mayBuildOn(accountId: string, building: Set<string>): boolean {
+    for (const key of building) {
+      const owner = this.buildingPieces.get(key)!.ownerAccountId;
+      if (owner === accountId) continue;
+      if (this.buildAccess.get(owner)?.has(accountId)) continue;
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * GDD section 10: a door hangs in a doorway socket, and "only the authorized
+   * builder can install a replacement door" -- so installing is a build-grid
+   * action, gated the same way attaching a piece is.
+   */
+  private resolveInstallDoor(
+    accountId: string,
+    definitionId: string,
+    site: PieceSite,
+    sequence: number,
+  ): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    const key = siteKey(site);
+    const frame = this.buildingPieces.get(key);
+    if (!frame || frame.site.form !== 'doorway') {
+      return { ...base, accepted: false, reasonCode: 'not_found' };
+    }
+    if (this.doors.has(key)) return { ...base, accepted: false, reasonCode: 'overlap' };
+
+    const slots = this.playerSlots.get(accountId) ?? [];
+    if (countInInventory(slots, definitionId) < 1) {
+      return { ...base, accepted: false, reasonCode: 'insufficient_resources' };
+    }
+    if (!this.mayBuildOn(accountId, this.buildingFrom([key]))) {
+      return { ...base, accepted: false, reasonCode: 'forbidden' };
+    }
+    if (!this.isWithinReach(accountId, worldPositionOf(site) as Vec3)) {
+      return { ...base, accepted: false, reasonCode: 'out_of_range' };
+    }
+
+    const { slots: remaining } = removeFromInventory(slots, definitionId, 1);
+    this.playerSlots.set(accountId, remaining);
+    // The door belongs to the frame's owner, not whoever hung it: section 10's
+    // "owner doors default closed and private" is about the base's owner, and
+    // an authorised builder installing one must not take the base's locks with
+    // them.
+    const ownerAccountId = frame.ownerAccountId;
+    this.doors.set(key, {
+      definitionId,
+      ownerAccountId,
+      open: false,
+      site: { ...site },
+      installedAtTick: this.state.tick,
+    });
+
+    const placedHp = DOOR_PLACED_HP[definitionId] ?? 0;
+    const replicated = new DoorState();
+    replicated.definitionId = definitionId;
+    replicated.ownerAccountId = ownerAccountId;
+    replicated.open = false;
+    replicated.storey = site.storey;
+    replicated.i = site.i;
+    replicated.k = site.k;
+    replicated.axis = site.axis ?? '';
+    replicated.health = placedHp;
+    this.state.doors.set(key, replicated);
+
+    this.store.runInTransaction(() => {
+      this.store.savePlayerSlots(accountId, remaining);
+      this.store.saveDoor(key, {
+        definitionId,
+        ownerAccountId,
+        open: false,
+        storey: site.storey,
+        i: site.i,
+        k: site.k,
+        axis: site.axis ?? '',
+        health: placedHp,
+        installedAtTick: this.state.tick,
+      });
+    });
+    return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  /**
+   * GDD section 10: "Owner doors default closed and private", and door access
+   * is granted separately from building permission -- so a builder is not
+   * automatically a key holder.
+   */
+  private mayOperateDoor(accountId: string, key: string): boolean {
+    const door = this.doors.get(key);
+    if (!door) return false;
+    return door.ownerAccountId === accountId || (this.doorAccess.get(key)?.has(accountId) ?? false);
+  }
+
+  private resolveOperateDoor(
+    accountId: string,
+    site: PieceSite,
+    open: boolean,
+    sequence: number,
+  ): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    const key = siteKey(site);
+    const door = this.doors.get(key);
+    if (!door) return { ...base, accepted: false, reasonCode: 'not_found' };
+    if (!this.isWithinReach(accountId, worldPositionOf(site) as Vec3)) {
+      return { ...base, accepted: false, reasonCode: 'out_of_range' };
+    }
+    if (!this.mayOperateDoor(accountId, key)) {
+      return { ...base, accepted: false, reasonCode: 'forbidden' };
+    }
+
+    door.open = open;
+    const replicated = this.state.doors.get(key);
+    if (replicated) replicated.open = open;
+    this.store.saveDoor(key, {
+      definitionId: door.definitionId,
+      ownerAccountId: door.ownerAccountId,
+      open,
+      storey: site.storey,
+      i: site.i,
+      k: site.k,
+      axis: site.axis ?? '',
+      health: replicated?.health ?? 0,
+      installedAtTick: door.installedAtTick,
+    });
+    return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  private resolveSetDoorAccess(
+    accountId: string,
+    site: PieceSite,
+    targetAccountId: string,
+    granted: boolean,
+    sequence: number,
+  ): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    const key = siteKey(site);
+    const door = this.doors.get(key);
+    if (!door) return { ...base, accepted: false, reasonCode: 'not_found' };
+    // Only the owner hands out keys; a guest cannot invite their friends in.
+    if (door.ownerAccountId !== accountId) return { ...base, accepted: false, reasonCode: 'forbidden' };
+    if (!this.isWithinReach(accountId, worldPositionOf(site) as Vec3)) {
+      return { ...base, accepted: false, reasonCode: 'out_of_range' };
+    }
+
+    const list = this.doorAccess.get(key) ?? new Set<string>();
+    if (granted) list.add(targetAccountId);
+    else list.delete(targetAccountId);
+    this.doorAccess.set(key, list);
+    this.store.setDoorAccess(key, targetAccountId, granted);
+    return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  private resolveSetBuildAccess(
+    accountId: string,
+    targetAccountId: string,
+    granted: boolean,
+    sequence: number,
+  ): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    const list = this.buildAccess.get(accountId) ?? new Set<string>();
+    if (granted) list.add(targetAccountId);
+    else list.delete(targetAccountId);
+    this.buildAccess.set(accountId, list);
+    this.store.setBuildAccess(accountId, targetAccountId, granted);
     return { ...base, accepted: true, reasonCode: 'ok' };
   }
 
@@ -2013,6 +2235,44 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       return;
     }
 
+    if (
+      command.action.type === 'installDoor' ||
+      command.action.type === 'operateDoor' ||
+      command.action.type === 'setDoorAccess'
+    ) {
+      const action = command.action;
+      const site: PieceSite = {
+        form: 'doorway',
+        storey: action.storey,
+        i: action.i,
+        k: action.k,
+        axis: action.axis,
+      };
+      const encoded = this.store.commitOutcome(key, () => {
+        if (action.type === 'installDoor') {
+          return JSON.stringify(this.resolveInstallDoor(accountId, action.definitionId, site, command.sequence));
+        }
+        if (action.type === 'operateDoor') {
+          return JSON.stringify(this.resolveOperateDoor(accountId, site, action.open, command.sequence));
+        }
+        return JSON.stringify(
+          this.resolveSetDoorAccess(accountId, site, action.targetAccountId, action.granted, command.sequence),
+        );
+      });
+      client.send('commandResult', JSON.parse(encoded) as CommandResult);
+      client.send('inventory', { slots: this.playerSlots.get(accountId) });
+      return;
+    }
+
+    if (command.action.type === 'setBuildAccess') {
+      const { targetAccountId, granted } = command.action;
+      const encoded = this.store.commitOutcome(key, () =>
+        JSON.stringify(this.resolveSetBuildAccess(accountId, targetAccountId, granted, command.sequence)),
+      );
+      client.send('commandResult', JSON.parse(encoded) as CommandResult);
+      return;
+    }
+
     if (command.action.type === 'containerInsert' || command.action.type === 'containerTake') {
       const action = command.action;
       const containerId = action.containerId;
@@ -2589,6 +2849,10 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     corpseId: string,
   ): { ownerAccountId: string; position: Point3; inventory: CorpseInventory; diedAtTick: number } | undefined {
     return this.corpses.get(corpseId);
+  }
+
+  doorForTest(site: PieceSite): { ownerAccountId: string; open: boolean } | undefined {
+    return this.doors.get(siteKey(site));
   }
 
   containerForTest(containerId: string): Slot[] | undefined {

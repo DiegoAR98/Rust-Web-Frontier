@@ -115,6 +115,28 @@ export const BuildingPieceState = schema(
 );
 export type BuildingPieceState = SchemaType<typeof BuildingPieceState>;
 
+/**
+ * A door hanging in a doorway socket (GDD section 10), keyed by that
+ * doorway's site. Whether it is open is public -- "a door left open lets
+ * anyone walk through", which nobody can see unless it replicates. Who may
+ * operate it is not: the access list is the owner's business and stays off
+ * the schema (TECHNICAL section 3).
+ */
+export const DoorState = schema(
+  {
+    definitionId: t.string().default(''),
+    ownerAccountId: t.string().default(''),
+    open: t.boolean().default(false),
+    storey: t.number().default(0),
+    i: t.number().default(0),
+    k: t.number().default(0),
+    axis: t.string().default(''),
+    health: t.number().default(0),
+  },
+  'DoorState',
+);
+export type DoorState = SchemaType<typeof DoorState>;
+
 export const WorldState = schema(
   {
     players: t.map(PlayerState),
@@ -124,6 +146,7 @@ export const WorldState = schema(
     corpses: t.map(CorpseState),
     deployables: t.map(DeployableState),
     buildingPieces: t.map(BuildingPieceState),
+    doors: t.map(DoorState),
     tick: t.number().default(0),
   },
   'WorldState',

@@ -116,6 +116,54 @@ export const PlaceBuildingPieceIntentSchema = z.object({
 });
 export type PlaceBuildingPieceIntent = z.infer<typeof PlaceBuildingPieceIntentSchema>;
 
+/** The doorway site a door command acts on; the same lattice as a piece. */
+const doorwaySite = {
+  storey: z.number().int().min(0).max(16),
+  i: z.number().int().min(-4096).max(4096),
+  k: z.number().int().min(-4096).max(4096),
+  axis: z.enum(['x', 'z']),
+};
+
+/** Hangs a door in a doorway socket (GDD section 10). */
+export const InstallDoorIntentSchema = z.object({
+  type: z.literal('installDoor'),
+  definitionId: z.string().min(1).max(64),
+  ...doorwaySite,
+});
+export type InstallDoorIntent = z.infer<typeof InstallDoorIntentSchema>;
+
+/** Opens or shuts a door. GDD section 10: owner doors "default closed and private". */
+export const OperateDoorIntentSchema = z.object({
+  type: z.literal('operateDoor'),
+  open: z.boolean(),
+  ...doorwaySite,
+});
+export type OperateDoorIntent = z.infer<typeof OperateDoorIntentSchema>;
+
+/**
+ * Grants or revokes one named player's access to one door (GDD section 10:
+ * "The owner can grant named player IDs door access ... through a local
+ * interaction. Permissions persist and can be revoked immediately").
+ */
+export const SetDoorAccessIntentSchema = z.object({
+  type: z.literal('setDoorAccess'),
+  targetAccountId: z.string().min(1).max(64),
+  granted: z.boolean(),
+  ...doorwaySite,
+});
+export type SetDoorAccessIntent = z.infer<typeof SetDoorAccessIntentSchema>;
+
+/**
+ * Grants or revokes building permission -- section 10's "explicit builder",
+ * which it lists separately from door access on purpose.
+ */
+export const SetBuildAccessIntentSchema = z.object({
+  type: z.literal('setBuildAccess'),
+  targetAccountId: z.string().min(1).max(64),
+  granted: z.boolean(),
+});
+export type SetBuildAccessIntent = z.infer<typeof SetBuildAccessIntentSchema>;
+
 const containerId = () => z.string().min(1).max(64);
 
 /** Moves items from the pack into a placed container (GDD section 8). */
@@ -179,6 +227,10 @@ export const ActionPayloadSchema = z.discriminatedUnion('type', [
   CorpseTakeIntentSchema,
   PlaceDeployableIntentSchema,
   PlaceBuildingPieceIntentSchema,
+  InstallDoorIntentSchema,
+  OperateDoorIntentSchema,
+  SetDoorAccessIntentSchema,
+  SetBuildAccessIntentSchema,
   ContainerInsertIntentSchema,
   ContainerTakeIntentSchema,
 ]);

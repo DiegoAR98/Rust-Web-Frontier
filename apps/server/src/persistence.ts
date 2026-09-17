@@ -158,6 +158,37 @@ interface BuildingPieceRow {
   placed_at_tick: number;
 }
 
+export interface DoorRecord {
+  definitionId: string;
+  ownerAccountId: string;
+  open: boolean;
+  storey: number;
+  i: number;
+  k: number;
+  axis: string;
+  health: number;
+  installedAtTick: number;
+}
+
+interface DoorRow {
+  site_key: string;
+  definition_id: string;
+  owner_account_id: string;
+  open: number;
+  storey: number;
+  i: number;
+  k: number;
+  axis: string;
+  health: number;
+  installed_at_tick: number;
+}
+
+interface AccessRow {
+  site_key?: string;
+  owner_account_id?: string;
+  account_id: string;
+}
+
 export interface StationRecord {
   kind: StationKind;
   lit: boolean;
@@ -388,6 +419,28 @@ export class WorldStore {
         axis TEXT,
         health REAL NOT NULL,
         placed_at_tick INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS doors (
+        site_key TEXT PRIMARY KEY,
+        definition_id TEXT NOT NULL,
+        owner_account_id TEXT NOT NULL,
+        open INTEGER NOT NULL,
+        storey INTEGER NOT NULL,
+        i INTEGER NOT NULL,
+        k INTEGER NOT NULL,
+        axis TEXT NOT NULL,
+        health REAL NOT NULL,
+        installed_at_tick INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS door_access (
+        site_key TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        PRIMARY KEY (site_key, account_id)
+      );
+      CREATE TABLE IF NOT EXISTS build_access (
+        owner_account_id TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        PRIMARY KEY (owner_account_id, account_id)
       );
       CREATE TABLE IF NOT EXISTS deployable_slots (
         deployable_id TEXT NOT NULL,
@@ -1057,6 +1110,105 @@ export class WorldStore {
         health: row.health,
         placedAtTick: row.placed_at_tick,
       });
+    }
+    return result;
+  }
+
+  /** A door and whether it is shut. Class-1: installing one consumes an item. */
+  saveDoor(siteKey: string, door: DoorRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO doors
+           (site_key, definition_id, owner_account_id, open, storey, i, k, axis, health, installed_at_tick)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(site_key) DO UPDATE SET
+           definition_id = excluded.definition_id, owner_account_id = excluded.owner_account_id,
+           open = excluded.open, storey = excluded.storey, i = excluded.i, k = excluded.k,
+           axis = excluded.axis, health = excluded.health, installed_at_tick = excluded.installed_at_tick`,
+      )
+      .run(
+        siteKey,
+        door.definitionId,
+        door.ownerAccountId,
+        door.open ? 1 : 0,
+        door.storey,
+        door.i,
+        door.k,
+        door.axis,
+        door.health,
+        door.installedAtTick,
+      );
+  }
+
+  loadDoors(): Map<string, DoorRecord> {
+    const rows = this.db
+      .prepare(
+        `SELECT site_key, definition_id, owner_account_id, open, storey, i, k, axis, health, installed_at_tick
+         FROM doors`,
+      )
+      .all() as DoorRow[];
+    const result = new Map<string, DoorRecord>();
+    for (const row of rows) {
+      result.set(row.site_key, {
+        definitionId: row.definition_id,
+        ownerAccountId: row.owner_account_id,
+        open: row.open !== 0,
+        storey: row.storey,
+        i: row.i,
+        k: row.k,
+        axis: row.axis,
+        health: row.health,
+        installedAtTick: row.installed_at_tick,
+      });
+    }
+    return result;
+  }
+
+  /**
+   * GDD section 10: "Permissions persist and can be revoked immediately."
+   * Persisting is the whole point -- an access list that a restart cleared
+   * would lock a player's friends out of a base they were sharing.
+   */
+  setDoorAccess(siteKey: string, accountId: string, granted: boolean): void {
+    if (granted) {
+      this.db
+        .prepare('INSERT OR IGNORE INTO door_access (site_key, account_id) VALUES (?, ?)')
+        .run(siteKey, accountId);
+      return;
+    }
+    this.db.prepare('DELETE FROM door_access WHERE site_key = ? AND account_id = ?').run(siteKey, accountId);
+  }
+
+  loadDoorAccess(): Map<string, Set<string>> {
+    const rows = this.db.prepare('SELECT site_key, account_id FROM door_access').all() as AccessRow[];
+    const result = new Map<string, Set<string>>();
+    for (const row of rows) {
+      const list = result.get(row.site_key!) ?? new Set<string>();
+      list.add(row.account_id);
+      result.set(row.site_key!, list);
+    }
+    return result;
+  }
+
+  setBuildAccess(ownerAccountId: string, accountId: string, granted: boolean): void {
+    if (granted) {
+      this.db
+        .prepare('INSERT OR IGNORE INTO build_access (owner_account_id, account_id) VALUES (?, ?)')
+        .run(ownerAccountId, accountId);
+      return;
+    }
+    this.db
+      .prepare('DELETE FROM build_access WHERE owner_account_id = ? AND account_id = ?')
+      .run(ownerAccountId, accountId);
+  }
+
+  loadBuildAccess(): Map<string, Set<string>> {
+    const rows = this.db.prepare('SELECT owner_account_id, account_id FROM build_access').all() as AccessRow[];
+    const result = new Map<string, Set<string>>();
+    for (const row of rows) {
+      const list = result.get(row.owner_account_id!) ?? new Set<string>();
+      list.add(row.account_id);
+      result.set(row.owner_account_id!, list);
     }
     return result;
   }
