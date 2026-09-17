@@ -67,6 +67,8 @@ import {
   drainCalories,
   EXPOSURE_MAX,
   EXPOSURE_ZONE_RATES,
+  HAZARD_ZONE_CENTER,
+  HAZARD_ZONE_RADIUS_M,
   HEALTH_MAX,
   HEALTH_SPAWN,
   MELEE_SWING_CALORIE_COST,
@@ -122,20 +124,7 @@ export const MOVE_INTENT_GRACE_TICKS = 5;
  * standing_tree vs wood_pile both yielding wood).
  */
 const DEFAULT_YIELD_PER_HIT: Record<string, number> = { wood: 10 };
-/**
- * Placeholder hazard zone (GDD section 6's hot-ore exposure), standing in for
- * authored zone geometry. No worn-armor protection is modeled (0), since armor
- * does not exist until M3.
- *
- * Deliberately not on the spawn point any more. It was, for convenience, which
- * meant every new player began taking exposure the instant they joined. GDD
- * section 12 requires a respawn to be placed "outside structures/hazards", and
- * there is no reading of that where a first spawn should be worse. Twenty
- * metres east: still a short walk to exercise, and clear of the seeded item,
- * the nodes and the stations.
- */
-export const HAZARD_ZONE_CENTER = { x: 20, z: 0 };
-export const HAZARD_ZONE_RADIUS_M = 5;
+// The placeholder hot-ore zone lives in @rwf/sim; see HAZARD_ZONE_CENTER there.
 /** GDD section 5: how far a player can reach to take or hit something. */
 const INTERACT_REACH_M = 2.5;
 /**

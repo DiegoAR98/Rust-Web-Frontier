@@ -15,6 +15,8 @@ import { PROTOCOL_VERSION } from '@rwf/protocol';
 // server's answer cannot drift apart into two different rules.
 import {
   PLACEMENT_CLEARANCE_M,
+  HAZARD_ZONE_CENTER,
+  HAZARD_ZONE_RADIUS_M,
   siteKey,
   validatePieceSite,
   worldPositionOf,
@@ -191,16 +193,15 @@ itemMesh.material = itemMaterial;
  * a player has to walk to it, an unmarked patch of ground that quietly damages
  * them would be the worst of both.
  */
-const HAZARD_ZONE = { x: 20, z: 0, radius: 5 };
 const hazardMaterial = new StandardMaterial('hazardMat', scene);
 hazardMaterial.diffuseColor = new Color3(0.8, 0.45, 0.15);
 hazardMaterial.alpha = 0.35;
 const hazardMesh = MeshBuilder.CreateGround(
   'hazardZone',
-  { width: HAZARD_ZONE.radius * 2, height: HAZARD_ZONE.radius * 2 },
+  { width: HAZARD_ZONE_RADIUS_M * 2, height: HAZARD_ZONE_RADIUS_M * 2 },
   scene,
 );
-hazardMesh.position.set(HAZARD_ZONE.x, 0.02, HAZARD_ZONE.z);
+hazardMesh.position.set(HAZARD_ZONE_CENTER.x, 0.02, HAZARD_ZONE_CENTER.z);
 hazardMesh.material = hazardMaterial;
 hazardMesh.isPickable = false;
 
@@ -1129,8 +1130,8 @@ function describeNearest(): string {
   }
   // Only while it matters: a warning that is always on the screen stops being
   // read long before the player is standing in the thing it warns about.
-  const toHazard = Math.hypot(camera.position.x - HAZARD_ZONE.x, camera.position.z - HAZARD_ZONE.z);
-  if (toHazard <= HAZARD_ZONE.radius) parts.push('IN THE HOT-ORE ZONE');
+  const toHazard = Math.hypot(camera.position.x - HAZARD_ZONE_CENTER.x, camera.position.z - HAZARD_ZONE_CENTER.z);
+  if (toHazard <= HAZARD_ZONE_RADIUS_M) parts.push('IN THE HOT-ORE ZONE');
   return parts.join('  ');
 }
 

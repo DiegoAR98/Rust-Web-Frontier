@@ -1,8 +1,8 @@
 import { boot, type ColyseusTestServer } from '@colyseus/testing';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import appConfig from '@rwf/server/app.config';
-import { CALORIE_SPAWN, EXPOSURE_ZONE_RATES } from '@rwf/sim';
-import { HAZARD_ZONE_CENTER, type WorldRoom } from '@rwf/server/world-room';
+import { CALORIE_SPAWN, EXPOSURE_ZONE_RATES, HAZARD_ZONE_CENTER } from '@rwf/sim';
+import type { WorldRoom } from '@rwf/server/world-room';
 
 let colyseus: ColyseusTestServer;
 

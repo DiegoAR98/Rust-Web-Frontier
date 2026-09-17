@@ -23,6 +23,18 @@ export function computeStarvationDamage(calories: number, dt: number): number {
 }
 
 export const EXPOSURE_ZONE_RATES = { low: 2, medium: 5, high: 10 } as const;
+
+/**
+ * The placeholder hot-ore zone, standing in for authored zone geometry. Shared
+ * rather than declared on each side: the server decides who it damages and the
+ * client draws it, and two copies of a position is two ways for the drawn
+ * circle to stop matching the ground that hurts you.
+ *
+ * Deliberately off the spawn point -- GDD section 12 places a respawn "outside
+ * structures/hazards", and a first spawn should be no worse.
+ */
+export const HAZARD_ZONE_CENTER = { x: 20, z: 0 } as const;
+export const HAZARD_ZONE_RADIUS_M = 5;
 export const EXPOSURE_PROTECTION_CAP = 0.9;
 export const EXPOSURE_DECAY_PER_S = 2;
 export const EXPOSURE_SICKNESS_THRESHOLD = 500;
