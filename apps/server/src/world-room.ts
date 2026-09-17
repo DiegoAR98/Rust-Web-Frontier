@@ -1,9 +1,10 @@
 import { Room, type Client } from '@colyseus/core';
 import { CommandSchema, type Command, type CommandResult } from '@rwf/protocol';
-import { getItem, getRecipe } from '@rwf/content';
+import { getConsumable, getItem, getRecipe } from '@rwf/content';
 import {
   addToInventory,
   applyBleedWound,
+  CALORIE_MAX,
   CALORIE_SPAWN,
   CREATURE_SPECS,
   harvestCarcassHit,
@@ -23,6 +24,7 @@ import {
   computeColdCalorieDrainPerS,
   computeColdDamagePerS,
   computeColdDeficit,
+  computeRegenPerS,
   computeStarvationDamage,
   countFreeCapacity,
   dayPhase,
@@ -34,6 +36,8 @@ import {
   EXPOSURE_ZONE_RATES,
   HEALTH_MAX,
   HEALTH_SPAWN,
+  MELEE_SWING_CALORIE_COST,
+  REGEN_CALORIE_COST_PER_HP,
   harvestNode,
   removeFromInventory,
   startQueueEntry,
@@ -52,7 +56,7 @@ import {
   type StationState,
   type WorldItem,
 } from '@rwf/sim';
-import { WorldStore, type Vec3 } from './persistence.js';
+import { WorldStore, type StatusEffectRecord, type Vec3 } from './persistence.js';
 import { CarcassState, CreatureState, PlayerState, WorldItemState, WorldState } from './world-state.js';
 
 /** Matches TECHNICAL section 3's simulation budget: 20 fixed ticks/s. */
@@ -146,8 +150,18 @@ const SPAWN_KIT: Array<[string, number]> = [
  * rules from the same section, which nothing else is waiting on.
  */
 const USE_CHANNEL_SECONDS: Record<string, number> = { bandage: 2 };
+
+/** How long a use channel runs, for medicine or for food. */
+function useChannelSeconds(definitionId: string): number | undefined {
+  return USE_CHANNEL_SECONDS[definitionId] ?? getConsumable(definitionId)?.channelSeconds;
+}
+
+/** GDD section 6: a fire within 4 m is what "a nearby campfire" means. */
+const CAMPFIRE_WARMTH_RADIUS_M = 4;
 /** GDD section 6: "A shared 2-second post-use cooldown prevents instant stacked medicine." */
 const USE_COOLDOWN_TICKS = 2 * TICK_RATE_HZ;
+/** GDD section 6: raw meat "applies 20 seconds of sickness at 0.5 HP/s". */
+const POISON_RATE_PER_S = 0.5;
 
 interface ClientUserData {
   accountId: string;
@@ -252,6 +266,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private bleedRoll: () => number = Math.random;
   private readonly channelsByAccount = new Map<string, { definitionId: string; channel: ChannelState }>();
   private readonly useCooldownUntilTick = new Map<string, number>();
+  private readonly poisonByAccount = new Map<string, BleedWound>();
+  /** When each account last took damage, for GDD section 6's 10s regen delay. */
+  private readonly lastDamagedTick = new Map<string, number>();
 
   onCreate(): void {
     // TECHNICAL section 17: the world keeps running even when nobody is
@@ -308,6 +325,12 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     }
     for (const [accountId, vitals] of this.store.loadPlayerVitals()) {
       this.playerVitals.set(accountId, vitals);
+    }
+    for (const [accountId, effects] of this.store.loadStatusEffects()) {
+      for (const effect of effects) {
+        const target = effect.kind === 'poison' ? this.poisonByAccount : this.woundsByAccount;
+        target.set(accountId, { ratePerS: effect.ratePerS, remainingS: effect.remainingS });
+      }
     }
     for (const [stationId, record] of this.store.loadStations()) {
       const spec = STATION_SPECS[record.kind];
@@ -417,6 +440,10 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       }
       for (const [accountId, vitals] of this.playerVitals) {
         this.store.savePlayerVitals(accountId, vitals);
+        // Written for every known player, not only the wounded ones, so a
+        // wound that closed since the last checkpoint is actually cleared
+        // rather than left behind to be restored on the next restart.
+        this.store.saveStatusEffects(accountId, this.statusEffectsOf(accountId));
       }
       for (const [accountId, entry] of this.craftingByAccount) {
         this.persistCrafting(accountId, entry);
@@ -469,6 +496,26 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     const empty: Slot[] = new Array(BACKPACK_SLOTS).fill(null);
     this.playerSlots.set(accountId, empty);
     this.store.savePlayerSlots(accountId, empty);
+  }
+
+  poisonForTest(accountId: string): BleedWound | null {
+    return this.poisonByAccount.get(accountId) ?? null;
+  }
+
+  poisonForTestSet(accountId: string, wound: BleedWound): void {
+    this.poisonByAccount.set(accountId, wound);
+  }
+
+  setVitalsForTest(accountId: string, vitals: { calories: number; health: number; exposure: number }): void {
+    this.playerVitals.set(accountId, vitals);
+  }
+
+  setLastDamagedTickForTest(accountId: string, tick: number): void {
+    this.lastDamagedTick.set(accountId, tick);
+  }
+
+  clearUseCooldownForTest(accountId: string): void {
+    this.useCooldownUntilTick.delete(accountId);
   }
 
   expireCarcassesForTest(): void {
@@ -602,6 +649,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     const vitals = this.playerVitals.get(accountId);
     if (!vitals) return;
     this.playerVitals.set(accountId, { ...vitals, health: Math.max(0, vitals.health - damage) });
+    this.lastDamagedTick.set(accountId, this.state.tick);
     this.cancelChannel(accountId);
 
     if (source === 'bite' && this.bleedRoll() < BITE_BLEED_CHANCE) {
@@ -620,18 +668,34 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
    * regeneration and cold damage stop.
    */
   private tickBleeding(dt: number): void {
-    for (const [accountId, wound] of this.woundsByAccount) {
-      const { wound: next, damage } = tickBleed(wound, dt);
-      if (next) {
-        this.woundsByAccount.set(accountId, next);
-      } else {
-        this.woundsByAccount.delete(accountId);
-      }
+    // Food poisoning is the same rule with a different name (GDD section 6:
+    // "20 seconds of sickness at 0.5 HP/s"), so it runs through the same loop.
+    for (const effects of [this.woundsByAccount, this.poisonByAccount]) {
+      for (const [accountId, wound] of effects) {
+        const { wound: next, damage } = tickBleed(wound, dt);
+        if (next) {
+          effects.set(accountId, next);
+        } else {
+          effects.delete(accountId);
+        }
 
-      const vitals = this.playerVitals.get(accountId);
-      if (!vitals || damage <= 0) continue;
-      this.playerVitals.set(accountId, { ...vitals, health: Math.max(0, vitals.health - damage) });
+        const vitals = this.playerVitals.get(accountId);
+        if (!vitals || damage <= 0) continue;
+        this.playerVitals.set(accountId, { ...vitals, health: Math.max(0, vitals.health - damage) });
+        // Bleeding counts as damage for the regeneration delay, but it does
+        // not cancel a use channel; see damagePlayer and D36.
+        this.lastDamagedTick.set(accountId, this.state.tick);
+      }
     }
+  }
+
+  private statusEffectsOf(accountId: string): StatusEffectRecord[] {
+    const effects: StatusEffectRecord[] = [];
+    const bleed = this.woundsByAccount.get(accountId);
+    if (bleed) effects.push({ kind: 'bleed', ...bleed });
+    const poison = this.poisonByAccount.get(accountId);
+    if (poison) effects.push({ kind: 'poison', ...poison });
+    return effects;
   }
 
   /** Seeds a carcass directly; the world normally makes them by killing something. */
@@ -670,6 +734,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     }
     if (this.isSwingOnCooldown(accountId)) return { ...base, accepted: false, reasonCode: 'rate_limited' };
     this.lastSwingTick.set(accountId, this.state.tick);
+    this.chargeSwingCalorie(accountId);
 
     const health = creature.health - MELEE_DAMAGE;
     // GDD section 7: "Prey flee when approached or hurt", and "damage alerts
@@ -722,6 +787,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     }
 
     this.lastSwingTick.set(accountId, this.state.tick);
+    this.chargeSwingCalorie(accountId);
     for (const [definitionId, quantity] of entries) {
       const { slots: next, overflow } = addToInventory(
         slots,
@@ -768,7 +834,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
    */
   private resolveUseItem(accountId: string, definitionId: string, sequence: number): CommandResult {
     const base = { sequence, serverTick: this.state.tick };
-    const durationS = USE_CHANNEL_SECONDS[definitionId];
+    const durationS = useChannelSeconds(definitionId);
     if (durationS === undefined) return { ...base, accepted: false, reasonCode: 'not_found' };
 
     const cooldownUntil = this.useCooldownUntilTick.get(accountId);
@@ -827,10 +893,38 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       this.playerSlots.set(accountId, next);
       this.store.savePlayerSlots(accountId, next);
       if (open.definitionId === 'bandage') this.woundsByAccount.delete(accountId);
+      this.applyConsumable(accountId, open.definitionId);
 
       const client = this.clientsByAccount.get(accountId);
       client?.send('inventory', { slots: next });
       this.sendChannel(accountId);
+    }
+  }
+
+  /**
+   * Applies what eating something does (CONTENT section 1, GDD section 6).
+   * Raw meat is deliberately edible: it feeds badly and makes you sick, which
+   * is the decision the cooking loop exists to let you avoid.
+   */
+  private applyConsumable(accountId: string, definitionId: string): void {
+    const effect = getConsumable(definitionId);
+    const vitals = this.playerVitals.get(accountId);
+    if (!effect || !vitals) return;
+
+    this.playerVitals.set(accountId, {
+      calories: Math.min(CALORIE_MAX, vitals.calories + effect.calories),
+      health: Math.min(HEALTH_MAX, vitals.health + effect.health),
+      exposure: Math.max(0, vitals.exposure + effect.exposure),
+    });
+
+    if (effect.poisonSeconds > 0) {
+      // GDD section 6: "Repeated consumption refreshes, not stacks, the
+      // duration" -- which is applyBleedWound's max-rate/latest-expiry rule.
+      // Poisoning is the same shape of timed damage as bleeding.
+      this.poisonByAccount.set(
+        accountId,
+        applyBleedWound(this.poisonByAccount.get(accountId) ?? null, POISON_RATE_PER_S, effect.poisonSeconds),
+      );
     }
   }
 
@@ -841,6 +935,34 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       definitionId: open?.definitionId ?? null,
       elapsedS: open?.channel.elapsedS ?? 0,
       durationS: open?.channel.durationS ?? 0,
+    });
+  }
+
+  /** GDD section 6's "nearby campfire": a lit one within 4 m. */
+  private isNearLitCampfire(position: Point3): boolean {
+    for (const [stationId, config] of this.stationConfigs) {
+      if (config.kind !== 'campfire') continue;
+      if (!this.stations.get(stationId)?.lit) continue;
+      const distance = Math.hypot(
+        position.x - config.position.x,
+        position.y - config.position.y,
+        position.z - config.position.z,
+      );
+      if (distance <= CAMPFIRE_WARMTH_RADIUS_M) return true;
+    }
+    return false;
+  }
+
+  /**
+   * GDD section 6: "Every valid melee swing additionally costs 1 calorie."
+   * Charged only on swings the server accepted, so a refused one is free.
+   */
+  private chargeSwingCalorie(accountId: string): void {
+    const vitals = this.playerVitals.get(accountId);
+    if (!vitals) return;
+    this.playerVitals.set(accountId, {
+      ...vitals,
+      calories: Math.max(0, vitals.calories - MELEE_SWING_CALORIE_COST),
     });
   }
 
@@ -1318,6 +1440,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     // Only an accepted swing starts the cooldown; a refused one (out of
     // reach, full pack, depleted) must not also cost the player their rhythm.
     this.lastSwingTick.set(accountId, this.state.tick);
+    this.chargeSwingCalorie(accountId);
     const { node: nextNode, result } = harvestNode(node, config.yieldPerHit);
     this.resourceNodes.set(nodeId, nextNode);
     this.store.saveNodeState(nodeId, config.definitionId, nextNode.remaining, config.yieldPerHit, config.position);
@@ -1652,11 +1775,29 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       const starvation = computeStarvationDamage(calories, dt);
       const exposureDamage = computeExposureDamage(exposure) * dt;
       const coldDamage = computeColdDamagePerS(coldDeficit) * dt;
-      const health = Math.max(
-        0,
-        Math.min(HEALTH_MAX, vitals.health - starvation - exposureDamage - coldDamage),
-      );
-      const next = { calories, health, exposure };
+      const damage = starvation + exposureDamage + coldDamage;
+      if (damage > 0) this.lastDamagedTick.set(accountId, this.state.tick);
+
+      // GDD section 6's passive recovery. Without it health only ever falls:
+      // the wolf outside is a one-way trip to 0 HP, which is not a state the
+      // game can do anything with until M2's death transaction exists.
+      const regenPerS = computeRegenPerS({
+        calories,
+        secondsSinceDamage: (this.state.tick - (this.lastDamagedTick.get(accountId) ?? -Infinity)) / TICK_RATE_HZ,
+        bleeding: this.woundsByAccount.has(accountId),
+        poisoned: this.poisonByAccount.has(accountId),
+        exposure,
+        coldDeficit,
+        nearCampfire: this.isNearLitCampfire(movement.position),
+      });
+      const beforeRegen = Math.max(0, Math.min(HEALTH_MAX, vitals.health - damage));
+      const health = Math.min(HEALTH_MAX, beforeRegen + regenPerS * dt);
+      // "Each regenerated HP consumes two additional calories" -- charged on
+      // what was actually healed, so a player already at full health pays
+      // nothing.
+      const healed = health - beforeRegen;
+
+      const next = { calories: Math.max(0, calories - healed * REGEN_CALORIE_COST_PER_HP), health, exposure };
       this.playerVitals.set(accountId, next);
 
       this.clientsByAccount.get(accountId)?.send('vitals', {

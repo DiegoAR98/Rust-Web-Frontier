@@ -187,6 +187,11 @@ window.addEventListener('keydown', (e) => {
   // GDD section 6's use channels. Bandage is the only one with an effect so
   // far, so it gets the key rather than a belt slot.
   if (e.code === 'KeyB') send({ type: 'useItem', definitionId: 'bandage' });
+  // Cooked first: raw meat feeds badly and poisons you (GDD section 6), so it
+  // is what you eat when there is nothing else.
+  if (e.code === 'KeyV') {
+    send({ type: 'useItem', definitionId: heldQuantity('cooked_meat') > 0 ? 'cooked_meat' : 'raw_meat' });
+  }
 });
 
 document.addEventListener('pointerlockchange', () => {
@@ -540,9 +545,23 @@ function describeNearest(): string {
   if (itemMesh.isEnabled()) {
     parts.push(`wood ${Vector3.Distance(camera.position, ITEM_WORLD_POSITION).toFixed(1)}m (E)`);
   }
+  // Everything LMB can hit, closest first, because LMB picks the nearest of
+  // them: naming only the nodes would have the HUD point at a wood pile while
+  // the click went to the deer standing next to it.
+  const swingable: Array<{ label: string; distance: number }> = [];
   for (const node of NODES) {
-    parts.push(`${node.label} ${Vector3.Distance(camera.position, node.position).toFixed(1)}m (LMB)`);
+    swingable.push({ label: node.label, distance: Vector3.Distance(camera.position, node.position) });
   }
+  for (const [id, position] of creaturePositions) {
+    swingable.push({ label: id, distance: Vector3.Distance(camera.position, position) });
+  }
+  for (const [id, position] of carcassPositions) {
+    swingable.push({ label: `${id} carcass`, distance: Vector3.Distance(camera.position, position) });
+  }
+  for (const target of swingable.sort((a, b) => a.distance - b.distance).slice(0, 3)) {
+    parts.push(`${target.label} ${target.distance.toFixed(1)}m (LMB)`);
+  }
+
   const station = nearestStation();
   if (station) {
     parts.push(`${station.label} ${Vector3.Distance(camera.position, station.position).toFixed(1)}m`);
@@ -616,7 +635,7 @@ engine.runRenderLoop(() => {
           }`,
           `last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : `  (${lookError ?? 'click canvas to look'})`}`,
           'WASD move : shift sprint : space jump : LMB swing at what you face : E take : C craft hatchet',
-          'B bandage : at a station -- F add fuel : R add input : G light/snuff : T take output',
+          'B bandage : V eat : at a station -- F add fuel : R add input : G light/snuff : T take output',
         ].join('\n')
       : disconnectReason
         ? `${disconnectReason} -- reload to reconnect`

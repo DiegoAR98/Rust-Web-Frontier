@@ -67,3 +67,36 @@ export function coldBlocksRegeneration(deficit: number): boolean {
 export function computeColdDamagePerS(deficit: number): number {
   return deficit >= 40 ? 0.25 : 0;
 }
+
+/**
+ * GDD section 6: "Passive regeneration is 0.1 HP/s when calories are at least
+ * 800, no damage was received in the previous 10 seconds, and no bleeding,
+ * poisoning, exposure sickness or cold deficit of 20+ is active. A nearby
+ * campfire raises regeneration to 0.4 HP/s under the same conditions. Each
+ * regenerated HP consumes two additional calories."
+ */
+export const REGEN_CALORIE_THRESHOLD = 800;
+export const REGEN_BASE_PER_S = 0.1;
+export const REGEN_CAMPFIRE_PER_S = 0.4;
+export const REGEN_CALORIE_COST_PER_HP = 2;
+export const REGEN_DAMAGE_QUIET_S = 10;
+
+export interface RegenConditions {
+  calories: number;
+  secondsSinceDamage: number;
+  bleeding: boolean;
+  poisoned: boolean;
+  exposure: number;
+  coldDeficit: number;
+  nearCampfire: boolean;
+}
+
+/** HP per second a player regenerates right now; 0 if anything blocks it. */
+export function computeRegenPerS(conditions: RegenConditions): number {
+  if (conditions.calories < REGEN_CALORIE_THRESHOLD) return 0;
+  if (conditions.secondsSinceDamage < REGEN_DAMAGE_QUIET_S) return 0;
+  if (conditions.bleeding || conditions.poisoned) return 0;
+  if (conditions.exposure >= EXPOSURE_SICKNESS_THRESHOLD) return 0;
+  if (coldBlocksRegeneration(conditions.coldDeficit)) return 0;
+  return conditions.nearCampfire ? REGEN_CAMPFIRE_PER_S : REGEN_BASE_PER_S;
+}

@@ -53,6 +53,21 @@ interface ItemClaimRow {
   z: number;
 }
 
+export type StatusEffectKind = 'bleed' | 'poison';
+
+export interface StatusEffectRecord {
+  kind: StatusEffectKind;
+  ratePerS: number;
+  remainingS: number;
+}
+
+interface StatusEffectRow {
+  account_id: string;
+  kind: string;
+  rate_per_s: number;
+  remaining_s: number;
+}
+
 export interface StationRecord {
   kind: StationKind;
   lit: boolean;
@@ -217,6 +232,13 @@ export class WorldStore {
         calories REAL NOT NULL,
         health REAL NOT NULL,
         exposure REAL NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS status_effects (
+        account_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        rate_per_s REAL NOT NULL,
+        remaining_s REAL NOT NULL,
+        PRIMARY KEY (account_id, kind)
       );
       CREATE TABLE IF NOT EXISTS stations (
         station_id TEXT PRIMARY KEY,
@@ -631,6 +653,36 @@ export class WorldStore {
         const target = slot.compartment === 'input' ? station.inputs : station.outputs;
         target[slot.slot_index] = stack;
       }
+    }
+    return result;
+  }
+
+  /**
+   * Replaces one account's timed status effects. Continuous state like vitals
+   * (TECHNICAL section 7's class 2), and checkpointed with them: health is
+   * durable, so the bleeding draining it has to be too, or stopping the host
+   * is a free heal.
+   */
+  saveStatusEffects(accountId: string, effects: StatusEffectRecord[]): void {
+    const replace = this.db.transaction((rows: StatusEffectRecord[]) => {
+      this.db.prepare('DELETE FROM status_effects WHERE account_id = ?').run(accountId);
+      const insert = this.db.prepare(
+        'INSERT INTO status_effects (account_id, kind, rate_per_s, remaining_s) VALUES (?, ?, ?, ?)',
+      );
+      for (const row of rows) insert.run(accountId, row.kind, row.ratePerS, row.remainingS);
+    });
+    replace(effects);
+  }
+
+  loadStatusEffects(): Map<string, StatusEffectRecord[]> {
+    const rows = this.db
+      .prepare('SELECT account_id, kind, rate_per_s, remaining_s FROM status_effects')
+      .all() as StatusEffectRow[];
+    const result = new Map<string, StatusEffectRecord[]>();
+    for (const row of rows) {
+      const list = result.get(row.account_id) ?? [];
+      list.push({ kind: row.kind as StatusEffectKind, ratePerS: row.rate_per_s, remainingS: row.remaining_s });
+      result.set(row.account_id, list);
     }
     return result;
   }
