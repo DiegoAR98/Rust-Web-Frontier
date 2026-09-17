@@ -904,6 +904,35 @@ function attemptSwing(): void {
       action: { type: 'harvestCarcass', carcassId: id },
     });
   }
+  for (const [id, position] of deployablePositions) {
+    candidates.push({
+      distance: Vector3.Distance(camera.position, position),
+      action: { type: 'attackDeployable', deployableId: id },
+    });
+  }
+  // Structural pieces, so a raider can actually get through a wall. Combat
+  // immune ones are left out of the list rather than swung at and refused --
+  // GDD section 10 makes that immunity deliberate, so it is not a surprise
+  // worth spending a swing to discover.
+  if (room) {
+    for (const piece of room.state.buildingPieces.values()) {
+      if (piece.form === 'foundation' || piece.form === 'pillar') continue;
+      const site: PieceSite = {
+        form: piece.form as PieceForm,
+        storey: piece.storey,
+        i: piece.i,
+        k: piece.k,
+        axis: piece.axis === '' ? null : (piece.axis as 'x' | 'z'),
+      };
+      const at = worldPositionOf(site);
+      candidates.push({
+        distance: Vector3.Distance(camera.position, new Vector3(at.x, at.y, at.z)),
+        // A door hangs at the same site as its frame; hitting the frame while
+        // a door is in it would leave the door floating.
+        action: { type: 'attackStructure', door: room.state.doors.has(siteKey(site)), ...site },
+      });
+    }
+  }
   for (const node of NODES) {
     candidates.push({
       distance: Vector3.Distance(camera.position, node.position),
