@@ -40,23 +40,26 @@ function transactionKeyString(key: TransactionKey): string {
 }
 
 /**
- * Commits an outcome for a transaction key exactly once. A duplicate
- * sequence (retry after a client timeout, or a forced-replay after crash
- * recovery) returns the originally stored outcome instead of recomputing
- * or overwriting it (TECHNICAL section 2: "Retries return the stored
- * outcome, not another item"). Uses `has` rather than an `undefined` check
- * so a legitimately committed `undefined` outcome cannot fail open into a
+ * Commits an outcome for a transaction key exactly once. `computeOutcome`
+ * is a lazy factory rather than a plain value: on a duplicate sequence
+ * (retry after a client timeout, or a forced-replay after crash recovery)
+ * it is never invoked, so a side-effecting resolver (granting an item,
+ * mutating world state) cannot run twice. The stored outcome is returned
+ * instead (TECHNICAL section 2: "Retries return the stored outcome, not
+ * another item"). Uses `has` rather than an `undefined` check so a
+ * legitimately committed `undefined` outcome cannot fail open into a
  * reprocess.
  */
 export function commitOutcome<TOutcome>(
   log: TransactionLog<TOutcome>,
   key: TransactionKey,
-  outcome: TOutcome,
+  computeOutcome: () => TOutcome,
 ): TOutcome {
   const k = transactionKeyString(key);
   if (log.committed.has(k)) {
     return log.committed.get(k) as TOutcome;
   }
+  const outcome = computeOutcome();
   log.committed.set(k, outcome);
   return outcome;
 }

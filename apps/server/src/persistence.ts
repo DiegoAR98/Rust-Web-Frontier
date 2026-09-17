@@ -69,7 +69,12 @@ export class WorldStore {
     return row?.epoch === sessionEpoch;
   }
 
-  commitOutcome(key: TransactionKey, outcome: string): string {
+  /**
+   * `computeOutcome` is a lazy factory: on a duplicate sequence it is never
+   * invoked, so a side-effecting resolver cannot run twice (mirrors
+   * @rwf/sim's commitOutcome contract).
+   */
+  commitOutcome(key: TransactionKey, computeOutcome: () => string): string {
     if (!Number.isSafeInteger(key.sessionEpoch) || !Number.isSafeInteger(key.sequence)) {
       throw new RangeError('transaction key requires safe-integer sessionEpoch and sequence');
     }
@@ -81,6 +86,7 @@ export class WorldStore {
     if (existing) {
       return existing.outcome;
     }
+    const outcome = computeOutcome();
     this.db
       .prepare(
         'INSERT INTO transactions (account_id, session_epoch, sequence, outcome) VALUES (?, ?, ?, ?)',

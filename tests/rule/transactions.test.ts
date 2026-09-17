@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   beginSession,
   commitOutcome,
@@ -41,7 +41,7 @@ describe('transaction outcome log', () => {
   it('commits a new outcome for a fresh transaction key', () => {
     const log: TransactionLog<string> = { committed: new Map() };
 
-    const outcome = commitOutcome(log, { accountId: 'acct_1', sessionEpoch: 1, sequence: 1 }, 'granted-wood');
+    const outcome = commitOutcome(log, { accountId: 'acct_1', sessionEpoch: 1, sequence: 1 }, () => 'granted-wood');
 
     expect(outcome).toBe('granted-wood');
   });
@@ -50,17 +50,28 @@ describe('transaction outcome log', () => {
     const log: TransactionLog<string> = { committed: new Map() };
     const key = { accountId: 'acct_1', sessionEpoch: 1, sequence: 1 };
 
-    commitOutcome(log, key, 'granted-wood');
-    const replay = commitOutcome(log, key, 'granted-stone');
+    commitOutcome(log, key, () => 'granted-wood');
+    const replay = commitOutcome(log, key, () => 'granted-stone');
 
     expect(replay).toBe('granted-wood');
+  });
+
+  it('never invokes the compute function for a duplicate sequence, so a side-effecting resolver cannot run twice', () => {
+    const log: TransactionLog<string> = { committed: new Map() };
+    const key = { accountId: 'acct_1', sessionEpoch: 1, sequence: 1 };
+    const compute = vi.fn(() => 'granted-wood');
+
+    commitOutcome(log, key, compute);
+    commitOutcome(log, key, compute);
+
+    expect(compute).toHaveBeenCalledTimes(1);
   });
 
   it('distinguishes transaction keys by sequence, session epoch and account', () => {
     const log: TransactionLog<string> = { committed: new Map() };
 
-    commitOutcome(log, { accountId: 'acct_1', sessionEpoch: 1, sequence: 1 }, 'a');
-    const other = commitOutcome(log, { accountId: 'acct_1', sessionEpoch: 2, sequence: 1 }, 'b');
+    commitOutcome(log, { accountId: 'acct_1', sessionEpoch: 1, sequence: 1 }, () => 'a');
+    const other = commitOutcome(log, { accountId: 'acct_1', sessionEpoch: 2, sequence: 1 }, () => 'b');
 
     expect(other).toBe('b');
   });
@@ -69,8 +80,8 @@ describe('transaction outcome log', () => {
     const log: TransactionLog<string | undefined> = { committed: new Map() };
     const key = { accountId: 'acct_1', sessionEpoch: 1, sequence: 1 };
 
-    commitOutcome(log, key, undefined);
-    const replay = commitOutcome(log, key, 'granted-wood');
+    commitOutcome(log, key, () => undefined);
+    const replay = commitOutcome(log, key, () => 'granted-wood');
 
     expect(replay).toBeUndefined();
   });
@@ -79,6 +90,6 @@ describe('transaction outcome log', () => {
     const log: TransactionLog<string> = { committed: new Map() };
     const unsafe = { accountId: 'acct_1', sessionEpoch: 1, sequence: Number.MAX_SAFE_INTEGER + 2 };
 
-    expect(() => commitOutcome(log, unsafe, 'a')).toThrow();
+    expect(() => commitOutcome(log, unsafe, () => 'a')).toThrow();
   });
 });

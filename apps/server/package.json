@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "exports": {
-    "./persistence": "./src/persistence.ts"
+    "./persistence": "./src/persistence.ts",
+    "./app.config": "./src/app.config.ts",
+    "./world-room": "./src/world-room.ts"
   },
   "scripts": {
     "dev": "tsx watch src/index.ts",
@@ -12,13 +14,16 @@
   },
   "dependencies": {
     "@colyseus/core": "0.18.14",
-    "@colyseus/schema": "^5.0.8",
+    "@colyseus/schema": "5.0.32",
+    "@colyseus/tools": "0.18.3",
     "@colyseus/ws-transport": "0.18.2",
     "@rwf/protocol": "*",
     "@rwf/sim": "*",
     "better-sqlite3": "13.0.3"
   },
   "devDependencies": {
+    "@colyseus/sdk": "0.18.2",
+    "@colyseus/testing": "0.18.5",
     "@types/better-sqlite3": "9.6.0"
   }
 }

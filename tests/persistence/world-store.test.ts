@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WorldStore } from '@rwf/server/persistence';
 
 let dir: string;
@@ -21,15 +21,27 @@ describe('WorldStore transaction durability (T04)', () => {
     const key = { accountId: 'acct_1', sessionEpoch: 1, sequence: 1 };
 
     const before = new WorldStore(dbFile);
-    const first = before.commitOutcome(key, 'granted-wood');
+    const first = before.commitOutcome(key, () => 'granted-wood');
     before.close(); // simulates the process being force-killed right after commit
 
     const after = new WorldStore(dbFile);
-    const replay = after.commitOutcome(key, 'granted-stone');
+    const replay = after.commitOutcome(key, () => 'granted-stone');
     after.close();
 
     expect(first).toBe('granted-wood');
     expect(replay).toBe('granted-wood');
+  });
+
+  it('never invokes the compute function for a duplicate sequence, even within the same process', () => {
+    const key = { accountId: 'acct_1', sessionEpoch: 1, sequence: 1 };
+    const store = new WorldStore(dbFile);
+    const compute = vi.fn(() => 'granted-wood');
+
+    store.commitOutcome(key, compute);
+    store.commitOutcome(key, compute);
+    store.close();
+
+    expect(compute).toHaveBeenCalledTimes(1);
   });
 });
 
