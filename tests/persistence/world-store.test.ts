@@ -64,6 +64,51 @@ describe('WorldStore transaction durability (T04)', () => {
   });
 });
 
+describe('WorldStore commit atomicity', () => {
+  it('rolls back the resolver\'s own writes when it fails partway', () => {
+    const store = new WorldStore(dbFile);
+    const key = { accountId: 'acct_1', sessionEpoch: 1, sequence: 1 };
+
+    // A real resolver commits several statements: resolveHitNode does
+    // saveNodeState then savePlayerSlots. If the process dies between them,
+    // the node has permanently lost budget that no player ever received.
+    expect(() =>
+      store.commitOutcome(key, () => {
+        store.saveNodeState('node_1', 'wood', 90, 10, POS);
+        throw new Error('host died between the resolver\'s two writes');
+      }),
+    ).toThrow();
+
+    expect(store.loadNodeStates().size).toBe(0);
+    store.close();
+  });
+
+  it('leaves no log row behind for a failed commit, so the command can be retried', () => {
+    const store = new WorldStore(dbFile);
+    const key = { accountId: 'acct_1', sessionEpoch: 1, sequence: 1 };
+
+    expect(() =>
+      store.commitOutcome(key, () => {
+        throw new Error('resolver failed');
+      }),
+    ).toThrow();
+
+    // A half-written commit must not masquerade as already done.
+    expect(store.commitOutcome(key, () => 'retried')).toBe('retried');
+    store.close();
+  });
+
+  it('still records a successful commit exactly once', () => {
+    // Guards against a rollback so eager it also discards good commits.
+    const store = new WorldStore(dbFile);
+    const key = { accountId: 'acct_1', sessionEpoch: 1, sequence: 1 };
+
+    expect(store.commitOutcome(key, () => 'first')).toBe('first');
+    expect(store.commitOutcome(key, () => 'second')).toBe('first');
+    store.close();
+  });
+});
+
 describe('WorldStore session durability', () => {
   it('keeps the session epoch counter durable across a restart, so a pre-crash old session stays stale', () => {
     const before = new WorldStore(dbFile);

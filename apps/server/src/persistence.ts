@@ -104,6 +104,12 @@ export class WorldStore {
     }
     this.db = new Database(filename);
     this.db.pragma('journal_mode = WAL');
+    // WAL defaults to synchronous = NORMAL, which survives a process crash but
+    // not an OS crash or power loss -- weaker than what this class promises
+    // below and what TECHNICAL section 7 requires of a committed transaction.
+    // FULL costs an fsync per commit; at 20Hz with checkpoints every 5s that
+    // is well within budget for a single-host world.
+    this.db.pragma('synchronous = FULL');
     this.migrate();
   }
 
@@ -210,6 +216,14 @@ export class WorldStore {
    * `computeOutcome` is a lazy factory: on a duplicate sequence it is never
    * invoked, so a side-effecting resolver cannot run twice (mirrors
    * @rwf/sim's commitOutcome contract).
+   *
+   * The resolver and the log row share one SQLite transaction. Without that
+   * they are separate commits, and a resolver like resolveHitNode makes
+   * several of its own: a crash between them leaves the node's budget spent
+   * with nothing granted, or the effect applied but unlogged so a same-epoch
+   * retry runs it again. Either outcome breaks the exactly-once guarantee the
+   * transaction key exists to provide, so the whole thing commits or none of
+   * it does.
    */
   commitOutcome(key: TransactionKey, computeOutcome: () => string): string {
     if (!Number.isSafeInteger(key.sessionEpoch) || !Number.isSafeInteger(key.sequence)) {
@@ -223,13 +237,16 @@ export class WorldStore {
     if (existing) {
       return existing.outcome;
     }
-    const outcome = computeOutcome();
-    this.db
-      .prepare(
-        'INSERT INTO transactions (account_id, session_epoch, sequence, outcome) VALUES (?, ?, ?, ?)',
-      )
-      .run(key.accountId, key.sessionEpoch, key.sequence, outcome);
-    return outcome;
+    const commit = this.db.transaction(() => {
+      const outcome = computeOutcome();
+      this.db
+        .prepare(
+          'INSERT INTO transactions (account_id, session_epoch, sequence, outcome) VALUES (?, ?, ?, ?)',
+        )
+        .run(key.accountId, key.sessionEpoch, key.sequence, outcome);
+      return outcome;
+    });
+    return commit();
   }
 
   /** Persists the simulation's own tick counter. Never derived from wall-clock time. */
