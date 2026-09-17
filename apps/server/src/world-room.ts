@@ -36,6 +36,12 @@ export const CHECKPOINT_INTERVAL_TICKS = 5 * TICK_RATE_HZ;
 /** GDD section 8: 24 backpack slots per player. */
 const BACKPACK_SLOTS = 24;
 /**
+ * How long a move intent stays live without a refresh. The client resends at
+ * 20Hz (one per tick), so 5 ticks absorbs 250ms of jitter or packet loss
+ * before the avatar stops. See expireStaleMoveIntents.
+ */
+const MOVE_INTENT_GRACE_TICKS = 5;
+/**
  * Per-resource gather rate (CONTENT section 4). Keyed by the resource
  * produced rather than a node-type ID: today every node producing a given
  * resource shares one rate. Revisit with a real node-type lookup once a
@@ -69,7 +75,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private store!: WorldStore;
   private readonly worldItems = new Map<string, WorldItem>();
   private readonly movementByAccount = new Map<string, MovementState>();
-  private readonly pendingMove = new Map<string, MoveAction>();
+  private readonly pendingMove = new Map<string, { action: MoveAction; tick: number }>();
   private readonly resourceNodes = new Map<string, ResourceNode>();
   private readonly nodeConfigs = new Map<string, NodeConfig>();
   private readonly playerSlots = new Map<string, Slot[]>();
@@ -253,7 +259,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     }
 
     if (command.action.type === 'move') {
-      this.pendingMove.set(accountId, command.action);
+      this.pendingMove.set(accountId, { action: command.action, tick: this.state.tick });
       return;
     }
 
@@ -359,6 +365,37 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     return { ...base, accepted: true, reasonCode: 'ok' };
   }
 
+  /**
+   * A move intent describes what the player is doing right now, so it must not
+   * outlive the stream of commands that produced it. Without this, one packet
+   * drives the avatar forever: a backgrounded tab (whose send interval browsers
+   * throttle to ~1Hz) or any packet-loss gap leaves the player sprinting across
+   * the map unattended, burning calories at the sprint rate and re-jumping on
+   * every landing.
+   *
+   * Expiry neutralizes the axes rather than dropping the entry, so gravity keeps
+   * integrating and a player who disconnects mid-air still falls to the ground.
+   * Yaw and crouch are posture, not motion, and are left as the player set them.
+   */
+  private expireStaleMoveIntents(): void {
+    for (const [accountId, pending] of this.pendingMove) {
+      if (this.state.tick - pending.tick <= MOVE_INTENT_GRACE_TICKS) continue;
+      const { action } = pending;
+      if (action.axisX === 0 && action.axisY === 0 && !action.sprint && !action.jump) continue;
+      // Keeping the original tick leaves the entry expired, so it stays
+      // neutral until a fresh command replaces it.
+      this.pendingMove.set(accountId, {
+        action: { ...action, axisX: 0, axisY: 0, sprint: false, jump: false },
+        tick: pending.tick,
+      });
+    }
+  }
+
+  /** Test-only: reports whether the account's *effective* intent is sprinting. */
+  isSprintingForTest(accountId: string): boolean {
+    return this.pendingMove.get(accountId)?.action.sprint ?? false;
+  }
+
   /** Advances every account's active crafting entry by dt seconds. */
   private tickCrafting(dt: number): void {
     for (const [accountId, entry] of this.craftingByAccount) {
@@ -403,7 +440,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private tick(dt: number): void {
     this.state.tick += 1;
 
-    for (const [accountId, action] of this.pendingMove) {
+    this.expireStaleMoveIntents();
+
+    for (const [accountId, { action }] of this.pendingMove) {
       const movement = this.movementByAccount.get(accountId);
       const player = this.state.players.get(accountId);
       if (!movement || !player) continue;
@@ -423,7 +462,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       const movement = this.movementByAccount.get(accountId);
       if (!vitals || !movement) continue;
 
-      const sprinting = this.pendingMove.get(accountId)?.sprint ?? false;
+      const sprinting = this.pendingMove.get(accountId)?.action.sprint ?? false;
       const calories = drainCalories(vitals.calories, dt, sprinting);
 
       const dx = movement.position.x - HAZARD_ZONE_CENTER.x;
