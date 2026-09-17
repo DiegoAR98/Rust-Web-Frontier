@@ -5,3 +5,4 @@ export * from './transactions.js';
 export * from './survival.js';
 export * from './bleed.js';
 export * from './processing.js';
+export * from './carcass.js';
