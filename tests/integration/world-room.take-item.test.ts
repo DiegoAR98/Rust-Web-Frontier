@@ -80,3 +80,56 @@ describe('WorldRoom take-item conservation (T03)', () => {
     client.leave();
   });
 });
+
+/**
+ * GDD section 5: taking a world item puts it in the taker's pack. Claiming it
+ * on the replicated state only removes it from the world; without the grant
+ * the item is destroyed rather than picked up.
+ */
+describe('WorldRoom take-item grants the item (GDD section 5)', () => {
+  it('puts the taken item in the pack and tells the owner', async () => {
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    room.spawnItem('item_1', 'wood');
+
+    const client = await colyseus.connectTo(room, { accountId: 'acct_take' });
+    const inventories: Array<{ slots: Array<{ definitionId: string; quantity: number } | null> }> = [];
+    client.onMessage('inventory', (payload) => inventories.push(payload));
+    await client.waitForMessage('session');
+
+    expect(room.countForTest('acct_take', 'wood')).toBe(0);
+
+    client.send('command', takeItemCommand(1, 'item_1'));
+    const result = await client.waitForMessage('commandResult');
+
+    expect(result.accepted).toBe(true);
+    expect(room.countForTest('acct_take', 'wood')).toBe(1);
+    // The owner has to be told, the same way an accepted gather tells them.
+    const latest = inventories.at(-1)!;
+    expect(latest.slots.filter((s) => s?.definitionId === 'wood')).toHaveLength(1);
+
+    client.leave();
+  });
+
+  it('refuses a take that will not fit and leaves the item unclaimed', async () => {
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    room.spawnItem('item_1', 'wood');
+
+    const client = await colyseus.connectTo(room, { accountId: 'acct_full' });
+    await client.waitForMessage('session');
+    // Stone hatchets do not stack, so 24 of them occupy every backpack slot
+    // and leave wood nowhere to go.
+    room.grantForTest('acct_full', 'stone_hatchet', 24);
+
+    client.send('command', takeItemCommand(1, 'item_1'));
+    const result = await client.waitForMessage('commandResult');
+
+    expect(result.accepted).toBe(false);
+    expect(result.reasonCode).toBe('insufficient_resources');
+    // GDD section 8: a refused take must not consume the item. Claiming it
+    // and then failing to grant it would delete it from the world.
+    expect(room.state.items.get('item_1')!.claimedBy).toBe('');
+    expect(room.countForTest('acct_full', 'wood')).toBe(0);
+
+    client.leave();
+  });
+});

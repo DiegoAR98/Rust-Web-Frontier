@@ -382,6 +382,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         JSON.stringify(this.resolveTakeItem(accountId, itemInstanceId, command.sequence)),
       );
       client.send('commandResult', JSON.parse(encoded) as CommandResult);
+      // A take that succeeded changed the pack; tell the owner, same as a
+      // gather does. Inventory is private, so it cannot ride the shared state.
+      client.send('inventory', { slots: this.playerSlots.get(accountId) });
       return;
     }
 
@@ -416,6 +419,18 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       return { ...base, accepted: false, reasonCode: 'out_of_range' };
     }
 
+    // Checked before the claim, for the same reason resolveHitNode peeks
+    // before harvesting: claiming the item and then finding nowhere to put it
+    // would delete it from the world instead of picking it up.
+    const worldItem = this.worldItems.get(itemInstanceId);
+    const currentSlots = this.playerSlots.get(accountId) ?? new Array(BACKPACK_SLOTS).fill(null);
+    if (worldItem && worldItem.claimedBy === null) {
+      const stackLimit = getItem(worldItem.definitionId)?.stack ?? 1;
+      if (countFreeCapacity(currentSlots, worldItem.definitionId, stackLimit) < 1) {
+        return { ...base, accepted: false, reasonCode: 'insufficient_resources' };
+      }
+    }
+
     const outcome = simTakeItem(this.worldItems, itemInstanceId, accountId);
     if (outcome.outcome === 'taken') {
       const stateItem = this.state.items.get(itemInstanceId);
@@ -428,6 +443,17 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
           position ?? { x: 0, y: 0, z: 0 },
         );
       }
+      // The claim only removes the item from the world; this is what actually
+      // puts it in the taker's pack (GDD section 5).
+      const stackLimit = getItem(outcome.item.definitionId)?.stack ?? 1;
+      const { slots, overflow } = addToInventory(currentSlots, outcome.item.definitionId, 1, stackLimit);
+      if (overflow > 0) {
+        // Unreachable given the capacity check above; failing loudly beats
+        // silently destroying the item if the two ever disagree.
+        throw new Error(`take overflow of ${outcome.item.definitionId} despite a capacity check`);
+      }
+      this.playerSlots.set(accountId, slots);
+      this.store.savePlayerSlots(accountId, slots);
       return { ...base, accepted: true, reasonCode: 'ok' };
     }
     return { ...base, accepted: false, reasonCode: outcome.outcome };
