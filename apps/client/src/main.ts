@@ -11,7 +11,7 @@ import '@babylonjs/core/Meshes/Builders/capsuleBuilder';
 import '@babylonjs/core/Meshes/Builders/boxBuilder';
 import { ColyseusSDK, getStateCallbacks, type Room } from '@colyseus/sdk';
 import { PROTOCOL_VERSION } from '@rwf/protocol';
-import { computeMoveIntent, type KeyState } from './input.js';
+import { computeMoveIntent, wrapYaw, type KeyState } from './input.js';
 import { interpolateTransform, type Transform } from './interpolate.js';
 
 /**
@@ -205,7 +205,7 @@ function sendMoveCommand(): void {
     sessionEpoch,
     sequence,
     clientTick: 0,
-    action: { type: 'move', ...intent, yaw: camera.rotation.y },
+    action: { type: 'move', ...intent, yaw: wrapYaw(camera.rotation.y) },
   });
 }
 
