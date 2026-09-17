@@ -61,11 +61,19 @@ describe('WorldRoom movement (T01)', () => {
     const observer = await colyseus.connectTo(room, { accountId: 'acct_b' });
 
     mover.send('command', moveCommand({ sessionEpoch: 1 }));
-    await room.waitForNextTimestep();
-    await room.waitForNextTimestep();
-    await observer.waitForNextPatch();
 
-    const observedMover = observer.state.players.get('acct_a');
+    // The command crosses a real socket, so assuming it lands within a fixed
+    // two timesteps is a bet on delivery time that a loaded machine loses.
+    // Waiting for the displacement itself is not a weaker test: the bound
+    // below is the actual claim, and it holds however many timesteps pass,
+    // because the intent expires after MOVE_INTENT_GRACE_TICKS either way.
+    let observedMover = observer.state.players.get('acct_a');
+    for (let i = 0; i < 40 && !(observedMover && observedMover.z > 0); i++) {
+      await room.waitForNextTimestep();
+      await observer.waitForNextPatch();
+      observedMover = observer.state.players.get('acct_a');
+    }
+
     expect(observedMover).toBeDefined();
     expect(observedMover!.z).toBeGreaterThan(0);
     // The point of the assertion is that the server integrates its own

@@ -44,7 +44,11 @@ describe('WorldRoom survival wiring (T05)', () => {
     client.onMessage('vitals', (payload: { calories: number; health: number }) => {
       latestVitals = payload;
     });
-    await client.waitForMessage('inventory'); // confirms onJoin's initial batch landed
+    // Waits for a vitals frame rather than onJoin's one-shot inventory: the
+    // join batch may already have landed by the time this line runs (see
+    // tests/setup.ts), whereas vitals ship every tick, so a frame after now
+    // is guaranteed and proves the same thing -- the room is ticking at us.
+    await client.waitForMessage('vitals');
 
     for (let i = 0; i < 5; i++) {
       await room.waitForNextTimestep();
@@ -75,7 +79,7 @@ describe('WorldRoom hazard zone exposure wiring (T06)', () => {
     client.onMessage('vitals', (payload: { exposure: number }) => {
       latestVitals = payload;
     });
-    await client.waitForMessage('inventory');
+    await client.waitForMessage('vitals'); // see the note in the calorie test above
 
     for (let i = 0; i < 5; i++) {
       await room.waitForNextTimestep();
