@@ -291,6 +291,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     // shared replicated schema. Sent the same tick as 'session' for the
     // same reason (avoid racing the client's post-join listener setup).
     this.clock.setTimeout(() => {
+      // A join followed immediately by a leave would otherwise fire these at a
+      // client that is already gone.
+      if (this.clientsByAccount.get(accountId) !== client) return;
       client.send('inventory', { slots: this.playerSlots.get(accountId) });
       client.send('vitals', this.playerVitals.get(accountId));
     }, 0);
@@ -299,6 +302,12 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   onLeave(client: RoomClient): void {
     const accountId = client.userData?.accountId;
     if (accountId) {
+      // Only tear down if this is still the account's current connection. A
+      // half-dead socket can close after the reconnect that replaced it has
+      // already rebound the account; keying purely on accountId would then
+      // remove the live client, and the reconnected player would stop being
+      // simulated while still appearing connected.
+      if (this.clientsByAccount.get(accountId) !== client) return;
       this.pendingMove.delete(accountId);
       this.connectedAccounts.delete(accountId);
       this.clientsByAccount.delete(accountId);
@@ -549,6 +558,10 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   }
 
   /** Test-only read accessors; no client-facing binding. */
+  isConnectedForTest(accountId: string): boolean {
+    return this.connectedAccounts.has(accountId);
+  }
+
   nodeRemainingForTest(nodeId: string): number | undefined {
     return this.resourceNodes.get(nodeId)?.remaining;
   }
