@@ -258,3 +258,13 @@ Reach was previously a distance check alone, which meant a raider standing outsi
 Two consequences worth stating. **The world entity cap now counts both** structural pieces and deployables, which is what D54 said it would have to do. And **a base is currently unraidable** — not by design but because nothing can damage a structure, so the only way through a locked door is to be given a key.
 
 The client's ghost imports `validatePieceSite` rather than reimplementing the support rules, so the preview and the answer cannot become two different rules. It stays a preview: it does not know the per-owner caps or where other players are standing, so the HUD says "clear here" rather than "allowed".
+
+### 2026-09-17 — Which reaches a wall stops (amends D61)
+
+Making reach wall-aware caught every caller of one shared helper, including `hitNode`, `attackCreature` and `harvestCarcass`. That silently introduced a rule the design does not have, and it only showed up because the question was asked directly: nothing in the suite built a wall near a wolf.
+
+| ID | Decision | Status and reason |
+|---|---|---|
+| D64 | Occlusion applies to reaching *for* things, not to swings | Proposed, and a correction to how D61 was first wired. Containers, corpses, stations, doors and world items go through the occluded check, because all five are the loot T11 denies through a wall. Swings — `hitNode`, `attackCreature`, `harvestCarcass` — stay on plain distance: GDD gives no rule against hitting what is on the far side of a wall, and T20's "no wall attacks" constrains animals rather than players, so denying it would be inventing a rule rather than implementing one. It also keeps a scan of every wall in the world off the 20 Hz swing path |
+
+The barrier list is cached and invalidated when a piece goes up or a door swings, rather than rebuilt per reach check. Recorded against **D27**: rebuilding it per call was the same shape as the un-cooldowned work that entry already tracks, and it was reached far more often.
