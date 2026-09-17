@@ -167,3 +167,19 @@ Wildlife was the keystone the rest of M1 was waiting on. Without animals there w
 | D40 | Wandering is standing at the anchor | Proposed. A real idle walk needs a random source, which would make the room's simulation non-deterministic on replay; the tick-driven design otherwise has none. Add it as a seeded stream when animals need to look alive rather than merely behave correctly |
 
 The spawn kit (GDD §5's rock, torch and two bandages) is granted on session epoch 1 — an account's first join ever — because that is the only available signal that separates a new player from one who has emptied their pack. Respawn-on-death will need its own rule when death exists in M2.
+
+### 2026-09-17 — Closing the survival loop: food, poisoning and regeneration
+
+Putting wolves in the world made an unrecoverable state reachable in about ten seconds, which is worth stating plainly because it was a consequence of the previous change rather than a pre-existing gap. Health was monotonically non-increasing: starvation, exposure, cold, bleeding and bites all subtracted, and nothing anywhere added. Seven bites put a player at 0 HP permanently, and GDD §6's "health at zero triggers one death transaction" is M2 scope. The same asymmetry applied to calories — a player could hunt a deer, cook the meat on the campfire built the same day, and have no way to eat it.
+
+Both halves of GDD §6 that answer this are now wired, and both reuse machinery that already existed. Food is a use channel, so it inherits the bandage's cancel-consumes-nothing and consume-on-completion path unchanged. Passive regeneration is a pure function of the conditions GDD lists, called from the survival tick.
+
+| ID | Decision | Status and reason |
+|---|---|---|
+| D41 | 0 HP remains a terminal state with no recovery, and is a known invalid state until M2 | Accepted limitation, now much harder to reach. GDD §6 says health at zero triggers one death transaction; death, corpses, bedroll respawn and loot-on-death are M2's gate (T13). Until that exists a player at 0 HP stays there, alive and unable to act on it. Regeneration, food and bandages mean reaching it now takes sustained neglect or a losing fight rather than one unlucky encounter |
+| D42 | Only cooked meat and raw meat have consumable effects | Proposed. CONTENT §1 also gives beans (+300 calories, −25 exposure) and rations (+600, +10 health, −50 exposure), but CONTENT §12 makes both loot-only and there is no loot table yet, so rows for them would be data nobody could reach. Added with the loot system |
+| D43 | Food poisoning reuses the bleed wound structure and its tick | Proposed. GDD §6 gives poisoning a rate and a duration that "refreshes, not stacks" — the same max-rate/latest-expiry rule `applyBleedWound` already implements for bleeding, and the same per-second damage `tickBleed` already applies. Modeling it separately would have duplicated both. They stay distinct maps because regeneration checks them separately and a bandage clears only one |
+
+Two consequences of wiring regeneration are worth noting. A lit campfire now has a second reason to exist besides cooking — GDD §6's 0.4 HP/s — which is also the hook the cold vertical's warmth will use (T07's unfinished half). And `MELEE_SWING_CALORIE_COST`, which had a constant and no callsite since the gather vertical, is now charged on every accepted swing; a refused swing is still free.
+
+Bleeding and poisoning are now checkpointed with the vitals they drain. They were in memory only, so stopping the host cleared them while the damaged health stayed — a free heal of the same shape this codebase already refuses for station fuel, and contrary to GDD §12's rule that a sleeper's "existing bleeding, poison and exposure finish under normal rules".
