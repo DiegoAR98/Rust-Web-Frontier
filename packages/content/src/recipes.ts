@@ -29,6 +29,52 @@ export const RECIPES: RecipeDefinition[] = [
     inputs: { wood: 40 },
     durationS: 10,
   },
+  // CONTENT section 7's wood tier: "foundation | wood 60 / 15 s", "pillar |
+  // wood 15 / 5 s", "wall | wood 40 / 10 s", "doorway | wood 40 / 10 s",
+  // "ceiling | wood 50 / 15 s", plus section 2's "wood_door | wood 30 | 10".
+  // These six sum to CONTENT's 360-wood 1x1 cabin.
+  {
+    id: 'wood_foundation',
+    outputId: 'wood_foundation',
+    outputQuantityPerUnit: 1,
+    inputs: { wood: 60 },
+    durationS: 15,
+  },
+  {
+    id: 'wood_pillar',
+    outputId: 'wood_pillar',
+    outputQuantityPerUnit: 1,
+    inputs: { wood: 15 },
+    durationS: 5,
+  },
+  {
+    id: 'wood_wall',
+    outputId: 'wood_wall',
+    outputQuantityPerUnit: 1,
+    inputs: { wood: 40 },
+    durationS: 10,
+  },
+  {
+    id: 'wood_doorway',
+    outputId: 'wood_doorway',
+    outputQuantityPerUnit: 1,
+    inputs: { wood: 40 },
+    durationS: 10,
+  },
+  {
+    id: 'wood_ceiling',
+    outputId: 'wood_ceiling',
+    outputQuantityPerUnit: 1,
+    inputs: { wood: 50 },
+    durationS: 15,
+  },
+  {
+    id: 'wood_door',
+    outputId: 'wood_door',
+    outputQuantityPerUnit: 1,
+    inputs: { wood: 30 },
+    durationS: 10,
+  },
 ];
 
 export function getRecipe(recipeId: string): RecipeDefinition | undefined {

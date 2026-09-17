@@ -2,8 +2,12 @@ import { describe, expect, it } from 'vitest';
 import { ITEMS, getItem, validateItemCatalog } from '@rwf/content';
 
 describe('item catalog (CONTENT section 1)', () => {
-  it('has exactly 68 individually listed item definitions', () => {
-    expect(ITEMS.length).toBe(68);
+  it('holds CONTENT s individually listed items plus the building pieces', () => {
+    // CONTENT section 1: "102 item definitions (68 individually listed, 16
+    // armor, 18 modular building pieces)". The 18 pieces arrived with the
+    // building vertical; the 16 armor rows are still owed, and this sum is
+    // what says so.
+    expect(ITEMS.length).toBe(68 + 18);
   });
 
   it('has no duplicate IDs', () => {

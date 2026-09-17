@@ -77,6 +77,27 @@ export const ITEMS: ItemDefinition[] = [
   { id: 'bars', displayName: 'Iron window bars', stack: 10, durable: false },
   { id: 'gateway', displayName: 'Timber gateway', stack: 10, durable: false },
   { id: 'gate', displayName: 'Timber gate', stack: 10, durable: false },
+  // CONTENT section 7: "Nine forms x two tiers = 18 inventory pieces ...
+  // Stack limit 10." Listed in full like the rest of this catalog; which of
+  // them a player can actually craft and place is BUILDING_PIECES' business.
+  { id: 'wood_foundation', displayName: 'Wood foundation', stack: 10, durable: false },
+  { id: 'wood_steps', displayName: 'Wood steps', stack: 10, durable: false },
+  { id: 'wood_pillar', displayName: 'Wood pillar', stack: 10, durable: false },
+  { id: 'wood_wall', displayName: 'Wood wall', stack: 10, durable: false },
+  { id: 'wood_doorway', displayName: 'Wood doorway', stack: 10, durable: false },
+  { id: 'wood_window', displayName: 'Wood window', stack: 10, durable: false },
+  { id: 'wood_ceiling', displayName: 'Wood ceiling', stack: 10, durable: false },
+  { id: 'wood_stairs', displayName: 'Wood stairs', stack: 10, durable: false },
+  { id: 'wood_ramp', displayName: 'Wood ramp', stack: 10, durable: false },
+  { id: 'metal_foundation', displayName: 'Iron foundation', stack: 10, durable: false },
+  { id: 'metal_steps', displayName: 'Iron steps', stack: 10, durable: false },
+  { id: 'metal_pillar', displayName: 'Iron pillar', stack: 10, durable: false },
+  { id: 'metal_wall', displayName: 'Iron wall', stack: 10, durable: false },
+  { id: 'metal_doorway', displayName: 'Iron doorway', stack: 10, durable: false },
+  { id: 'metal_window', displayName: 'Iron window', stack: 10, durable: false },
+  { id: 'metal_ceiling', displayName: 'Iron ceiling', stack: 10, durable: false },
+  { id: 'metal_stairs', displayName: 'Iron stairs', stack: 10, durable: false },
+  { id: 'metal_ramp', displayName: 'Iron ramp', stack: 10, durable: false },
 ];
 
 export function getItem(id: string): ItemDefinition | undefined {
