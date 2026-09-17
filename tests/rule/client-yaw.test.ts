@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { wrapYaw } from '@rwf/client/input';
+import { clampPitch, MAX_PITCH_RAD, wrapYaw } from '@rwf/client/input';
 import { MoveIntentSchema } from '@rwf/protocol';
 
 /**
@@ -61,5 +61,35 @@ describe('wrapYaw', () => {
     // not reach the wire, because that too is a disconnect rather than a drop.
     expect(wrapYaw(Number.NaN)).toBe(0);
     expect(wrapYaw(Number.POSITIVE_INFINITY)).toBe(0);
+  });
+});
+
+/**
+ * Pitch is clamped rather than wrapped: looking past straight up should stop
+ * at straight up, not roll the camera over onto its back. Just short of
+ * vertical, because exactly +/-90 degrees makes the view matrix's up vector
+ * degenerate and the view rolls unpredictably.
+ */
+describe('clampPitch', () => {
+  it('leaves an ordinary angle untouched', () => {
+    expect(clampPitch(0)).toBe(0);
+    expect(clampPitch(0.5)).toBeCloseTo(0.5, 12);
+    expect(clampPitch(-0.5)).toBeCloseTo(-0.5, 12);
+  });
+
+  it('stops at the limit instead of tipping over the top', () => {
+    expect(clampPitch(Math.PI)).toBe(MAX_PITCH_RAD);
+    expect(clampPitch(-Math.PI)).toBe(-MAX_PITCH_RAD);
+  });
+
+  it('never reaches exactly straight up or down', () => {
+    expect(MAX_PITCH_RAD).toBeLessThan(Math.PI / 2);
+    expect(clampPitch(1e9)).toBeLessThan(Math.PI / 2);
+    expect(clampPitch(-1e9)).toBeGreaterThan(-Math.PI / 2);
+  });
+
+  it('clamps a non-finite angle to level', () => {
+    expect(clampPitch(Number.NaN)).toBe(0);
+    expect(clampPitch(Number.POSITIVE_INFINITY)).toBe(0);
   });
 });

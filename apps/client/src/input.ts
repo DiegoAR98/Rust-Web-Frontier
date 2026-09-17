@@ -33,6 +33,22 @@ export function wrapYaw(yaw: number): number {
   return wrapped;
 }
 
+/**
+ * How far up or down the camera may look. Just short of vertical: at exactly
+ * +/-90 degrees the view matrix's up vector degenerates and the view rolls.
+ */
+export const MAX_PITCH_RAD = Math.PI / 2 - 0.01;
+
+/**
+ * Clamps vertical look, rather than wrapping it the way yaw is wrapped:
+ * looking past straight up must stop at straight up, not tip the camera over
+ * onto its back.
+ */
+export function clampPitch(pitch: number): number {
+  if (!Number.isFinite(pitch)) return 0;
+  return Math.min(MAX_PITCH_RAD, Math.max(-MAX_PITCH_RAD, pitch));
+}
+
 /** Converts raw held-key state into the bounded axis intent GDD section 5 specifies. */
 export function computeMoveIntent(keys: KeyState): MoveIntent {
   const axisY = (keys.forward ? 1 : 0) - (keys.back ? 1 : 0);

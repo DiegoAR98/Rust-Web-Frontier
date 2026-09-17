@@ -11,7 +11,7 @@ import '@babylonjs/core/Meshes/Builders/capsuleBuilder';
 import '@babylonjs/core/Meshes/Builders/boxBuilder';
 import { ColyseusSDK, getStateCallbacks, type Room } from '@colyseus/sdk';
 import { PROTOCOL_VERSION } from '@rwf/protocol';
-import { computeMoveIntent, wrapYaw, type KeyState } from './input.js';
+import { clampPitch, computeMoveIntent, wrapYaw, type KeyState } from './input.js';
 import { interpolateTransform, type Transform } from './interpolate.js';
 
 /**
@@ -74,6 +74,9 @@ let entered = false;
 let inventorySlots: Array<{ definitionId: string; quantity: number } | null> = [];
 let sendTimer: number | undefined;
 let disconnectReason: string | undefined;
+let lookError: string | undefined;
+let yaw = 0;
+let pitch = 0;
 
 const keys: KeyState = {
   forward: false,
@@ -106,12 +109,45 @@ window.addEventListener('keydown', (e) => {
 
 document.addEventListener('pointerlockchange', () => {
   entered = document.pointerLockElement === canvas;
+  if (entered) lookError = undefined;
 });
+
+// Pointer lock failing used to be completely silent, which made a dead
+// mouse-look indistinguishable from a broken camera. Now it says so.
+document.addEventListener('pointerlockerror', () => {
+  lookError = 'pointer lock refused';
+});
+
+/**
+ * Requests pointer lock defensively. Two things bite here:
+ * - the API returns a Promise in current Chrome but `undefined` in older
+ *   browsers, so calling .catch() on the result throws a TypeError and takes
+ *   the surrounding click handler down with it;
+ * - it must be called while the user activation from the click is still live,
+ *   so callers must not await anything first.
+ */
+function requestLook(): void {
+  try {
+    const result = canvas.requestPointerLock() as unknown as Promise<void> | undefined;
+    if (result && typeof result.catch === 'function') {
+      result.catch(() => {
+        lookError = 'pointer lock refused';
+      });
+    }
+  } catch {
+    lookError = 'pointer lock unavailable';
+  }
+}
 
 window.addEventListener('mousemove', (e) => {
   if (!entered) return;
   const sensitivity = 0.0025;
-  camera.rotation.y += e.movementX * sensitivity;
+  yaw = wrapYaw(yaw + e.movementX * sensitivity);
+  // Vertical look was simply absent before: only yaw was applied, so moving
+  // the mouse up or down did nothing at all.
+  pitch = clampPitch(pitch + e.movementY * sensitivity);
+  camera.rotation.y = yaw;
+  camera.rotation.x = pitch;
 });
 
 // GDD section 5: "Use/aim | Left/right mouse". Gathering is a tool-use
@@ -122,20 +158,19 @@ window.addEventListener('mousedown', (e) => {
 
 // Mouse-look needs pointer lock, but a lock rejection/delay must never block
 // the connection or WASD movement: those are gated on `room`, not `entered`.
-enterButton.addEventListener('click', async () => {
+enterButton.addEventListener('click', () => {
   overlayEl.style.display = 'none';
-  if (!room) await connect();
-  try {
-    await canvas.requestPointerLock();
-  } catch {
-    // Mouse-look is unavailable until the user clicks the canvas below;
-    // movement and everything else still works.
-  }
+  // Requested FIRST and synchronously. Awaiting connect() here -- a real
+  // WebSocket handshake -- meant the browser no longer saw a live user
+  // activation by the time pointer lock was asked for, so it was refused and
+  // the game came up with working WASD and a frozen camera.
+  requestLook();
+  if (!room) void connect();
 });
 
 // Re-acquire pointer lock after it's lost (Escape, alt-tab, devtools focus).
 canvas.addEventListener('click', () => {
-  if (!entered) canvas.requestPointerLock().catch(() => {});
+  if (!entered) requestLook();
 });
 
 async function connect(): Promise<void> {
@@ -221,7 +256,7 @@ function sendMoveCommand(): void {
     sessionEpoch,
     sequence,
     clientTick: 0,
-    action: { type: 'move', ...intent, yaw: wrapYaw(camera.rotation.y) },
+    action: { type: 'move', ...intent, yaw: wrapYaw(yaw) },
   });
 }
 
@@ -267,7 +302,7 @@ engine.runRenderLoop(() => {
 
   const woodCount = inventorySlots.reduce((sum, slot) => sum + (slot?.definitionId === 'wood' ? slot.quantity : 0), 0);
   statusEl.textContent = room
-    ? `account ${accountId.slice(0, 8)} epoch ${sessionEpoch} players ${room.state.players.size} wood ${woodCount} last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : ' (click canvas to look)'}`
+    ? `account ${accountId.slice(0, 8)} epoch ${sessionEpoch} players ${room.state.players.size} wood ${woodCount} last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : ` (${lookError ?? 'click canvas to look'})`}`
     : disconnectReason
       ? `${disconnectReason} -- reload to reconnect`
       : 'not connected';
