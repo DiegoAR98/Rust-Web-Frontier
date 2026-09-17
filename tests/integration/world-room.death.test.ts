@@ -154,6 +154,33 @@ describe('WorldRoom death (GDD section 12)', () => {
     client.leave();
   });
 
+  it('stays quiet about the move commands a dead client keeps sending', async () => {
+    // A dead player's client goes on sending move intents at its normal rate
+    // while they read the death prompt. Moves are fire-and-forget everywhere
+    // else -- answering them would pin the HUD's `last:` line to "dead" and
+    // spend a reply per move on a body that no longer exists.
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const client = await colyseus.connectTo(room, { accountId: 'acct_twitch' });
+    await client.waitForMessage('session');
+    const results: unknown[] = [];
+    client.onMessage('commandResult', (payload) => results.push(payload));
+
+    room.damageForTest('acct_twitch', HEALTH_MAX);
+    for (let i = 0; i < 5; i++) {
+      client.send(
+        'command',
+        command({ type: 'move', axisX: 0, axisY: 1, yaw: 0, sprint: false, crouch: false, jump: false }),
+      );
+    }
+    await room.waitForNextPatch();
+
+    expect(results).toEqual([]);
+    // ...and the dead body still did not move.
+    expect(room.state.players.has('acct_twitch')).toBe(false);
+
+    client.leave();
+  });
+
   it('refuses to respawn a player who is still alive', async () => {
     const room = (await colyseus.createRoom('world', {})) as WorldRoom;
     const client = await colyseus.connectTo(room, { accountId: 'acct_alive' });
@@ -205,15 +232,39 @@ describe('WorldRoom respawn (GDD section 12)', () => {
     await client.waitForMessage('session');
     room.teleportForTest('acct_moved', { x: 400, y: 0, z: 400 });
     room.damageForTest('acct_moved', HEALTH_MAX);
+    // Fixed roll: "landed on one of four anchors" is barely an assertion.
+    room.setRespawnRollForTest(() => 0);
 
     client.send('command', command({ type: 'respawn' }));
     await client.waitForMessage('commandResult');
 
     const player = room.state.players.get('acct_moved')!;
     expect({ x: player.x, z: player.z }).not.toEqual({ x: 400, z: 400 });
-    expect(room.respawnAnchorsForTest().some((a) => a.position.x === player.x && a.position.z === player.z)).toBe(
-      true,
-    );
+    const first = room.respawnAnchorsForTest()[0]!;
+    expect({ x: player.x, z: player.z }).toEqual({ x: first.position.x, z: first.position.z });
+
+    client.leave();
+  });
+
+  it('finds the seeded world safe to respawn into', async () => {
+    // The anchors are placed far out precisely so section 12's 75 m clearance
+    // can be satisfied. If they were not, every respawn would take the "no
+    // safe anchor" fallback and warn about a world that is actually quiet --
+    // which makes the warning worthless when it matters.
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const client = await colyseus.connectTo(room, { accountId: 'acct_safe' });
+    // Registered before the command: the respawn notice is sent inside the
+    // transaction, so it reaches the client ahead of the commandResult and a
+    // waitForMessage armed afterwards has already missed it.
+    const notices: Array<{ safe: boolean }> = [];
+    client.onMessage('respawn', (payload: { safe: boolean }) => notices.push(payload));
+    await client.waitForMessage('session');
+    room.damageForTest('acct_safe', HEALTH_MAX);
+
+    client.send('command', command({ type: 'respawn' }));
+    await client.waitForMessage('commandResult');
+
+    expect(notices).toEqual([expect.objectContaining({ safe: true })]);
 
     client.leave();
   });

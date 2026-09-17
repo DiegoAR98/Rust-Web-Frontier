@@ -161,14 +161,19 @@ const CORPSE_LIFETIME_TICKS = 30 * 60 * TICK_RATE_HZ;
 /**
  * GDD section 12's "valid Coyote Wash or Juniper perimeter anchor". The real
  * map authors 16 arrival anchors (GDD section 13); until the map exists these
- * four stand in for them, placed clear of the hot-ore zone at the origin and
- * of the wolf, so a respawn is not immediately another death.
+ * four stand in for them.
+ *
+ * They are far out deliberately. Section 12's rule is to prefer an anchor at
+ * least 75 m from active enemies, and anchors huddled around the seeded
+ * content could never satisfy it -- every respawn would take the "no safe
+ * anchor" fallback and report the world as dangerous whether it was or not.
+ * A perimeter is also what section 13's arrival anchors actually are.
  */
 const RESPAWN_ANCHORS: RespawnAnchor[] = [
-  { id: 'coyote_wash_n', position: { x: -20, y: 0, z: -20 } },
-  { id: 'coyote_wash_s', position: { x: -20, y: 0, z: 20 } },
-  { id: 'juniper_e', position: { x: 20, y: 0, z: -20 } },
-  { id: 'juniper_w', position: { x: 24, y: 0, z: 24 } },
+  { id: 'coyote_wash_n', position: { x: -90, y: 0, z: -60 } },
+  { id: 'coyote_wash_s', position: { x: -80, y: 0, z: 70 } },
+  { id: 'juniper_e', position: { x: 85, y: 0, z: -55 } },
+  { id: 'juniper_w', position: { x: 95, y: 0, z: 60 } },
 ];
 /** GDD section 5: "A player starts with a rock, a torch and bandages." */
 const SPAWN_KIT: Array<[string, number]> = [
@@ -299,6 +304,12 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
    * Math.random.
    */
   private bleedRoll: () => number = Math.random;
+  /**
+   * Which of the clear anchors a respawn lands on (GDD section 12). Injectable
+   * for the same reason as bleedRoll: a test asserting "one of four" is barely
+   * an assertion at all.
+   */
+  private respawnRoll: () => number = Math.random;
   private readonly channelsByAccount = new Map<string, { definitionId: string; channel: ChannelState }>();
   private readonly useCooldownUntilTick = new Map<string, number>();
   private readonly poisonByAccount = new Map<string, BleedWound>();
@@ -605,6 +616,11 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.bleedRoll = roll;
   }
 
+  /** Test-only: fixes which clear anchor a respawn picks. */
+  setRespawnRollForTest(roll: () => number): void {
+    this.respawnRoll = roll;
+  }
+
   advanceCreaturesForTest(dt: number): void {
     this.tickCreatures(dt);
   }
@@ -838,6 +854,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.corpses.delete(corpseId);
     this.state.corpses.delete(corpseId);
     this.store.deleteCorpse(corpseId);
+    // Tells whoever was standing over it that it is gone, then forgets them;
+    // a viewer set that outlived its corpse would leak one entry per death.
+    this.sendCorpse(corpseId);
   }
 
   /**
@@ -861,10 +880,15 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private sendCorpse(corpseId: string): void {
     const corpse = this.corpses.get(corpseId);
     const payload = this.corpsePayload(corpseId);
-    for (const accountId of this.connectedAccounts) {
-      if (corpse && !this.isWithinReach(accountId, { ...corpse.position })) continue;
+    // A removal notice goes only to the players who were being shown the body,
+    // not to everyone connected: nobody else was told it existed.
+    const audience = corpse
+      ? [...this.connectedAccounts].filter((accountId) => this.isWithinReach(accountId, { ...corpse.position }))
+      : [...(this.corpseViewers.get(corpseId) ?? [])];
+    for (const accountId of audience) {
       this.clientsByAccount.get(accountId)?.send('corpse', payload);
     }
+    if (!corpse) this.corpseViewers.delete(corpseId);
   }
 
   /**
@@ -906,13 +930,20 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       return { ...base, accepted: false, reasonCode: 'not_dead' };
     }
 
+    // "Active enemies" is read as things that would attack the new body: other
+    // living players, and predators. A deer is not an enemy -- it runs from
+    // you -- and counting it would push respawns away from the safest ground
+    // in the world for no reason.
     const enemies: Point3[] = [];
-    for (const creature of this.creatures.values()) enemies.push(creature.position);
+    for (const creature of this.creatures.values()) {
+      if (CREATURE_SPECS[creature.kind].attack === null) continue;
+      enemies.push(creature.position);
+    }
     for (const [otherId, movement] of this.movementByAccount) {
       if (otherId === accountId || this.deadAccounts.has(otherId)) continue;
       enemies.push(movement.position);
     }
-    const chosen = chooseRespawnAnchor(RESPAWN_ANCHORS, enemies, Math.random);
+    const chosen = chooseRespawnAnchor(RESPAWN_ANCHORS, enemies, this.respawnRoll);
     const position = chosen ? { ...chosen.anchor.position } : { x: 0, y: 0, z: 0 };
 
     this.deadAccounts.delete(accountId);
@@ -995,9 +1026,11 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     });
     if (emptied) {
       // An empty body is scenery nobody can interact with; GDD section 8's
-      // 30-minute timer is for bags that still hold something.
+      // 30-minute timer is for bags that still hold something. The row is
+      // already deleted above, inside the same transaction as the pack.
       this.corpses.delete(corpseId);
       this.state.corpses.delete(corpseId);
+      this.corpseViewers.delete(corpseId);
     }
 
     return { ...base, accepted: true, reasonCode: 'ok' };
@@ -1461,9 +1494,17 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     const key = { accountId, sessionEpoch: command.sessionEpoch, sequence: command.sequence };
 
     // GDD section 12 marks a dead account dead until it respawns: it has no
-    // live character, so nothing but the respawn itself can be acted on. The
-    // check comes before the move shortcut so a corpse cannot be walked
-    // around either.
+    // live character, so nothing but the respawn itself can be acted on.
+    //
+    // Moves are exempt from the *reply*, not from the refusal: a dead client
+    // keeps sending move intents at its normal rate while the player reads the
+    // death prompt, and answering each one would spend a message per move and
+    // pin the HUD's last-result line to "dead". They are dropped silently, the
+    // same way a live move never gets a result either. The body cannot move
+    // regardless -- death deletes its movement state, so the tick skips it.
+    if (this.deadAccounts.has(accountId) && command.action.type === 'move') {
+      return;
+    }
     if (this.deadAccounts.has(accountId) && command.action.type !== 'respawn') {
       client.send('commandResult', {
         sequence: command.sequence,
