@@ -162,3 +162,61 @@ describe('WorldStore item claim durability (T04)', () => {
     expect(items.get('item_1')).toEqual({ definitionId: 'wood', claimedBy: 'acct_a' });
   });
 });
+
+describe('WorldStore resource node durability (T03 conservation across a restart)', () => {
+  it('restores a node at its last saved remaining budget', () => {
+    const before = new WorldStore(dbFile);
+    before.saveNodeState('node_1', 'wood', 40);
+    before.close();
+
+    const after = new WorldStore(dbFile);
+    const nodes = after.loadNodeStates();
+    after.close();
+
+    expect(nodes.get('node_1')).toEqual({ definitionId: 'wood', remaining: 40 });
+  });
+
+  it('overwrites the remaining budget rather than accumulating history', () => {
+    const store = new WorldStore(dbFile);
+    store.saveNodeState('node_1', 'wood', 150);
+    store.saveNodeState('node_1', 'wood', 100);
+
+    const nodes = store.loadNodeStates();
+    store.close();
+
+    expect(nodes.get('node_1')?.remaining).toBe(100);
+  });
+});
+
+describe('WorldStore player inventory durability', () => {
+  it('restores a private inventory at its last saved contents', () => {
+    const before = new WorldStore(dbFile);
+    before.savePlayerSlots('acct_a', [{ definitionId: 'wood', quantity: 40 }, null, { definitionId: 'stone', quantity: 5 }]);
+    before.close();
+
+    const after = new WorldStore(dbFile);
+    const slots = after.loadPlayerSlots('acct_a', 3);
+    after.close();
+
+    expect(slots).toEqual([{ definitionId: 'wood', quantity: 40 }, null, { definitionId: 'stone', quantity: 5 }]);
+  });
+
+  it('returns an all-empty inventory for an account with no saved slots', () => {
+    const store = new WorldStore(dbFile);
+    const slots = store.loadPlayerSlots('acct_new', 4);
+    store.close();
+
+    expect(slots).toEqual([null, null, null, null]);
+  });
+
+  it('replaces the full saved set on each save rather than merging with the previous one', () => {
+    const store = new WorldStore(dbFile);
+    store.savePlayerSlots('acct_a', [{ definitionId: 'wood', quantity: 10 }, { definitionId: 'stone', quantity: 5 }]);
+    store.savePlayerSlots('acct_a', [null, { definitionId: 'stone', quantity: 5 }]);
+
+    const slots = store.loadPlayerSlots('acct_a', 2);
+    store.close();
+
+    expect(slots).toEqual([null, { definitionId: 'stone', quantity: 5 }]);
+  });
+});

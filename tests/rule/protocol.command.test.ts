@@ -78,6 +78,13 @@ describe('CommandSchema', () => {
     expect(result.success).toBe(true);
   });
 
+  it('accepts a well-formed hit-node command', () => {
+    const result = CommandSchema.safeParse(
+      validMoveCommand({ action: { type: 'hitNode', nodeId: 'node_1' } }),
+    );
+    expect(result.success).toBe(true);
+  });
+
   it('rejects an unknown action type', () => {
     const result = CommandSchema.safeParse(
       validMoveCommand({ action: { type: 'noclip', itemInstanceId: 'item_123' } }),

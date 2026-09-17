@@ -1,6 +1,16 @@
 import { Room, type Client } from '@colyseus/core';
 import { CommandSchema, type Command, type CommandResult } from '@rwf/protocol';
-import { stepMovement, takeItem as simTakeItem, type MovementState, type WorldItem } from '@rwf/sim';
+import { getItem } from '@rwf/content';
+import {
+  addToInventory,
+  harvestNode,
+  stepMovement,
+  takeItem as simTakeItem,
+  type MovementState,
+  type ResourceNode,
+  type Slot,
+  type WorldItem,
+} from '@rwf/sim';
 import { WorldStore } from './persistence.js';
 import { PlayerState, WorldItemState, WorldState } from './world-state.js';
 
@@ -8,10 +18,25 @@ import { PlayerState, WorldItemState, WorldState } from './world-state.js';
 const TICK_RATE_HZ = 20;
 /** TECHNICAL section 7: continuous state checkpoints every 5 seconds. */
 export const CHECKPOINT_INTERVAL_TICKS = 5 * TICK_RATE_HZ;
+/** GDD section 8: 24 backpack slots per player. */
+const BACKPACK_SLOTS = 24;
+/**
+ * Per-resource gather rate (CONTENT section 4). Keyed by the resource
+ * produced rather than a node-type ID: today every node producing a given
+ * resource shares one rate. Revisit with a real node-type lookup once a
+ * second node type yields the same resource at a different rate (e.g.
+ * standing_tree vs wood_pile both yielding wood).
+ */
+const DEFAULT_YIELD_PER_HIT: Record<string, number> = { wood: 10 };
 
 interface ClientUserData {
   accountId: string;
   sessionEpoch: number;
+}
+
+interface NodeConfig {
+  definitionId: string;
+  yieldPerHit: number;
 }
 
 type RoomClient = Client<{ userData: ClientUserData }>;
@@ -22,6 +47,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private readonly worldItems = new Map<string, WorldItem>();
   private readonly movementByAccount = new Map<string, MovementState>();
   private readonly pendingMove = new Map<string, MoveAction>();
+  private readonly resourceNodes = new Map<string, ResourceNode>();
+  private readonly nodeConfigs = new Map<string, NodeConfig>();
+  private readonly playerSlots = new Map<string, Slot[]>();
 
   onCreate(): void {
     // TECHNICAL section 17: the world keeps running even when nobody is
@@ -63,6 +91,13 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       item.claimedBy = claim.claimedBy ?? '';
       this.state.items.set(instanceId, item);
     }
+    for (const [nodeId, node] of this.store.loadNodeStates()) {
+      this.resourceNodes.set(nodeId, { nodeId, remaining: node.remaining });
+      this.nodeConfigs.set(nodeId, {
+        definitionId: node.definitionId,
+        yieldPerHit: DEFAULT_YIELD_PER_HIT[node.definitionId] ?? 0,
+      });
+    }
 
     this.onMessage('command', CommandSchema, (client, command) => {
       this.handleCommand(client, command);
@@ -99,6 +134,13 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.state.items.set(instanceId, item);
   }
 
+  /** Seeds a gatherable resource node for tests/tools; not a player-facing command. */
+  spawnNode(nodeId: string, definitionId: string, totalBudget: number, yieldPerHit: number): void {
+    this.resourceNodes.set(nodeId, { nodeId, remaining: totalBudget });
+    this.nodeConfigs.set(nodeId, { definitionId, yieldPerHit });
+    this.store.saveNodeState(nodeId, definitionId, totalBudget);
+  }
+
   onJoin(client: RoomClient, options: { accountId?: string }): void {
     const accountId = options?.accountId;
     if (!accountId) {
@@ -122,6 +164,14 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     }
     // Reconnecting to an existing accountId resumes the same body: the
     // schema entry and movementByAccount state are left untouched.
+
+    if (!this.playerSlots.has(accountId)) {
+      this.playerSlots.set(accountId, this.store.loadPlayerSlots(accountId, BACKPACK_SLOTS));
+    }
+    // Private per TECHNICAL section 3: inventory contents never ride the
+    // shared replicated schema. Sent the same tick as 'session' for the
+    // same reason (avoid racing the client's post-join listener setup).
+    this.clock.setTimeout(() => client.send('inventory', { slots: this.playerSlots.get(accountId) }), 0);
   }
 
   onLeave(client: RoomClient): void {
@@ -153,12 +203,26 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       return;
     }
 
-    const itemInstanceId = command.action.itemInstanceId;
     const key = { accountId, sessionEpoch: command.sessionEpoch, sequence: command.sequence };
+
+    if (command.action.type === 'takeItem') {
+      const itemInstanceId = command.action.itemInstanceId;
+      const encoded = this.store.commitOutcome(key, () =>
+        JSON.stringify(this.resolveTakeItem(accountId, itemInstanceId, command.sequence)),
+      );
+      client.send('commandResult', JSON.parse(encoded) as CommandResult);
+      return;
+    }
+
+    const nodeId = command.action.nodeId;
     const encoded = this.store.commitOutcome(key, () =>
-      JSON.stringify(this.resolveTakeItem(accountId, itemInstanceId, command.sequence)),
+      JSON.stringify(this.resolveHitNode(accountId, nodeId, command.sequence)),
     );
     client.send('commandResult', JSON.parse(encoded) as CommandResult);
+    // The inventory changed (or didn't) as a side effect of resolveHitNode;
+    // tell the owner their current contents either way, same as takeItem's
+    // commandResult tells them the outcome of their own action.
+    client.send('inventory', { slots: this.playerSlots.get(accountId) });
   }
 
   private resolveTakeItem(accountId: string, itemInstanceId: string, sequence: number): CommandResult {
@@ -173,6 +237,31 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       return { ...base, accepted: true, reasonCode: 'ok' };
     }
     return { ...base, accepted: false, reasonCode: outcome.outcome };
+  }
+
+  private resolveHitNode(accountId: string, nodeId: string, sequence: number): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    const node = this.resourceNodes.get(nodeId);
+    const config = this.nodeConfigs.get(nodeId);
+    if (!node || !config) {
+      return { ...base, accepted: false, reasonCode: 'not_found' };
+    }
+
+    const { node: nextNode, result } = harvestNode(node, config.yieldPerHit);
+    this.resourceNodes.set(nodeId, nextNode);
+    this.store.saveNodeState(nodeId, config.definitionId, nextNode.remaining);
+
+    if (result.granted <= 0) {
+      return { ...base, accepted: false, reasonCode: 'depleted' };
+    }
+
+    const stackLimit = getItem(config.definitionId)?.stack ?? 1;
+    const currentSlots = this.playerSlots.get(accountId) ?? new Array(BACKPACK_SLOTS).fill(null);
+    const { slots: nextSlots } = addToInventory(currentSlots, config.definitionId, result.granted, stackLimit);
+    this.playerSlots.set(accountId, nextSlots);
+    this.store.savePlayerSlots(accountId, nextSlots);
+
+    return { ...base, accepted: true, reasonCode: 'ok' };
   }
 
   private tick(dt: number): void {

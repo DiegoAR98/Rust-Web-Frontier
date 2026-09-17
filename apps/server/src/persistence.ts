@@ -1,7 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import Database from 'better-sqlite3';
-import type { TransactionKey } from '@rwf/sim';
+import type { Slot, TransactionKey } from '@rwf/sim';
 
 interface SessionRow {
   epoch: number;
@@ -41,6 +41,23 @@ interface ItemClaimRow {
   instance_id: string;
   definition_id: string;
   claimed_by: string | null;
+}
+
+export interface NodeState {
+  definitionId: string;
+  remaining: number;
+}
+
+interface ResourceNodeRow {
+  node_id: string;
+  definition_id: string;
+  remaining: number;
+}
+
+interface PlayerSlotRow {
+  slot_index: number;
+  definition_id: string;
+  quantity: number;
 }
 
 /**
@@ -90,6 +107,18 @@ export class WorldStore {
         instance_id TEXT PRIMARY KEY,
         definition_id TEXT NOT NULL,
         claimed_by TEXT
+      );
+      CREATE TABLE IF NOT EXISTS resource_nodes (
+        node_id TEXT PRIMARY KEY,
+        definition_id TEXT NOT NULL,
+        remaining INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS player_slots (
+        account_id TEXT NOT NULL,
+        slot_index INTEGER NOT NULL,
+        definition_id TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        PRIMARY KEY (account_id, slot_index)
       );
     `);
   }
@@ -219,6 +248,61 @@ export class WorldStore {
       result.set(row.instance_id, { definitionId: row.definition_id, claimedBy: row.claimed_by });
     }
     return result;
+  }
+
+  /** Persists a resource node's remaining budget (T03 conservation across a restart). */
+  saveNodeState(nodeId: string, definitionId: string, remaining: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO resource_nodes (node_id, definition_id, remaining) VALUES (?, ?, ?)
+         ON CONFLICT(node_id) DO UPDATE SET
+           definition_id = excluded.definition_id, remaining = excluded.remaining`,
+      )
+      .run(nodeId, definitionId, remaining);
+  }
+
+  loadNodeStates(): Map<string, NodeState> {
+    const rows = this.db
+      .prepare('SELECT node_id, definition_id, remaining FROM resource_nodes')
+      .all() as ResourceNodeRow[];
+    const result = new Map<string, NodeState>();
+    for (const row of rows) {
+      result.set(row.node_id, { definitionId: row.definition_id, remaining: row.remaining });
+    }
+    return result;
+  }
+
+  /**
+   * Replaces an account's entire saved inventory in one transaction. Private
+   * per TECHNICAL section 3: inventory contents never ride the shared
+   * replicated schema, so this is the only durable home for them.
+   */
+  savePlayerSlots(accountId: string, slots: Slot[]): void {
+    const replace = this.db.transaction((items: Slot[]) => {
+      this.db.prepare('DELETE FROM player_slots WHERE account_id = ?').run(accountId);
+      const insert = this.db.prepare(
+        'INSERT INTO player_slots (account_id, slot_index, definition_id, quantity) VALUES (?, ?, ?, ?)',
+      );
+      items.forEach((slot, index) => {
+        if (slot) {
+          insert.run(accountId, index, slot.definitionId, slot.quantity);
+        }
+      });
+    });
+    replace(slots);
+  }
+
+  loadPlayerSlots(accountId: string, size: number): Slot[] {
+    const rows = this.db
+      .prepare('SELECT slot_index, definition_id, quantity FROM player_slots WHERE account_id = ?')
+      .all(accountId) as PlayerSlotRow[];
+    const slots: Slot[] = new Array(size).fill(null);
+    for (const row of rows) {
+      if (row.slot_index >= 0 && row.slot_index < size) {
+        slots[row.slot_index] = { definitionId: row.definition_id, quantity: row.quantity };
+      }
+    }
+    return slots;
   }
 
   close(): void {

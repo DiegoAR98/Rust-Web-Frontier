@@ -21,9 +21,16 @@ export const TakeItemIntentSchema = z.object({
 });
 export type TakeItemIntent = z.infer<typeof TakeItemIntentSchema>;
 
+export const HitNodeIntentSchema = z.object({
+  type: z.literal('hitNode'),
+  nodeId: z.string().min(1).max(64),
+});
+export type HitNodeIntent = z.infer<typeof HitNodeIntentSchema>;
+
 export const ActionPayloadSchema = z.discriminatedUnion('type', [
   MoveIntentSchema,
   TakeItemIntentSchema,
+  HitNodeIntentSchema,
 ]);
 export type ActionPayload = z.infer<typeof ActionPayloadSchema>;
 
@@ -45,6 +52,7 @@ export const REASON_CODES = [
   'rate_limited',
   'not_found',
   'already_taken',
+  'depleted',
 ] as const;
 export type ReasonCode = (typeof REASON_CODES)[number];
 
