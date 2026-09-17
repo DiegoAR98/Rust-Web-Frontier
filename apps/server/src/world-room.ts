@@ -99,6 +99,16 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       });
     }
 
+    // Seed the M0/M1 proof-of-mechanism content on a genuinely fresh world
+    // only -- never re-seed over a restored (possibly claimed/depleted)
+    // item or node, which the restore loops above already populated.
+    if (!this.worldItems.has('item_1')) {
+      this.spawnItem('item_1', 'wood');
+    }
+    if (!this.resourceNodes.has('node_1')) {
+      this.spawnNode('node_1', 'wood', 150, 10); // CONTENT section 4: wood pile
+    }
+
     this.onMessage('command', CommandSchema, (client, command) => {
       this.handleCommand(client, command);
     });
