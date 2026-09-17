@@ -44,3 +44,42 @@ export function addToInventory(
 
   return { slots: next, overflow: remaining };
 }
+
+/**
+ * Removes a quantity of one item from a slot array, draining across as many
+ * stacks of that item as needed. Empties an exhausted stack to `null` rather
+ * than leaving a zero-quantity stack behind. Never removes more than is
+ * actually present -- `removed` may be less than requested if there wasn't
+ * enough; it never goes negative or touches other items' stacks.
+ */
+export function removeFromInventory(
+  slots: Slot[],
+  definitionId: string,
+  quantity: number,
+): { slots: Slot[]; removed: number } {
+  const next = slots.slice();
+  let remaining = quantity;
+
+  for (let i = 0; i < next.length && remaining > 0; i++) {
+    const slot = next[i];
+    if (slot && slot.definitionId === definitionId) {
+      const take = Math.min(slot.quantity, remaining);
+      const leftover = slot.quantity - take;
+      next[i] = leftover > 0 ? { definitionId, quantity: leftover } : null;
+      remaining -= take;
+    }
+  }
+
+  return { slots: next, removed: quantity - remaining };
+}
+
+/** Sums quantity across every stack of one item. */
+export function countInInventory(slots: Slot[], definitionId: string): number {
+  let total = 0;
+  for (const slot of slots) {
+    if (slot && slot.definitionId === definitionId) {
+      total += slot.quantity;
+    }
+  }
+  return total;
+}

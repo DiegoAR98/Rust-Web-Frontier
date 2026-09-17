@@ -1,12 +1,13 @@
 import { Room, type Client } from '@colyseus/core';
 import { CommandSchema, type Command, type CommandResult } from '@rwf/protocol';
-import { getItem } from '@rwf/content';
+import { getItem, getRecipe } from '@rwf/content';
 import {
   addToInventory,
   CALORIE_SPAWN,
   computeExposureDamage,
   computeExposureIntake,
   computeStarvationDamage,
+  countInInventory,
   decayExposure,
   drainCalories,
   EXPOSURE_MAX,
@@ -14,9 +15,13 @@ import {
   HEALTH_MAX,
   HEALTH_SPAWN,
   harvestNode,
+  removeFromInventory,
+  startQueueEntry,
   stepMovement,
   takeItem as simTakeItem,
+  tickQueueEntry,
   type MovementState,
+  type QueueEntry,
   type ResourceNode,
   type Slot,
   type WorldItem,
@@ -71,6 +76,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private readonly playerVitals = new Map<string, { calories: number; health: number; exposure: number }>();
   private readonly connectedAccounts = new Set<string>();
   private readonly clientsByAccount = new Map<string, RoomClient>();
+  private readonly craftingByAccount = new Map<string, QueueEntry>();
 
   onCreate(): void {
     // TECHNICAL section 17: the world keeps running even when nobody is
@@ -262,14 +268,24 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       return;
     }
 
-    const nodeId = command.action.nodeId;
+    if (command.action.type === 'hitNode') {
+      const nodeId = command.action.nodeId;
+      const encoded = this.store.commitOutcome(key, () =>
+        JSON.stringify(this.resolveHitNode(accountId, nodeId, command.sequence)),
+      );
+      client.send('commandResult', JSON.parse(encoded) as CommandResult);
+      // The inventory changed (or didn't) as a side effect of resolveHitNode;
+      // tell the owner their current contents either way, same as takeItem's
+      // commandResult tells them the outcome of their own action.
+      client.send('inventory', { slots: this.playerSlots.get(accountId) });
+      return;
+    }
+
+    const { recipeId, quantity } = command.action;
     const encoded = this.store.commitOutcome(key, () =>
-      JSON.stringify(this.resolveHitNode(accountId, nodeId, command.sequence)),
+      JSON.stringify(this.resolveCraft(accountId, recipeId, quantity, command.sequence)),
     );
     client.send('commandResult', JSON.parse(encoded) as CommandResult);
-    // The inventory changed (or didn't) as a side effect of resolveHitNode;
-    // tell the owner their current contents either way, same as takeItem's
-    // commandResult tells them the outcome of their own action.
     client.send('inventory', { slots: this.playerSlots.get(accountId) });
   }
 
@@ -310,6 +326,78 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.store.savePlayerSlots(accountId, nextSlots);
 
     return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  private resolveCraft(accountId: string, recipeId: string, quantity: number, sequence: number): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    const recipe = getRecipe(recipeId);
+    if (!recipe) {
+      return { ...base, accepted: false, reasonCode: 'not_found' };
+    }
+    if (this.craftingByAccount.has(accountId)) {
+      // GDD section 9 allows six entries per queue; this vertical models
+      // one active entry per account. Expand to a real multi-slot queue
+      // when a second concurrent recipe is actually needed.
+      return { ...base, accepted: false, reasonCode: 'busy' };
+    }
+
+    let slots = this.playerSlots.get(accountId) ?? new Array(BACKPACK_SLOTS).fill(null);
+    for (const [inputId, perUnit] of Object.entries(recipe.inputs)) {
+      if (countInInventory(slots, inputId) < perUnit * quantity) {
+        return { ...base, accepted: false, reasonCode: 'insufficient_resources' };
+      }
+    }
+    // Escrow the entire entry's cost up front (GDD section 9), only after
+    // confirming every input clears its full requirement above.
+    for (const [inputId, perUnit] of Object.entries(recipe.inputs)) {
+      slots = removeFromInventory(slots, inputId, perUnit * quantity).slots;
+    }
+    this.playerSlots.set(accountId, slots);
+    this.store.savePlayerSlots(accountId, slots);
+
+    this.craftingByAccount.set(accountId, startQueueEntry(recipe, quantity));
+    return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  /** Advances every account's active crafting entry by dt seconds. */
+  private tickCrafting(dt: number): void {
+    for (const [accountId, entry] of this.craftingByAccount) {
+      const { entry: nextEntry, producedUnits } = tickQueueEntry(entry, dt, Infinity);
+
+      if (producedUnits > 0) {
+        const stackLimit = getItem(nextEntry.recipe.outputId)?.stack ?? 1;
+        const currentSlots = this.playerSlots.get(accountId) ?? new Array(BACKPACK_SLOTS).fill(null);
+        const { slots } = addToInventory(
+          currentSlots,
+          nextEntry.recipe.outputId,
+          producedUnits * nextEntry.recipe.outputQuantityPerUnit,
+          stackLimit,
+        );
+        this.playerSlots.set(accountId, slots);
+        this.store.savePlayerSlots(accountId, slots);
+        this.clientsByAccount.get(accountId)?.send('inventory', { slots });
+      }
+
+      if (nextEntry.completedUnits >= nextEntry.totalUnits) {
+        this.craftingByAccount.delete(accountId);
+      } else {
+        this.craftingByAccount.set(accountId, nextEntry);
+      }
+    }
+  }
+
+  /** Test-only: seeds a player's inventory directly, bypassing gather/take. */
+  grantForTest(accountId: string, definitionId: string, quantity: number): void {
+    const stackLimit = getItem(definitionId)?.stack ?? 1;
+    const current = this.playerSlots.get(accountId) ?? new Array(BACKPACK_SLOTS).fill(null);
+    const { slots } = addToInventory(current, definitionId, quantity, stackLimit);
+    this.playerSlots.set(accountId, slots);
+    this.store.savePlayerSlots(accountId, slots);
+  }
+
+  /** Test-only: advances crafting by dt seconds directly, bypassing the real tick timer. */
+  advanceCraftingForTest(dt: number): void {
+    this.tickCrafting(dt);
   }
 
   private tick(dt: number): void {
@@ -353,6 +441,8 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
 
       this.clientsByAccount.get(accountId)?.send('vitals', next);
     }
+
+    this.tickCrafting(dt);
 
     if (this.state.tick % CHECKPOINT_INTERVAL_TICKS === 0) {
       this.checkpoint();

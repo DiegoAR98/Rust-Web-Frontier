@@ -85,6 +85,26 @@ describe('CommandSchema', () => {
     expect(result.success).toBe(true);
   });
 
+  it('accepts a well-formed craft command', () => {
+    const result = CommandSchema.safeParse(
+      validMoveCommand({ action: { type: 'craft', recipeId: 'stone_hatchet', quantity: 1 } }),
+    );
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects a craft quantity outside 1..100 (GDD section 9: up to 100 units per entry)', () => {
+    expect(
+      CommandSchema.safeParse(
+        validMoveCommand({ action: { type: 'craft', recipeId: 'stone_hatchet', quantity: 0 } }),
+      ).success,
+    ).toBe(false);
+    expect(
+      CommandSchema.safeParse(
+        validMoveCommand({ action: { type: 'craft', recipeId: 'stone_hatchet', quantity: 101 } }),
+      ).success,
+    ).toBe(false);
+  });
+
   it('rejects an unknown action type', () => {
     const result = CommandSchema.safeParse(
       validMoveCommand({ action: { type: 'noclip', itemInstanceId: 'item_123' } }),

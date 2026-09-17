@@ -27,10 +27,19 @@ export const HitNodeIntentSchema = z.object({
 });
 export type HitNodeIntent = z.infer<typeof HitNodeIntentSchema>;
 
+export const CraftIntentSchema = z.object({
+  type: z.literal('craft'),
+  recipeId: z.string().min(1).max(64),
+  // GDD section 9: each queue entry holds up to 100 identical recipe units.
+  quantity: z.number().int().min(1).max(100),
+});
+export type CraftIntent = z.infer<typeof CraftIntentSchema>;
+
 export const ActionPayloadSchema = z.discriminatedUnion('type', [
   MoveIntentSchema,
   TakeItemIntentSchema,
   HitNodeIntentSchema,
+  CraftIntentSchema,
 ]);
 export type ActionPayload = z.infer<typeof ActionPayloadSchema>;
 
@@ -53,6 +62,8 @@ export const REASON_CODES = [
   'not_found',
   'already_taken',
   'depleted',
+  'insufficient_resources',
+  'busy',
 ] as const;
 export type ReasonCode = (typeof REASON_CODES)[number];
 
