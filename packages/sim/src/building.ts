@@ -129,14 +129,52 @@ function supportRequirement(site: PieceSite): SupportRequirement {
 export function validatePieceSite(site: PieceSite, placed: ReadonlySet<string>): SiteRefusal | null {
   if (placed.has(siteKey(site))) return 'occupied';
   if (site.storey < 0 || site.storey >= MAX_STOREYS) return 'too_high';
-  if (site.form === 'foundation') {
-    return site.storey === 0 ? null : 'unsupported';
-  }
+  return isSupported(site, placed) ? null : 'unsupported';
+}
+
+/**
+ * Whether anything is holding this site up. Deliberately separate from
+ * validatePieceSite, which refuses an *occupied* site: a cascade asks the
+ * other question -- whether a piece that is already standing still has its
+ * supports -- and would get 'occupied' for every piece it looked at.
+ */
+export function isSupported(site: PieceSite, placed: ReadonlySet<string>): boolean {
+  // "Foundations anchor to permitted terrain": the ground does not fall away.
+  if (site.form === 'foundation') return site.storey === 0;
 
   const { keys, mode } = supportRequirement(site);
-  const satisfied =
-    mode === 'any' ? keys.some((key) => placed.has(key)) : keys.every((key) => placed.has(key));
-  return satisfied ? null : 'unsupported';
+  return mode === 'any' ? keys.some((key) => placed.has(key)) : keys.every((key) => placed.has(key));
+}
+
+/**
+ * Everything that falls when one site is removed (GDD section 10: "Removing a
+ * support by decay or allowed demolition cascades removal to dependents in a
+ * deterministic order"). The removed site comes first, then whatever lost its
+ * support because of it, then whatever lost its support because of that.
+ *
+ * The order is a support before its dependents, and within one collapse the
+ * keys are sorted, so a client replaying the list never sees a wall outlive
+ * the pillar it hung on and two identical worlds always collapse identically
+ * however their pieces were built.
+ */
+export function cascadeRemoval(removed: string, placed: ReadonlyMap<string, PieceSite>): string[] {
+  if (!placed.has(removed)) return [];
+
+  const standing = new Set(placed.keys());
+  standing.delete(removed);
+  const fallen = [removed];
+
+  // Each pass drops everything that is unsupported *now*, so a piece can only
+  // fall after whatever was holding it up -- which is what makes the order
+  // deterministic rather than dependent on iteration order.
+  for (;;) {
+    const losing = [...standing].filter((key) => !isSupported(placed.get(key)!, standing)).sort();
+    if (losing.length === 0) return fallen;
+    for (const key of losing) {
+      standing.delete(key);
+      fallen.push(key);
+    }
+  }
 }
 
 /**
