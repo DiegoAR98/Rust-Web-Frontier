@@ -72,6 +72,8 @@ let sequence = 0;
 let room: Room | undefined;
 let entered = false;
 let inventorySlots: Array<{ definitionId: string; quantity: number } | null> = [];
+let sendTimer: number | undefined;
+let disconnectReason: string | undefined;
 
 const keys: KeyState = {
   forward: false,
@@ -141,18 +143,32 @@ async function connect(): Promise<void> {
   const joined = await client.joinOrCreate('world', { accountId });
   room = joined;
 
-  let sendingStarted = false;
   joined.onMessage('session', (payload: { sessionEpoch: number }) => {
     sessionEpoch = payload.sessionEpoch;
     // Don't start sending until the epoch is known: a command sent before
     // this arrives would carry the stale default (0) and be rejected as
     // stale_session forever if this message were ever lost, rather than
     // just for the first few commands.
-    if (!sendingStarted) {
-      sendingStarted = true;
-      setInterval(sendMoveCommand, 1000 / MOVE_SEND_HZ);
+    if (sendTimer === undefined) {
+      sendTimer = window.setInterval(sendMoveCommand, 1000 / MOVE_SEND_HZ);
     }
   });
+
+  // Without this the page keeps calling room.send 20x/s on a dead room
+  // forever and the HUD still reads "connected" off stale state -- a frozen
+  // game that looks fine. The server can and does close the connection
+  // (an invalid command is a disconnect, not a dropped message), so this is
+  // a normal path, not an edge case.
+  const handleDisconnect = (reason: string) => {
+    if (sendTimer !== undefined) {
+      clearInterval(sendTimer);
+      sendTimer = undefined;
+    }
+    room = undefined;
+    disconnectReason = reason;
+  };
+  joined.onLeave((code: number) => handleDisconnect(`disconnected (code ${code})`));
+  joined.onError((code: number, message?: string) => handleDisconnect(`error ${code}: ${message ?? ''}`));
 
   joined.onMessage('commandResult', (payload: { accepted: boolean; reasonCode: string }) => {
     statusEl.dataset.lastResult = `${payload.accepted ? 'ok' : payload.reasonCode}`;
@@ -252,7 +268,9 @@ engine.runRenderLoop(() => {
   const woodCount = inventorySlots.reduce((sum, slot) => sum + (slot?.definitionId === 'wood' ? slot.quantity : 0), 0);
   statusEl.textContent = room
     ? `account ${accountId.slice(0, 8)} epoch ${sessionEpoch} players ${room.state.players.size} wood ${woodCount} last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : ' (click canvas to look)'}`
-    : 'not connected';
+    : disconnectReason
+      ? `${disconnectReason} -- reload to reconnect`
+      : 'not connected';
 
   scene.render();
 });
