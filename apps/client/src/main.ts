@@ -116,6 +116,14 @@ const corpseMaterial = new StandardMaterial('corpseMat', scene);
 corpseMaterial.diffuseColor = new Color3(0.2, 0.2, 0.45);
 const crateMaterial = new StandardMaterial('crateMat', scene);
 crateMaterial.diffuseColor = new Color3(0.55, 0.38, 0.18);
+const bedrollMaterial = new StandardMaterial('bedrollMat', scene);
+bedrollMaterial.diffuseColor = new Color3(0.7, 0.62, 0.45);
+
+/** How each deployable is drawn, so a bedroll does not look like a crate. */
+const DEPLOYABLE_SHAPES: Record<string, { width: number; height: number; depth: number }> = {
+  small_crate: { width: 0.9, height: 0.7, depth: 0.9 },
+  bedroll: { width: 0.9, height: 0.15, depth: 1.9 },
+};
 const timberMaterial = new StandardMaterial('timberMat', scene);
 timberMaterial.diffuseColor = new Color3(0.48, 0.33, 0.16);
 const doorMaterial = new StandardMaterial('doorMat', scene);
@@ -235,6 +243,7 @@ const PLACEABLES: Array<{ key: string; definitionId: string; form: PieceForm | n
   // A door is not a piece: it goes into a doorway's socket, so X installs it
   // into whichever doorway is in reach rather than snapping it to the grid.
   { key: 'Digit7', definitionId: 'wood_door', form: null },
+  { key: 'Digit8', definitionId: 'bedroll', form: null },
 ];
 let selected = PLACEABLES[0]!;
 /** Set while this account is dead; GDD section 12's death recap and respawn prompt. */
@@ -300,7 +309,11 @@ window.addEventListener('keydown', (e) => {
   }
   // GDD section 12: a dead account has no live character until it asks for a
   // new one. Everything else the server refuses outright while dead.
-  if (e.code === 'Enter' && death) send({ type: 'respawn' });
+  // Enter takes the random arrival anchor; shift-Enter asks for the player's
+  // own bedroll, which the server refuses if it is on cooldown or gone.
+  if (e.code === 'Enter' && death) {
+    send({ type: 'respawn', anchorId: e.shiftKey ? (myAnchorId() ?? null) : null });
+  }
   if (e.code === 'KeyQ') attemptCorpseTake();
   // GDD section 10's placement, and section 8's storage.
   if (e.code === 'KeyX') attemptPlace();
@@ -530,9 +543,10 @@ async function connect(): Promise<void> {
     corpsePositions.delete(key);
     corpseContents.delete(key);
   });
-  $(joined.state).deployables!.onAdd((_deployable: ReplicatedCreature, key: string) => {
-    const mesh = MeshBuilder.CreateBox(`deployable_${key}`, { width: 0.9, height: 0.7, depth: 0.9 }, scene);
-    mesh.material = crateMaterial;
+  $(joined.state).deployables!.onAdd((deployable: ReplicatedCreature & { definitionId: string }, key: string) => {
+    const shape = DEPLOYABLE_SHAPES[deployable.definitionId] ?? DEPLOYABLE_SHAPES.small_crate!;
+    const mesh = MeshBuilder.CreateBox(`deployable_${key}`, shape, scene);
+    mesh.material = deployable.definitionId === 'bedroll' ? bedrollMaterial : crateMaterial;
     deployableMeshes.set(key, mesh);
   });
   $(joined.state).deployables!.onRemove((_deployable: ReplicatedCreature, key: string) => {
@@ -824,6 +838,20 @@ function nearestOtherAccountId(): string | undefined {
   return best;
 }
 
+/**
+ * This player's own bedroll. GDD section 12 says not to expose anchor
+ * coordinates to other players; a deployable's position is public because you
+ * can see a bedroll lying there, but only its owner's client reads it as a
+ * respawn option.
+ */
+function myAnchorId(): string | undefined {
+  if (!room) return undefined;
+  for (const [id, deployable] of room.state.deployables.entries()) {
+    if (deployable.definitionId === 'bedroll' && deployable.ownerAccountId === accountId) return id;
+  }
+  return undefined;
+}
+
 function attemptPlace(): void {
   if (selected.definitionId === 'wood_door') {
     const doorway = nearestDoorway();
@@ -850,6 +878,9 @@ function nearestContainerId(): string | undefined {
   let best: string | undefined;
   let bestDistance = Infinity;
   for (const [id, position] of deployablePositions) {
+    // A bedroll is a deployable that holds nothing; aiming the store key at
+    // one would only ever earn a refusal.
+    if (room?.state.deployables.get(id)?.definitionId === 'bedroll') continue;
     const distance = Vector3.Distance(camera.position, position);
     if (distance >= bestDistance) continue;
     best = id;
@@ -1177,7 +1208,11 @@ engine.runRenderLoop(() => {
       ? [
           // GDD section 12's respawn prompt. First line, because while it is
           // showing nothing else the player presses will be accepted.
-          ...(death ? [`YOU DIED -- press ENTER to respawn  (your body: ${death.corpseId ?? 'gone'})`] : []),
+          ...(death
+            ? [
+                `YOU DIED -- ENTER to respawn${myAnchorId() ? ', SHIFT+ENTER for your bedroll' : ''}  (your body: ${death.corpseId ?? 'gone'})`,
+              ]
+            : []),
           ...(respawnNotice ? [respawnNotice] : []),
           `account ${accountId.slice(0, 8)}  epoch ${sessionEpoch}  players ${room.state.players.size}`,
           `${engine.getFps().toFixed(0)} fps render : ${MOVE_SEND_HZ} Hz sim`,
@@ -1197,7 +1232,7 @@ engine.runRenderLoop(() => {
           }`,
           `last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : `  (${lookError ?? 'click canvas to look'})`}`,
           'WASD move : shift sprint : space jump : LMB swing at what you face : E take',
-          'C craft hatchet : N craft crate : 1-7 pick what to place : X place it : Q loot a body : O door',
+          'C craft hatchet : N craft crate : 1-8 pick what to place : X place it : Q loot a body : O door',
           'Z store in crate : H take from crate : M craft one of the selected piece',
           'B bandage : V eat : at a station -- F fuel : R input : G light/snuff : T take output',
         ].join('\n')
