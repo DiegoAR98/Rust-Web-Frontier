@@ -139,6 +139,7 @@ interface StationPayload {
 }
 const stationStates = new Map<string, StationPayload>();
 let vitals = { calories: 0, health: 0, exposure: 0, coldDeficit: 0, phase: 'day' };
+let channel: { definitionId: string | null; elapsedS: number; durationS: number } | undefined;
 let yaw = 0;
 let pitch = 0;
 let localLastTransform: Transform | undefined;
@@ -183,6 +184,9 @@ window.addEventListener('keydown', (e) => {
   if (e.code === 'KeyR') attemptStationInsert(nearestStation()?.input);
   if (e.code === 'KeyT') attemptStationTake();
   if (e.code === 'KeyG') attemptStationLight();
+  // GDD section 6's use channels. Bandage is the only one with an effect so
+  // far, so it gets the key rather than a belt slot.
+  if (e.code === 'KeyB') send({ type: 'useItem', definitionId: 'bandage' });
 });
 
 document.addEventListener('pointerlockchange', () => {
@@ -300,6 +304,12 @@ async function connect(): Promise<void> {
   // the station.
   joined.onMessage('station', (payload: StationPayload) => {
     stationStates.set(payload.stationId, payload);
+  });
+
+  // An open use channel is private to its owner, and the HUD needs the timer
+  // GDD section 21 calls for.
+  joined.onMessage('channel', (payload: typeof channel) => {
+    channel = payload;
   });
 
   // Vitals are private per TECHNICAL section 3, so they arrive as a targeted
@@ -599,9 +609,14 @@ engine.runRenderLoop(() => {
           `craft: ${describeCrafting()}`,
           `near: ${describeNearest()}`,
           `station: ${describeStation()}`,
+          `using: ${
+            channel && channel.definitionId
+              ? `${channel.definitionId} ${channel.elapsedS.toFixed(1)}/${channel.durationS.toFixed(0)}s`
+              : 'nothing'
+          }`,
           `last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : `  (${lookError ?? 'click canvas to look'})`}`,
           'WASD move : shift sprint : space jump : LMB swing at what you face : E take : C craft hatchet',
-          'at a station -- F add fuel : R add input : G light/snuff : T take output',
+          'B bandage : at a station -- F add fuel : R add input : G light/snuff : T take output',
         ].join('\n')
       : disconnectReason
         ? `${disconnectReason} -- reload to reconnect`

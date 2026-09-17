@@ -49,6 +49,17 @@ export const HarvestCarcassIntentSchema = z.object({
 });
 export type HarvestCarcassIntent = z.infer<typeof HarvestCarcassIntentSchema>;
 
+/**
+ * Starts a use channel (GDD section 6). Names the item, not a slot: the
+ * channel consumes one of whatever the player is holding of that kind, and
+ * which slot it came out of is the server's business.
+ */
+export const UseItemIntentSchema = z.object({
+  type: z.literal('useItem'),
+  definitionId: z.string().min(1).max(64),
+});
+export type UseItemIntent = z.infer<typeof UseItemIntentSchema>;
+
 const stationId = () => z.string().min(1).max(64);
 
 /**
@@ -89,6 +100,7 @@ export const ActionPayloadSchema = z.discriminatedUnion('type', [
   StationLightIntentSchema,
   AttackCreatureIntentSchema,
   HarvestCarcassIntentSchema,
+  UseItemIntentSchema,
 ]);
 export type ActionPayload = z.infer<typeof ActionPayloadSchema>;
 

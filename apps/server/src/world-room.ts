@@ -7,10 +7,13 @@ import {
   CALORIE_SPAWN,
   CREATURE_SPECS,
   harvestCarcassHit,
+  progressChannel,
+  startChannel,
   spawnCreature as simSpawnCreature,
   stepCreature,
   tickBleed,
   type CarcassState as SimCarcassState,
+  type ChannelState,
   type BleedWound,
   type CreatureKind,
   type CreatureState as SimCreatureState,
@@ -130,6 +133,21 @@ const MELEE_DAMAGE = 10;
 const ALARM_DURATION_S = 5;
 /** GDD section 7: "Unharvested carcasses expire after 10 online minutes." */
 const CARCASS_LIFETIME_TICKS = 10 * 60 * TICK_RATE_HZ;
+/** GDD section 5: "A player starts with a rock, a torch and bandages." */
+const SPAWN_KIT: Array<[string, number]> = [
+  ['rock', 1],
+  ['torch', 1],
+  ['bandage', 2],
+];
+/**
+ * GDD section 6's use channels: "food/water/cleanser 1 second, bandage 2,
+ * field dressing 3, surgeon kit 4." Only the bandage does anything yet -- it
+ * clears bleeding; the healing-over-time kits need the medical regeneration
+ * rules from the same section, which nothing else is waiting on.
+ */
+const USE_CHANNEL_SECONDS: Record<string, number> = { bandage: 2 };
+/** GDD section 6: "A shared 2-second post-use cooldown prevents instant stacked medicine." */
+const USE_COOLDOWN_TICKS = 2 * TICK_RATE_HZ;
 
 interface ClientUserData {
   accountId: string;
@@ -232,6 +250,8 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
    * Math.random.
    */
   private bleedRoll: () => number = Math.random;
+  private readonly channelsByAccount = new Map<string, { definitionId: string; channel: ChannelState }>();
+  private readonly useCooldownUntilTick = new Map<string, number>();
 
   onCreate(): void {
     // TECHNICAL section 17: the world keeps running even when nobody is
@@ -427,6 +447,30 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.lastSwingTick.delete(accountId);
   }
 
+  channelForTest(accountId: string): { definitionId: string; channel: ChannelState } | undefined {
+    return this.channelsByAccount.get(accountId);
+  }
+
+  advanceChannelsForTest(dt: number): void {
+    this.tickChannels(dt);
+  }
+
+  /** Test-only: opens a bleed wound without needing something to bite you. */
+  woundForTestSet(accountId: string, wound: BleedWound): void {
+    this.woundsByAccount.set(accountId, wound);
+  }
+
+  /** Test-only: incoming damage, the kind that cancels a use channel. */
+  damageForTest(accountId: string, damage: number): void {
+    this.damagePlayer(accountId, damage, 'melee');
+  }
+
+  clearInventoryForTest(accountId: string): void {
+    const empty: Slot[] = new Array(BACKPACK_SLOTS).fill(null);
+    this.playerSlots.set(accountId, empty);
+    this.store.savePlayerSlots(accountId, empty);
+  }
+
   expireCarcassesForTest(): void {
     this.expireCarcasses();
   }
@@ -554,10 +598,11 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
    * where the source can open a wound: "melee and animal bites have 20% for
    * 0.5 HP/s for 10 seconds".
    */
-  private damagePlayer(accountId: string, damage: number, source: 'bite'): void {
+  private damagePlayer(accountId: string, damage: number, source: 'bite' | 'melee'): void {
     const vitals = this.playerVitals.get(accountId);
     if (!vitals) return;
     this.playerVitals.set(accountId, { ...vitals, health: Math.max(0, vitals.health - damage) });
+    this.cancelChannel(accountId);
 
     if (source === 'bite' && this.bleedRoll() < BITE_BLEED_CHANCE) {
       // applyBleedWound takes the higher rate and later expiry rather than
@@ -716,6 +761,89 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     }
   }
 
+  /**
+   * Starts a use channel (GDD section 6). Nothing is consumed here: the item
+   * is spent only when the channel completes, which is what makes cancelling
+   * free.
+   */
+  private resolveUseItem(accountId: string, definitionId: string, sequence: number): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    const durationS = USE_CHANNEL_SECONDS[definitionId];
+    if (durationS === undefined) return { ...base, accepted: false, reasonCode: 'not_found' };
+
+    const cooldownUntil = this.useCooldownUntilTick.get(accountId);
+    if (cooldownUntil !== undefined && this.state.tick < cooldownUntil) {
+      return { ...base, accepted: false, reasonCode: 'rate_limited' };
+    }
+    if (this.channelsByAccount.has(accountId)) return { ...base, accepted: false, reasonCode: 'busy' };
+
+    const slots = this.playerSlots.get(accountId) ?? [];
+    if (countInInventory(slots, definitionId) < 1) {
+      return { ...base, accepted: false, reasonCode: 'insufficient_resources' };
+    }
+
+    this.channelsByAccount.set(accountId, { definitionId, channel: startChannel(durationS) });
+    return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  /**
+   * GDD section 6: "Damage, sprint, death or disconnect cancels without
+   * consumption." Read as *incoming* damage: a bleed wound that cancelled the
+   * bandage treating it, every tick, would make bleeding untreatable, which is
+   * the opposite of what T08 describes. So bleeding, starvation, exposure and
+   * cold do not cancel; bites do.
+   */
+  private cancelChannel(accountId: string): void {
+    if (!this.channelsByAccount.delete(accountId)) return;
+    this.sendChannel(accountId);
+  }
+
+  /** Advances every open use channel, consuming and applying only on completion. */
+  private tickChannels(dt: number): void {
+    for (const [accountId, open] of this.channelsByAccount) {
+      if (this.pendingMove.get(accountId)?.action.sprint) {
+        this.cancelChannel(accountId);
+        continue;
+      }
+
+      const { channel, completed } = progressChannel(open.channel, dt);
+      if (!completed) {
+        this.channelsByAccount.set(accountId, { ...open, channel: channel! });
+        continue;
+      }
+
+      // Consume and apply together: a completion that spent the bandage but
+      // failed to clear the wound would be worse than not completing at all.
+      const slots = this.playerSlots.get(accountId) ?? [];
+      const { slots: next, removed } = removeFromInventory(slots, open.definitionId, 1);
+      this.channelsByAccount.delete(accountId);
+      this.useCooldownUntilTick.set(accountId, this.state.tick + USE_COOLDOWN_TICKS);
+      if (removed < 1) {
+        // The item left the pack while the channel ran; nothing to apply.
+        this.sendChannel(accountId);
+        continue;
+      }
+
+      this.playerSlots.set(accountId, next);
+      this.store.savePlayerSlots(accountId, next);
+      if (open.definitionId === 'bandage') this.woundsByAccount.delete(accountId);
+
+      const client = this.clientsByAccount.get(accountId);
+      client?.send('inventory', { slots: next });
+      this.sendChannel(accountId);
+    }
+  }
+
+  /** Tells one owner about their own open channel, so the HUD can show a timer. */
+  private sendChannel(accountId: string): void {
+    const open = this.channelsByAccount.get(accountId);
+    this.clientsByAccount.get(accountId)?.send('channel', {
+      definitionId: open?.definitionId ?? null,
+      elapsedS: open?.channel.elapsedS ?? 0,
+      durationS: open?.channel.durationS ?? 0,
+    });
+  }
+
   private isSwingOnCooldown(accountId: string): boolean {
     const lastSwing = this.lastSwingTick.get(accountId);
     return lastSwing !== undefined && this.state.tick - lastSwing < SWING_INTERVAL_TICKS;
@@ -795,6 +923,12 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     if (!this.playerSlots.has(accountId)) {
       this.playerSlots.set(accountId, this.store.loadPlayerSlots(accountId, BACKPACK_SLOTS));
     }
+    // GDD section 5's spawn kit. Epoch 1 is an account's very first join ever,
+    // which is the only signal that separates a new player from one who has
+    // simply emptied their pack. Respawn-on-death gets its own rule with M2.
+    if (sessionEpoch === 1) {
+      this.grantSpawnKit(accountId);
+    }
     if (!this.playerVitals.has(accountId)) {
       this.playerVitals.set(accountId, { calories: CALORIE_SPAWN, health: HEALTH_SPAWN, exposure: 0 });
     }
@@ -826,6 +960,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       // simulated while still appearing connected.
       if (this.clientsByAccount.get(accountId) !== client) return;
       this.pendingMove.delete(accountId);
+      // GDD section 6: a disconnect cancels an open use channel, without
+      // consuming what it would have spent.
+      this.channelsByAccount.delete(accountId);
       this.connectedAccounts.delete(accountId);
       this.clientsByAccount.delete(accountId);
     }
@@ -907,6 +1044,16 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       );
       client.send('commandResult', JSON.parse(encoded) as CommandResult);
       client.send('inventory', { slots: this.playerSlots.get(accountId) });
+      return;
+    }
+
+    if (command.action.type === 'useItem') {
+      const definitionId = command.action.definitionId;
+      const encoded = this.store.commitOutcome(key, () =>
+        JSON.stringify(this.resolveUseItem(accountId, definitionId, command.sequence)),
+      );
+      client.send('commandResult', JSON.parse(encoded) as CommandResult);
+      this.sendChannel(accountId);
       return;
     }
 
@@ -1351,6 +1498,15 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.tickSurvival(dt);
   }
 
+  private grantSpawnKit(accountId: string): void {
+    let slots = this.playerSlots.get(accountId) ?? new Array(BACKPACK_SLOTS).fill(null);
+    for (const [definitionId, quantity] of SPAWN_KIT) {
+      slots = addToInventory(slots, definitionId, quantity, getItem(definitionId)?.stack ?? 1).slots;
+    }
+    this.playerSlots.set(accountId, slots);
+    this.store.savePlayerSlots(accountId, slots);
+  }
+
   /** Test-only: seeds a player's inventory directly, bypassing gather/take. */
   grantForTest(accountId: string, definitionId: string, quantity: number): void {
     const stackLimit = getItem(definitionId)?.stack ?? 1;
@@ -1411,6 +1567,8 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.tickBleeding(dt);
 
     this.tickSurvival(dt);
+
+    this.tickChannels(dt);
 
     this.tickCrafting(dt);
 
