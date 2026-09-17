@@ -69,8 +69,9 @@ describe('WorldRoom damaging a structure (GDD section 10)', () => {
     const result = await client.waitForMessage('commandResult');
 
     expect(result.accepted, result.reasonCode).toBe(true);
-    // CONTENT section 7's wood wall is 1000 HP; section 5's rock hits for 10.
-    expect(room.state.buildingPieces.get(siteKey(WALL))!.health).toBe(990);
+    // CONTENT section 7's wood wall is 1000 HP; section 5's rock hits for 10,
+    // and section 8 halves a tool's damage against wood.
+    expect(room.state.buildingPieces.get(siteKey(WALL))!.health).toBe(995);
 
     client.leave();
   });
@@ -94,8 +95,8 @@ describe('WorldRoom damaging a structure (GDD section 10)', () => {
   it('brings the wall down when the last of its health goes', async () => {
     const room = (await colyseus.createRoom('world', {})) as WorldRoom;
     const client = await cabinWall(room, 'acct_breaker');
-    // One swing from destroyed, rather than a hundred of them.
-    room.setPieceHealthForTest(WALL, 10);
+    // One swing from destroyed, rather than two hundred of them.
+    room.setPieceHealthForTest(WALL, 5);
 
     client.send('command', attack(WALL));
     expect((await client.waitForMessage('commandResult')).accepted).toBe(true);
@@ -110,7 +111,7 @@ describe('WorldRoom damaging a structure (GDD section 10)', () => {
   it('refuses a swing at a piece that is no longer there', async () => {
     const room = (await colyseus.createRoom('world', {})) as WorldRoom;
     const client = await cabinWall(room, 'acct_air');
-    room.setPieceHealthForTest(WALL, 10);
+    room.setPieceHealthForTest(WALL, 5);
     client.send('command', attack(WALL));
     await client.waitForMessage('commandResult');
     room.clearSwingCooldownForTest('acct_air');
@@ -135,7 +136,7 @@ describe('WorldRoom damaging a structure (GDD section 10)', () => {
 
     expect(second.accepted).toBe(false);
     expect(second.reasonCode).toBe('rate_limited');
-    expect(room.state.buildingPieces.get(siteKey(WALL))!.health).toBe(990);
+    expect(room.state.buildingPieces.get(siteKey(WALL))!.health).toBe(995);
 
     client.leave();
   });

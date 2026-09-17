@@ -13,6 +13,9 @@ import {
   validateDeployablePlacement,
   validatePieceSite,
   cascadeRemoval,
+  structuralMeleeDamage,
+  structuralSplashDamage,
+  EXPLOSIVES,
   stepDecay,
   DECAY_INTERVAL_S,
   WOOD_DECAY,
@@ -148,6 +151,15 @@ const BUILD_REACH_M = 6;
 const DOOR_PLACED_HP: Record<string, number> = { wood_door: 500, metal_door: 1000 };
 /** GDD section 11: "A building-wide raid lock lasts 60 seconds after any hostile damage". */
 const RAID_LOCK_TICKS = 60 * TICK_RATE_HZ;
+
+/**
+ * Which of CONTENT section 8's two structural damage multipliers a piece
+ * uses. Read off the id's tier prefix, which is how CONTENT names every one
+ * of the eighteen pieces and both doors.
+ */
+function materialOf(definitionId: string): 'wood' | 'metal' {
+  return definitionId.startsWith('metal') ? 'metal' : 'wood';
+}
 /** Camera offset above the player's feet; the client measures reach from here. */
 const EYE_HEIGHT_M = 1.7;
 /**
@@ -1631,7 +1643,12 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
 
     const replicated = door ? this.state.doors.get(key) : this.state.buildingPieces.get(key);
     if (!replicated) return { ...base, accepted: false, reasonCode: 'not_found' };
-    const health = replicated.health - MELEE_DAMAGE;
+    // CONTENT section 8: "Tools deal their base melee damage x0.5 to wood and
+    // x0.05 to metal." Without it a rock chews through a wall at full damage,
+    // and there is no reason for anyone to build an explosive.
+    const health =
+      replicated.health -
+      structuralMeleeDamage(MELEE_DAMAGE, materialOf(door ? replicated.definitionId : piece.definitionId));
     if (health > 0) {
       // Class-2 continuous state (TECHNICAL section 7): checkpointed rather
       // than written per hit, because a raid is hundreds of hits and each one
@@ -1646,6 +1663,62 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       this.destroyPiece(key);
     }
     return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  /**
+   * GDD section 11's explosion against structures. Test-only for now: the
+   * satchel item and its crafting chain are M3 (PRODUCTION section 1 puts
+   * "satchel raid" there), but T12's maths and the occlusion rule are
+   * structural geometry and belong with the building work.
+   */
+  detonateForTest(at: Point3, explosiveId: 'satchel' | 'powder_bomb'): void {
+    const spec = EXPLOSIVES[explosiveId];
+    // "resolve the blocking set from the pre-explosion world so a single
+    // explosion cannot destroy a door and then damage behind it
+    // retroactively" -- so the barriers are taken once, up front, and the
+    // targets are gathered before anything is applied.
+    const barriers = this.barriers();
+    const hits: Array<{ key: string; damage: number; door: boolean; deployable: boolean }> = [];
+
+    const consider = (key: string, position: Point3, door: boolean, deployable: boolean): void => {
+      const distance = Math.hypot(position.x - at.x, position.y - at.y, position.z - at.z);
+      const damage = structuralSplashDamage(spec, distance);
+      if (damage <= 0) return;
+      // "One intact structural barrier occludes further structural blast
+      // damage."
+      if (isReachBlocked(at, position, barriers)) return;
+      hits.push({ key, damage, door, deployable });
+    };
+
+    for (const [key, piece] of this.buildingPieces) {
+      // CONTENT section 8: "Supports marked combat immune ignore these and
+      // all explosions."
+      if (getBuildingPiece(piece.definitionId)?.combatImmune) continue;
+      consider(key, worldPositionOf(piece.site), false, false);
+    }
+    for (const [key, door] of this.doors) {
+      consider(key, worldPositionOf(door.site), true, false);
+    }
+    for (const [id, deployable] of this.deployables) {
+      consider(id, deployable.position, false, true);
+    }
+
+    for (const hit of hits) {
+      const replicated = hit.deployable
+        ? this.state.deployables.get(hit.key)
+        : hit.door
+          ? this.state.doors.get(hit.key)
+          : this.state.buildingPieces.get(hit.key);
+      if (!replicated) continue;
+      const health = replicated.health - hit.damage;
+      if (health > 0) {
+        replicated.health = health;
+        continue;
+      }
+      if (hit.deployable) this.breakDeployable(hit.key);
+      else if (hit.door) this.removeDoor(hit.key);
+      else this.destroyPiece(hit.key);
+    }
   }
 
   private removeDoor(key: string): void {

@@ -12,6 +12,7 @@ export * from './placement.js';
 export * from './building.js';
 export * from './occlusion.js';
 export * from './decay.js';
+export * from './explosion.js';
 export * from './stacks.js';
 export * from './crafting.js';
 export * from './daynight.js';
