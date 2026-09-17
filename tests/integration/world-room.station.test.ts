@@ -161,6 +161,46 @@ describe('WorldRoom furnace (T09, CONTENT section 3)', () => {
   });
 });
 
+/**
+ * Station contents are container contents, which TECHNICAL section 3 keeps off
+ * the shared replicated state. They therefore have to be pushed to the players
+ * who can see them, and a cold empty station never changes, so arriving at one
+ * has to be what triggers it.
+ */
+describe('WorldRoom station replication (TECHNICAL section 3)', () => {
+  it('shows a station to a player who walks up to it, before anything changes', async () => {
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    room.spawnStation('furnace_t', 'furnace', AT_ARMS_LENGTH);
+    const client = await colyseus.connectTo(room, { accountId: 'acct_near' });
+    const seen: Array<{ stationId: string; lit: boolean }> = [];
+    client.onMessage('station', (payload) => seen.push(payload));
+    await client.waitForMessage('session');
+
+    await room.waitForNextTimestep();
+    await room.waitForNextTimestep();
+
+    expect(seen.map((s) => s.stationId)).toContain('furnace_t');
+
+    client.leave();
+  });
+
+  it('does not show a station to a player nowhere near it', async () => {
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    room.spawnStation('furnace_far', 'furnace', { x: 1000, y: 0, z: 1000 });
+    const client = await colyseus.connectTo(room, { accountId: 'acct_away' });
+    const seen: string[] = [];
+    client.onMessage('station', (payload: { stationId: string }) => seen.push(payload.stationId));
+    await client.waitForMessage('session');
+
+    await room.waitForNextTimestep();
+    await room.waitForNextTimestep();
+
+    expect(seen).not.toContain('furnace_far');
+
+    client.leave();
+  });
+});
+
 /** The same wiring has to serve CONTENT's other station without changes. */
 describe('WorldRoom campfire (CONTENT section 3)', () => {
   it('cooks 6 meat and makes 6 charcoal in 60s', async () => {

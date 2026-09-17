@@ -38,8 +38,22 @@ const MOVE_SEND_HZ = 20; // matches TECHNICAL section 3's simulation rate
 const PATCH_INTERVAL_MS = 50;
 const EYE_HEIGHT_M = 1.7; // matches the server's own eye height for reach
 const ITEM_WORLD_POSITION = new Vector3(2, 0.5, 2); // client-side placeholder; see note below
-const NODE_WORLD_POSITION = new Vector3(-2, 0.5, 2); // client-side placeholder; matches server's node_1
 const HUD_INTERVAL_MS = 100; // the HUD is read by a human; no reason to rebuild it per frame
+
+/**
+ * Where the server seeds the world's gatherables and stations. Mirrored here
+ * only so the placeholder meshes stand in the right place and the HUD can name
+ * what you are next to; the server is the authority on all of it, and refuses
+ * anything out of its own reach.
+ */
+const NODES = [
+  { id: 'node_1', label: 'wood pile', position: new Vector3(-2, 0.5, 2) },
+  { id: 'rock_1', label: 'ore rock', position: new Vector3(0, 0.5, -6) },
+];
+const STATIONS = [
+  { id: 'furnace_1', label: 'furnace', input: 'metal_ore', position: new Vector3(6, 0.5, 0) },
+  { id: 'campfire_1', label: 'campfire', input: 'raw_meat', position: new Vector3(-6, 0.5, 0) },
+];
 
 const statusEl = document.getElementById('status')!;
 const overlayEl = document.getElementById('enterOverlay')!;
@@ -74,9 +88,23 @@ itemMesh.material = itemMaterial;
 
 const nodeMaterial = new StandardMaterial('nodeMat', scene);
 nodeMaterial.diffuseColor = new Color3(0.4, 0.3, 0.15);
-const nodeMesh = MeshBuilder.CreateBox('node_1', { width: 0.8, height: 0.5, depth: 0.8 }, scene);
-nodeMesh.position.copyFrom(NODE_WORLD_POSITION);
-nodeMesh.material = nodeMaterial;
+for (const node of NODES) {
+  const mesh = MeshBuilder.CreateBox(node.id, { width: 0.8, height: 0.5, depth: 0.8 }, scene);
+  mesh.position.copyFrom(node.position);
+  mesh.material = nodeMaterial;
+}
+
+const stationMaterial = new StandardMaterial('stationMat', scene);
+stationMaterial.diffuseColor = new Color3(0.45, 0.45, 0.5); // cold stone; lit fires glow below
+const litMaterial = new StandardMaterial('litMat', scene);
+litMaterial.diffuseColor = new Color3(0.9, 0.45, 0.15);
+const stationMeshes = new Map<string, ReturnType<typeof MeshBuilder.CreateBox>>();
+for (const station of STATIONS) {
+  const mesh = MeshBuilder.CreateBox(station.id, { width: 1, height: 1, depth: 1 }, scene);
+  mesh.position.copyFrom(station.position);
+  mesh.material = stationMaterial;
+  stationMeshes.set(station.id, mesh);
+}
 
 const accountId = getOrCreateAccountId();
 let sessionEpoch = 0;
@@ -88,6 +116,16 @@ let sendTimer: number | undefined;
 let disconnectReason: string | undefined;
 let lookError: string | undefined;
 let crafting: { recipeId: string | null; completedUnits: number; totalUnits: number; progressS: number } | undefined;
+interface StationPayload {
+  stationId: string;
+  kind: string;
+  lit: boolean;
+  progressS: number;
+  inputs: Array<{ definitionId: string; quantity: number } | null>;
+  fuel: { definitionId: string; quantity: number } | null;
+  outputs: Array<{ definitionId: string; quantity: number } | null>;
+}
+const stationStates = new Map<string, StationPayload>();
 let vitals = { calories: 0, health: 0, exposure: 0, coldDeficit: 0, phase: 'day' };
 let yaw = 0;
 let pitch = 0;
@@ -127,6 +165,12 @@ window.addEventListener('keydown', (e) => {
   // direct keybind rather than a recipe browser; the browser arrives with the
   // rest of the catalog.
   if (e.code === 'KeyC') attemptCraft('stone_hatchet', 1);
+  // CONTENT section 3's stations. Direct keys for the same reason: a real
+  // slot-by-slot station panel arrives with M2's containers.
+  if (e.code === 'KeyF') attemptStationInsert('wood');
+  if (e.code === 'KeyR') attemptStationInsert(nearestStation()?.input);
+  if (e.code === 'KeyT') attemptStationTake();
+  if (e.code === 'KeyG') attemptStationLight();
 });
 
 document.addEventListener('pointerlockchange', () => {
@@ -239,6 +283,13 @@ async function connect(): Promise<void> {
     crafting = payload;
   });
 
+  // Station contents are container contents, which TECHNICAL section 3 keeps
+  // off the shared state; the server sends them only to players standing at
+  // the station.
+  joined.onMessage('station', (payload: StationPayload) => {
+    stationStates.set(payload.stationId, payload);
+  });
+
   // Vitals are private per TECHNICAL section 3, so they arrive as a targeted
   // message rather than on the shared state. They were already being sent
   // every tick and simply thrown away by the client.
@@ -301,15 +352,7 @@ function sendMoveCommand(): void {
 }
 
 function attemptCraft(recipeId: string, quantity: number): void {
-  if (!room) return;
-  sequence += 1;
-  room.send('command', {
-    protocolVersion: PROTOCOL_VERSION,
-    sessionEpoch,
-    sequence,
-    clientTick: 0,
-    action: { type: 'craft', recipeId, quantity },
-  });
+  send({ type: 'craft', recipeId, quantity });
 }
 
 // Reach is deliberately NOT pre-checked here. The server enforces it (a
@@ -318,27 +361,61 @@ function attemptCraft(recipeId: string, quantity: number): void {
 // keybind: nothing happened and nothing said why. Now the server answers and
 // the HUD's `last:` line shows out_of_range/already_taken/ok.
 function attemptTakeItem(): void {
-  if (!room) return;
-  sequence += 1;
-  room.send('command', {
-    protocolVersion: PROTOCOL_VERSION,
-    sessionEpoch,
-    sequence,
-    clientTick: 0,
-    action: { type: 'takeItem', itemInstanceId: 'item_1' },
-  });
+  send({ type: 'takeItem', itemInstanceId: 'item_1' });
 }
 
-function attemptHitNode(): void {
+function send(action: Record<string, unknown>): void {
   if (!room) return;
   sequence += 1;
-  room.send('command', {
-    protocolVersion: PROTOCOL_VERSION,
-    sessionEpoch,
-    sequence,
-    clientTick: 0,
-    action: { type: 'hitNode', nodeId: 'node_1' },
-  });
+  room.send('command', { protocolVersion: PROTOCOL_VERSION, sessionEpoch, sequence, clientTick: 0, action });
+}
+
+function nearestOf<T extends { position: Vector3 }>(candidates: readonly T[]): T | undefined {
+  let best: T | undefined;
+  let bestDistance = Infinity;
+  for (const candidate of candidates) {
+    const distance = Vector3.Distance(camera.position, candidate.position);
+    if (distance < bestDistance) {
+      best = candidate;
+      bestDistance = distance;
+    }
+  }
+  return best;
+}
+
+const nearestStation = () => nearestOf(STATIONS);
+
+function attemptHitNode(): void {
+  const node = nearestOf(NODES);
+  if (node) send({ type: 'hitNode', nodeId: node.id });
+}
+
+/** Sums one item across the pack, so a keypress can move everything you carry. */
+function heldQuantity(definitionId: string): number {
+  return inventorySlots.reduce(
+    (sum, slot) => sum + (slot?.definitionId === definitionId ? slot.quantity : 0),
+    0,
+  );
+}
+
+function attemptStationInsert(definitionId: string | undefined): void {
+  const station = nearestStation();
+  if (!station || !definitionId) return;
+  // One stack at a time, which is the protocol's own per-insert ceiling.
+  const quantity = Math.min(250, heldQuantity(definitionId));
+  if (quantity < 1) return;
+  send({ type: 'stationInsert', stationId: station.id, definitionId, quantity });
+}
+
+function attemptStationTake(): void {
+  const station = nearestStation();
+  if (station) send({ type: 'stationTake', stationId: station.id });
+}
+
+function attemptStationLight(): void {
+  const station = nearestStation();
+  if (!station) return;
+  send({ type: 'stationLight', stationId: station.id, lit: !stationStates.get(station.id)?.lit });
 }
 
 /** Sums each distinct item in the pack, so the HUD is not wood-only. */
@@ -370,8 +447,31 @@ function describeNearest(): string {
   if (itemMesh.isEnabled()) {
     parts.push(`wood ${Vector3.Distance(camera.position, ITEM_WORLD_POSITION).toFixed(1)}m (E)`);
   }
-  parts.push(`tree ${Vector3.Distance(camera.position, NODE_WORLD_POSITION).toFixed(1)}m (LMB)`);
+  for (const node of NODES) {
+    parts.push(`${node.label} ${Vector3.Distance(camera.position, node.position).toFixed(1)}m (LMB)`);
+  }
+  const station = nearestStation();
+  if (station) {
+    parts.push(`${station.label} ${Vector3.Distance(camera.position, station.position).toFixed(1)}m`);
+  }
   return parts.join('  ');
+}
+
+/** The station you are standing at, as the server last reported it to you. */
+function describeStation(): string {
+  const station = nearestStation();
+  const state = station && stationStates.get(station.id);
+  if (!station || !state) return 'walk up to a furnace or campfire';
+  const describe = (slots: Array<{ definitionId: string; quantity: number } | null>): string => {
+    const filled = slots.filter((slot) => slot !== null);
+    return filled.length === 0 ? 'empty' : filled.map((slot) => `${slot!.definitionId} ${slot!.quantity}`).join(', ');
+  };
+  return [
+    `${station.label} ${state.lit ? 'LIT' : 'cold'}`,
+    `in ${describe(state.inputs)}`,
+    `fuel ${state.fuel ? `wood ${state.fuel.quantity}` : 'empty'}`,
+    `out ${describe(state.outputs)}`,
+  ].join(' : ');
 }
 
 engine.runRenderLoop(() => {
@@ -400,6 +500,10 @@ engine.runRenderLoop(() => {
   const item = room?.state.items?.get('item_1');
   itemMesh.setEnabled(!item || item.claimedBy === '');
 
+  for (const [stationId, mesh] of stationMeshes) {
+    mesh.material = stationStates.get(stationId)?.lit ? litMaterial : stationMaterial;
+  }
+
   const now = performance.now();
   if (now - hudAtMs >= HUD_INTERVAL_MS) {
     hudAtMs = now;
@@ -411,8 +515,10 @@ engine.runRenderLoop(() => {
           `pack: ${describeInventory()}`,
           `craft: ${describeCrafting()}`,
           `near: ${describeNearest()}`,
+          `station: ${describeStation()}`,
           `last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : `  (${lookError ?? 'click canvas to look'})`}`,
           'WASD move : shift sprint : space jump : LMB gather : E take : C craft hatchet',
+          'at a station -- F add fuel : R add input : G light/snuff : T take output',
         ].join('\n')
       : disconnectReason
         ? `${disconnectReason} -- reload to reconnect`

@@ -184,6 +184,8 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private readonly lastSwingTick = new Map<string, number>();
   private readonly stations = new Map<string, StationState>();
   private readonly stationConfigs = new Map<string, StationConfig>();
+  /** Who was last within reach of each station, so arrivals can be detected. */
+  private readonly stationViewers = new Map<string, Set<string>>();
 
   onCreate(): void {
     // TECHNICAL section 17: the world keeps running even when nobody is
@@ -286,6 +288,13 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     if (!this.resourceNodes.has('node_1')) {
       // CONTENT section 4: wood pile
       this.spawnNode('node_1', 'wood', 150, 10, { x: -2, y: 0.5, z: 2 });
+    }
+    if (!this.resourceNodes.has('rock_1')) {
+      // CONTENT section 4's mixed rock, metal_ore column only (budget 60,
+      // yield 3). The real node carries three simultaneous budgets and pays
+      // all of them per swing, which needs a multi-resource node model;
+      // without any ore at all a furnace can only ever make charcoal.
+      this.spawnNode('rock_1', 'metal_ore', 60, 3, { x: 0, y: 0.5, z: -6 });
     }
     // Placed outside HAZARD_ZONE_RADIUS_M so tending a fire is not also a
     // stint in the hot-ore zone. Built stations arrive with M2's building
@@ -698,19 +707,24 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
    * off the shared schema, so this is a targeted message -- and only to
    * players standing at the station, who are the ones who could open it.
    */
-  private sendStation(stationId: string): void {
+  private stationPayload(stationId: string): unknown {
     const station = this.stations.get(stationId);
     const config = this.stationConfigs.get(stationId);
-    if (!station || !config) return;
-    const payload = {
+    return {
       stationId,
-      kind: config.kind,
-      lit: station.lit,
-      progressS: station.progressS,
-      inputs: station.inputs,
-      fuel: station.fuel,
-      outputs: station.outputs,
+      kind: config?.kind,
+      lit: station?.lit ?? false,
+      progressS: station?.progressS ?? 0,
+      inputs: station?.inputs ?? [],
+      fuel: station?.fuel ?? null,
+      outputs: station?.outputs ?? [],
     };
+  }
+
+  private sendStation(stationId: string): void {
+    const config = this.stationConfigs.get(stationId);
+    if (!this.stations.has(stationId) || !config) return;
+    const payload = this.stationPayload(stationId);
     for (const accountId of this.connectedAccounts) {
       if (!this.isWithinReach(accountId, config.position)) continue;
       this.clientsByAccount.get(accountId)?.send('station', payload);
@@ -1065,6 +1079,29 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       if (fuelQuantity(next) === fuelQuantity(station)) continue;
       this.persistStation(stationId);
       this.sendStation(stationId);
+    }
+
+    this.sendStationsToArrivals();
+  }
+
+  /**
+   * Sends a station's contents to a player the moment they come within reach
+   * of it. Without this a player who walks up to a station sees nothing at all
+   * until it next changes -- and a cold, empty one never changes. Tracked as
+   * an arrival rather than resent on a timer so a crowd standing at a furnace
+   * costs nothing.
+   */
+  private sendStationsToArrivals(): void {
+    for (const [stationId, config] of this.stationConfigs) {
+      const previous = this.stationViewers.get(stationId) ?? new Set<string>();
+      const current = new Set<string>();
+      for (const accountId of this.connectedAccounts) {
+        if (!this.isWithinReach(accountId, config.position)) continue;
+        current.add(accountId);
+        if (previous.has(accountId)) continue;
+        this.clientsByAccount.get(accountId)?.send('station', this.stationPayload(stationId));
+      }
+      this.stationViewers.set(stationId, current);
     }
   }
 
