@@ -32,26 +32,42 @@ interface PlayerCheckpointRow {
   grounded: number;
 }
 
+export interface Vec3 {
+  x: number;
+  y: number;
+  z: number;
+}
+
 export interface ItemClaim {
   definitionId: string;
   claimedBy: string | null;
+  position: Vec3;
 }
 
 interface ItemClaimRow {
   instance_id: string;
   definition_id: string;
   claimed_by: string | null;
+  x: number;
+  y: number;
+  z: number;
 }
 
 export interface NodeState {
   definitionId: string;
   remaining: number;
+  yieldPerHit: number;
+  position: Vec3;
 }
 
 interface ResourceNodeRow {
   node_id: string;
   definition_id: string;
   remaining: number;
+  yield_per_hit: number;
+  x: number;
+  y: number;
+  z: number;
 }
 
 interface PlayerSlotRow {
@@ -119,12 +135,19 @@ export class WorldStore {
       CREATE TABLE IF NOT EXISTS item_claims (
         instance_id TEXT PRIMARY KEY,
         definition_id TEXT NOT NULL,
-        claimed_by TEXT
+        claimed_by TEXT,
+        x REAL NOT NULL DEFAULT 0,
+        y REAL NOT NULL DEFAULT 0,
+        z REAL NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS resource_nodes (
         node_id TEXT PRIMARY KEY,
         definition_id TEXT NOT NULL,
-        remaining INTEGER NOT NULL
+        remaining INTEGER NOT NULL,
+        yield_per_hit REAL NOT NULL DEFAULT 0,
+        x REAL NOT NULL DEFAULT 0,
+        y REAL NOT NULL DEFAULT 0,
+        z REAL NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS player_slots (
         account_id TEXT NOT NULL,
@@ -140,6 +163,26 @@ export class WorldStore {
         exposure REAL NOT NULL DEFAULT 0
       );
     `);
+
+    // World files created before items and nodes had authoritative positions
+    // predate those columns. CREATE TABLE IF NOT EXISTS won't add them, so
+    // top up in place; the DEFAULTs give existing rows spawn-origin values.
+    this.addColumnIfMissing('item_claims', 'x', 'REAL NOT NULL DEFAULT 0');
+    this.addColumnIfMissing('item_claims', 'y', 'REAL NOT NULL DEFAULT 0');
+    this.addColumnIfMissing('item_claims', 'z', 'REAL NOT NULL DEFAULT 0');
+    this.addColumnIfMissing('resource_nodes', 'yield_per_hit', 'REAL NOT NULL DEFAULT 0');
+    this.addColumnIfMissing('resource_nodes', 'x', 'REAL NOT NULL DEFAULT 0');
+    this.addColumnIfMissing('resource_nodes', 'y', 'REAL NOT NULL DEFAULT 0');
+    this.addColumnIfMissing('resource_nodes', 'z', 'REAL NOT NULL DEFAULT 0');
+  }
+
+  private addColumnIfMissing(table: string, column: string, definition: string): void {
+    // Table and column names are compile-time literals from this file only --
+    // never user or client input -- so the unavoidable interpolation here
+    // (PRAGMA and ALTER TABLE cannot bind identifiers) has no injection path.
+    const columns = this.db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+    if (columns.some((c) => c.name === column)) return;
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
   beginSession(accountId: string): number {
@@ -248,45 +291,75 @@ export class WorldStore {
    * transaction-key dedup alone cannot catch a resent "take item" command
    * after a restart. The underlying claim state itself must survive.
    */
-  saveItemClaim(instanceId: string, definitionId: string, claimedBy: string | null): void {
+  saveItemClaim(
+    instanceId: string,
+    definitionId: string,
+    claimedBy: string | null,
+    position: Vec3,
+  ): void {
     this.db
       .prepare(
-        `INSERT INTO item_claims (instance_id, definition_id, claimed_by) VALUES (?, ?, ?)
+        `INSERT INTO item_claims (instance_id, definition_id, claimed_by, x, y, z) VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(instance_id) DO UPDATE SET
-           definition_id = excluded.definition_id, claimed_by = excluded.claimed_by`,
+           definition_id = excluded.definition_id, claimed_by = excluded.claimed_by,
+           x = excluded.x, y = excluded.y, z = excluded.z`,
       )
-      .run(instanceId, definitionId, claimedBy);
+      .run(instanceId, definitionId, claimedBy, position.x, position.y, position.z);
   }
 
   loadItemClaims(): Map<string, ItemClaim> {
     const rows = this.db
-      .prepare('SELECT instance_id, definition_id, claimed_by FROM item_claims')
+      .prepare('SELECT instance_id, definition_id, claimed_by, x, y, z FROM item_claims')
       .all() as ItemClaimRow[];
     const result = new Map<string, ItemClaim>();
     for (const row of rows) {
-      result.set(row.instance_id, { definitionId: row.definition_id, claimedBy: row.claimed_by });
+      result.set(row.instance_id, {
+        definitionId: row.definition_id,
+        claimedBy: row.claimed_by,
+        position: { x: row.x, y: row.y, z: row.z },
+      });
     }
     return result;
   }
 
-  /** Persists a resource node's remaining budget (T03 conservation across a restart). */
-  saveNodeState(nodeId: string, definitionId: string, remaining: number): void {
+  /**
+   * Persists a resource node's remaining budget (T03 conservation across a
+   * restart) along with the identity it was spawned with. yieldPerHit is
+   * stored rather than re-derived on load: a node whose rate came from
+   * anywhere but the default table would otherwise restore with a different
+   * (possibly zero) rate and be silently dead.
+   */
+  saveNodeState(
+    nodeId: string,
+    definitionId: string,
+    remaining: number,
+    yieldPerHit: number,
+    position: Vec3,
+  ): void {
     this.db
       .prepare(
-        `INSERT INTO resource_nodes (node_id, definition_id, remaining) VALUES (?, ?, ?)
+        `INSERT INTO resource_nodes (node_id, definition_id, remaining, yield_per_hit, x, y, z)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(node_id) DO UPDATE SET
-           definition_id = excluded.definition_id, remaining = excluded.remaining`,
+           definition_id = excluded.definition_id, remaining = excluded.remaining,
+           yield_per_hit = excluded.yield_per_hit,
+           x = excluded.x, y = excluded.y, z = excluded.z`,
       )
-      .run(nodeId, definitionId, remaining);
+      .run(nodeId, definitionId, remaining, yieldPerHit, position.x, position.y, position.z);
   }
 
   loadNodeStates(): Map<string, NodeState> {
     const rows = this.db
-      .prepare('SELECT node_id, definition_id, remaining FROM resource_nodes')
+      .prepare('SELECT node_id, definition_id, remaining, yield_per_hit, x, y, z FROM resource_nodes')
       .all() as ResourceNodeRow[];
     const result = new Map<string, NodeState>();
     for (const row of rows) {
-      result.set(row.node_id, { definitionId: row.definition_id, remaining: row.remaining });
+      result.set(row.node_id, {
+        definitionId: row.definition_id,
+        remaining: row.remaining,
+        yieldPerHit: row.yield_per_hit,
+        position: { x: row.x, y: row.y, z: row.z },
+      });
     }
     return result;
   }

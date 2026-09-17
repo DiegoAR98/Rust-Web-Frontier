@@ -27,7 +27,7 @@ import {
   type Slot,
   type WorldItem,
 } from '@rwf/sim';
-import { WorldStore } from './persistence.js';
+import { WorldStore, type Vec3 } from './persistence.js';
 import { PlayerState, WorldItemState, WorldState } from './world-state.js';
 
 /** Matches TECHNICAL section 3's simulation budget: 20 fixed ticks/s. */
@@ -58,6 +58,17 @@ const DEFAULT_YIELD_PER_HIT: Record<string, number> = { wood: 10 };
  */
 const HAZARD_ZONE_CENTER = { x: 0, z: 0 };
 const HAZARD_ZONE_RADIUS_M = 5;
+/** GDD section 5: how far a player can reach to take or hit something. */
+const INTERACT_REACH_M = 2.5;
+/**
+ * Slack on the server's reach check. The client decides it is in range from
+ * the position it has, which is always a little behind the server's; at
+ * SPRINT 5.5 m/s a ~180ms round trip is about a metre of travel. Generous
+ * enough never to refuse honest play, far too tight to farm from across the map.
+ */
+const INTERACT_REACH_TOLERANCE_M = 1;
+/** Camera offset above the player's feet; the client measures reach from here. */
+const EYE_HEIGHT_M = 1.7;
 
 interface ClientUserData {
   accountId: string;
@@ -67,6 +78,7 @@ interface ClientUserData {
 interface NodeConfig {
   definitionId: string;
   yieldPerHit: number;
+  position: Vec3;
 }
 
 type RoomClient = Client<{ userData: ClientUserData }>;
@@ -75,6 +87,7 @@ type MoveAction = Extract<Command['action'], { type: 'move' }>;
 export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private store!: WorldStore;
   private readonly worldItems = new Map<string, WorldItem>();
+  private readonly itemPositions = new Map<string, Vec3>();
   private readonly movementByAccount = new Map<string, MovementState>();
   private readonly pendingMove = new Map<string, { action: MoveAction; tick: number }>();
   private readonly resourceNodes = new Map<string, ResourceNode>();
@@ -120,6 +133,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         definitionId: claim.definitionId,
         claimedBy: claim.claimedBy,
       });
+      this.itemPositions.set(instanceId, claim.position);
       const item = new WorldItemState();
       item.definitionId = claim.definitionId;
       item.claimedBy = claim.claimedBy ?? '';
@@ -129,7 +143,11 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       this.resourceNodes.set(nodeId, { nodeId, remaining: node.remaining });
       this.nodeConfigs.set(nodeId, {
         definitionId: node.definitionId,
-        yieldPerHit: DEFAULT_YIELD_PER_HIT[node.definitionId] ?? 0,
+        // Prefer the rate the node was actually spawned with. Falling back to
+        // the default table is only for rows written before the column
+        // existed, where it is stored as 0.
+        yieldPerHit: node.yieldPerHit > 0 ? node.yieldPerHit : DEFAULT_YIELD_PER_HIT[node.definitionId] ?? 0,
+        position: node.position,
       });
     }
     for (const [accountId, vitals] of this.store.loadPlayerVitals()) {
@@ -139,11 +157,14 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     // Seed the M0/M1 proof-of-mechanism content on a genuinely fresh world
     // only -- never re-seed over a restored (possibly claimed/depleted)
     // item or node, which the restore loops above already populated.
+    // Positions match where the client draws its placeholder meshes, so a
+    // player who walks up to one is genuinely within the server's reach check.
     if (!this.worldItems.has('item_1')) {
-      this.spawnItem('item_1', 'wood');
+      this.spawnItem('item_1', 'wood', { x: 2, y: 0.5, z: 2 });
     }
     if (!this.resourceNodes.has('node_1')) {
-      this.spawnNode('node_1', 'wood', 150, 10); // CONTENT section 4: wood pile
+      // CONTENT section 4: wood pile
+      this.spawnNode('node_1', 'wood', 150, 10, { x: -2, y: 0.5, z: 2 });
     }
 
     this.onMessage('command', CommandSchema, (client, command) => {
@@ -176,19 +197,43 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   }
 
   /** Seeds a world item for tests/tools; not a player-facing command. */
-  spawnItem(instanceId: string, definitionId: string): void {
+  spawnItem(instanceId: string, definitionId: string, position: Vec3 = { x: 0, y: 0, z: 0 }): void {
     this.worldItems.set(instanceId, { instanceId, definitionId, claimedBy: null });
-    this.store.saveItemClaim(instanceId, definitionId, null);
+    this.itemPositions.set(instanceId, position);
+    this.store.saveItemClaim(instanceId, definitionId, null, position);
     const item = new WorldItemState();
     item.definitionId = definitionId;
     this.state.items.set(instanceId, item);
   }
 
   /** Seeds a gatherable resource node for tests/tools; not a player-facing command. */
-  spawnNode(nodeId: string, definitionId: string, totalBudget: number, yieldPerHit: number): void {
+  spawnNode(
+    nodeId: string,
+    definitionId: string,
+    totalBudget: number,
+    yieldPerHit: number,
+    position: Vec3 = { x: 0, y: 0, z: 0 },
+  ): void {
     this.resourceNodes.set(nodeId, { nodeId, remaining: totalBudget });
-    this.nodeConfigs.set(nodeId, { definitionId, yieldPerHit });
-    this.store.saveNodeState(nodeId, definitionId, totalBudget);
+    this.nodeConfigs.set(nodeId, { definitionId, yieldPerHit, position });
+    this.store.saveNodeState(nodeId, definitionId, totalBudget, yieldPerHit, position);
+  }
+
+  /**
+   * Server-authoritative reach check (GDD section 5). The client applies the
+   * same limit for responsiveness, but a modified client simply omits it, so
+   * the claim is only real if the server makes it. Measured from the player's
+   * eye, matching where the client measures from, with a tolerance that
+   * absorbs the latency between the client deciding it is in range and the
+   * command landing.
+   */
+  private isWithinReach(accountId: string, target: Vec3): boolean {
+    const movement = this.movementByAccount.get(accountId);
+    if (!movement) return false;
+    const dx = movement.position.x - target.x;
+    const dy = movement.position.y + EYE_HEIGHT_M - target.y;
+    const dz = movement.position.z - target.z;
+    return Math.sqrt(dx * dx + dy * dy + dz * dz) <= INTERACT_REACH_M + INTERACT_REACH_TOLERANCE_M;
   }
 
   onJoin(client: RoomClient, options: { accountId?: string }): void {
@@ -297,13 +342,25 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   }
 
   private resolveTakeItem(accountId: string, itemInstanceId: string, sequence: number): CommandResult {
-    const outcome = simTakeItem(this.worldItems, itemInstanceId, accountId);
     const base = { sequence, serverTick: this.state.tick };
+    const position = this.itemPositions.get(itemInstanceId);
+    // Checked before the claim so an out-of-reach attempt neither takes the
+    // item nor reveals whether it was still unclaimed.
+    if (position && !this.isWithinReach(accountId, position)) {
+      return { ...base, accepted: false, reasonCode: 'out_of_range' };
+    }
+
+    const outcome = simTakeItem(this.worldItems, itemInstanceId, accountId);
     if (outcome.outcome === 'taken') {
       const stateItem = this.state.items.get(itemInstanceId);
       if (stateItem) {
         stateItem.claimedBy = accountId;
-        this.store.saveItemClaim(itemInstanceId, stateItem.definitionId, accountId);
+        this.store.saveItemClaim(
+          itemInstanceId,
+          stateItem.definitionId,
+          accountId,
+          position ?? { x: 0, y: 0, z: 0 },
+        );
       }
       return { ...base, accepted: true, reasonCode: 'ok' };
     }
@@ -316,6 +373,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     const config = this.nodeConfigs.get(nodeId);
     if (!node || !config) {
       return { ...base, accepted: false, reasonCode: 'not_found' };
+    }
+    if (!this.isWithinReach(accountId, config.position)) {
+      return { ...base, accepted: false, reasonCode: 'out_of_range' };
     }
 
     // Peek at the harvest before committing it: decrementing the node budget
@@ -336,7 +396,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
 
     const { node: nextNode, result } = harvestNode(node, config.yieldPerHit);
     this.resourceNodes.set(nodeId, nextNode);
-    this.store.saveNodeState(nodeId, config.definitionId, nextNode.remaining);
+    this.store.saveNodeState(nodeId, config.definitionId, nextNode.remaining, config.yieldPerHit, config.position);
 
     const { slots: nextSlots, overflow } = addToInventory(currentSlots, config.definitionId, result.granted, stackLimit);
     if (overflow > 0) {

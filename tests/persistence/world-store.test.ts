@@ -7,6 +7,9 @@ import { WorldStore } from '@rwf/server/persistence';
 let dir: string;
 let dbFile: string;
 
+/** An arbitrary non-origin position, so a dropped coordinate can't pass as 0. */
+const POS = { x: 2, y: 0.5, z: -3 };
+
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'rwf-world-store-'));
   dbFile = join(dir, 'world.sqlite');
@@ -139,47 +142,47 @@ describe('WorldStore player transform checkpoints (T04/T17 continuous state)', (
 describe('WorldStore item claim durability (T04)', () => {
   it('restores an unclaimed spawned item after a restart', () => {
     const before = new WorldStore(dbFile);
-    before.saveItemClaim('item_1', 'wood', null);
+    before.saveItemClaim('item_1', 'wood', null, POS);
     before.close();
 
     const after = new WorldStore(dbFile);
     const items = after.loadItemClaims();
     after.close();
 
-    expect(items.get('item_1')).toEqual({ definitionId: 'wood', claimedBy: null });
+    expect(items.get('item_1')).toEqual({ definitionId: 'wood', claimedBy: null, position: POS });
   });
 
   it('restores an already-claimed item as claimed, so a retried take cannot grant it twice', () => {
     const before = new WorldStore(dbFile);
-    before.saveItemClaim('item_1', 'wood', null);
-    before.saveItemClaim('item_1', 'wood', 'acct_a');
+    before.saveItemClaim('item_1', 'wood', null, POS);
+    before.saveItemClaim('item_1', 'wood', 'acct_a', POS);
     before.close();
 
     const after = new WorldStore(dbFile);
     const items = after.loadItemClaims();
     after.close();
 
-    expect(items.get('item_1')).toEqual({ definitionId: 'wood', claimedBy: 'acct_a' });
+    expect(items.get('item_1')).toEqual({ definitionId: 'wood', claimedBy: 'acct_a', position: POS });
   });
 });
 
 describe('WorldStore resource node durability (T03 conservation across a restart)', () => {
   it('restores a node at its last saved remaining budget', () => {
     const before = new WorldStore(dbFile);
-    before.saveNodeState('node_1', 'wood', 40);
+    before.saveNodeState('node_1', 'wood', 40, 10, POS);
     before.close();
 
     const after = new WorldStore(dbFile);
     const nodes = after.loadNodeStates();
     after.close();
 
-    expect(nodes.get('node_1')).toEqual({ definitionId: 'wood', remaining: 40 });
+    expect(nodes.get('node_1')).toEqual({ definitionId: 'wood', remaining: 40, yieldPerHit: 10, position: POS });
   });
 
   it('overwrites the remaining budget rather than accumulating history', () => {
     const store = new WorldStore(dbFile);
-    store.saveNodeState('node_1', 'wood', 150);
-    store.saveNodeState('node_1', 'wood', 100);
+    store.saveNodeState('node_1', 'wood', 150, 10, POS);
+    store.saveNodeState('node_1', 'wood', 100, 10, POS);
 
     const nodes = store.loadNodeStates();
     store.close();
