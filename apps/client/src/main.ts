@@ -11,6 +11,9 @@ import '@babylonjs/core/Meshes/Builders/capsuleBuilder';
 import '@babylonjs/core/Meshes/Builders/boxBuilder';
 import { ColyseusSDK, getStateCallbacks, type Room } from '@colyseus/sdk';
 import { PROTOCOL_VERSION } from '@rwf/protocol';
+// The same constant the server validates with, so the ghost's preview and the
+// server's answer cannot drift apart into two different rules.
+import { PLACEMENT_CLEARANCE_M } from '@rwf/sim';
 import { clampPitch, computeMoveIntent, wrapYaw, type KeyState } from './input.js';
 import { interpolateTransform, type Transform } from './interpolate.js';
 
@@ -86,6 +89,8 @@ const carcassMeshes = new Map<string, ReturnType<typeof MeshBuilder.CreateBox>>(
 const carcassPositions = new Map<string, Vector3>();
 const corpseMeshes = new Map<string, ReturnType<typeof MeshBuilder.CreateBox>>();
 const corpsePositions = new Map<string, Vector3>();
+const deployableMeshes = new Map<string, ReturnType<typeof MeshBuilder.CreateBox>>();
+const deployablePositions = new Map<string, Vector3>();
 
 const deerMaterial = new StandardMaterial('deerMat', scene);
 deerMaterial.diffuseColor = new Color3(0.65, 0.5, 0.3);
@@ -97,6 +102,24 @@ carcassMaterial.diffuseColor = new Color3(0.5, 0.15, 0.15);
 // different things to walk up to, and both are lootable.
 const corpseMaterial = new StandardMaterial('corpseMat', scene);
 corpseMaterial.diffuseColor = new Color3(0.2, 0.2, 0.45);
+const crateMaterial = new StandardMaterial('crateMat', scene);
+crateMaterial.diffuseColor = new Color3(0.55, 0.38, 0.18);
+
+/**
+ * GDD section 10's placement ghost. It has to show where the crate would land
+ * and whether the server would accept it -- the section requires the ghost to
+ * expose the rules, and a player who cannot see a refusal coming just presses
+ * the key repeatedly.
+ */
+const ghostMesh = MeshBuilder.CreateBox('placementGhost', { width: 0.9, height: 0.7, depth: 0.9 }, scene);
+const ghostOkMaterial = new StandardMaterial('ghostOkMat', scene);
+ghostOkMaterial.diffuseColor = new Color3(0.3, 0.8, 0.3);
+ghostOkMaterial.alpha = 0.4;
+const ghostBadMaterial = new StandardMaterial('ghostBadMat', scene);
+ghostBadMaterial.diffuseColor = new Color3(0.85, 0.25, 0.2);
+ghostBadMaterial.alpha = 0.4;
+ghostMesh.isPickable = false;
+ghostMesh.setEnabled(false);
 
 const itemMaterial = new StandardMaterial('itemMat', scene);
 itemMaterial.diffuseColor = new Color3(0.7, 0.5, 0.2);
@@ -152,6 +175,14 @@ interface CorpsePayload {
   removed: boolean;
 }
 const corpseContents = new Map<string, CorpsePayload>();
+interface ContainerPayload {
+  containerId: string;
+  definitionId: string;
+  ownerAccountId: string;
+  slots: Array<{ definitionId: string; quantity: number } | null>;
+  removed: boolean;
+}
+const containerContents = new Map<string, ContainerPayload>();
 /** Set while this account is dead; GDD section 12's death recap and respawn prompt. */
 let death: { corpseId: string | null } | undefined;
 let respawnNotice: string | undefined;
@@ -195,6 +226,7 @@ window.addEventListener('keydown', (e) => {
   // direct keybind rather than a recipe browser; the browser arrives with the
   // rest of the catalog.
   if (e.code === 'KeyC') attemptCraft('stone_hatchet', 1);
+  if (e.code === 'KeyN') attemptCraft('small_crate', 1);
   // CONTENT section 3's stations. Direct keys for the same reason: a real
   // slot-by-slot station panel arrives with M2's containers.
   if (e.code === 'KeyF') attemptStationInsert('wood');
@@ -213,6 +245,10 @@ window.addEventListener('keydown', (e) => {
   // new one. Everything else the server refuses outright while dead.
   if (e.code === 'Enter' && death) send({ type: 'respawn' });
   if (e.code === 'KeyQ') attemptCorpseTake();
+  // GDD section 10's placement, and section 8's storage.
+  if (e.code === 'KeyX') attemptPlaceCrate();
+  if (e.code === 'KeyZ') attemptContainerInsert();
+  if (e.code === 'KeyH') attemptContainerTake();
 });
 
 document.addEventListener('pointerlockchange', () => {
@@ -340,6 +376,13 @@ async function connect(): Promise<void> {
     // trouble, which section 12 requires be communicated rather than hidden.
     respawnNotice = payload.safe ? undefined : 'respawned in a dangerous spot';
   });
+  joined.onMessage('container', (payload: ContainerPayload) => {
+    if (payload.removed) {
+      containerContents.delete(payload.containerId);
+      return;
+    }
+    containerContents.set(payload.containerId, payload);
+  });
   joined.onMessage('corpse', (payload: CorpsePayload) => {
     if (payload.removed) {
       corpseContents.delete(payload.corpseId);
@@ -424,6 +467,17 @@ async function connect(): Promise<void> {
     corpsePositions.delete(key);
     corpseContents.delete(key);
   });
+  $(joined.state).deployables!.onAdd((_deployable: ReplicatedCreature, key: string) => {
+    const mesh = MeshBuilder.CreateBox(`deployable_${key}`, { width: 0.9, height: 0.7, depth: 0.9 }, scene);
+    mesh.material = crateMaterial;
+    deployableMeshes.set(key, mesh);
+  });
+  $(joined.state).deployables!.onRemove((_deployable: ReplicatedCreature, key: string) => {
+    deployableMeshes.get(key)?.dispose();
+    deployableMeshes.delete(key);
+    deployablePositions.delete(key);
+    containerContents.delete(key);
+  });
 
   joined.onStateChange(() => {
     patchAtMs = performance.now();
@@ -464,6 +518,12 @@ async function connect(): Promise<void> {
       if (!corpse) continue;
       mesh.position.set(corpse.x, corpse.y + 0.2, corpse.z);
       corpsePositions.set(key, new Vector3(corpse.x, corpse.y, corpse.z));
+    }
+    for (const [key, mesh] of deployableMeshes) {
+      const deployable = joined.state.deployables.get(key);
+      if (!deployable) continue;
+      mesh.position.set(deployable.x, deployable.y + 0.35, deployable.z);
+      deployablePositions.set(key, new Vector3(deployable.x, deployable.y, deployable.z));
     }
   });
 }
@@ -533,6 +593,79 @@ function attemptCorpseTake(): void {
   if (corpseId) send({ type: 'corpseTake', corpseId });
 }
 
+/** GDD section 10: the ghost stands on the ground a short step ahead of you. */
+const PLACEMENT_DISTANCE_M = 2;
+
+function ghostPosition(): Vector3 {
+  // Ground level in front of where the player is facing. Pitch is ignored on
+  // purpose: a crate goes on the ground, and letting the player aim it at the
+  // sky would only ever produce a refusal.
+  return new Vector3(
+    camera.position.x + Math.sin(yaw) * PLACEMENT_DISTANCE_M,
+    0,
+    camera.position.z + Math.cos(yaw) * PLACEMENT_DISTANCE_M,
+  );
+}
+
+/**
+ * Whether the server would take this placement, using the same rules it does.
+ * It is a preview, not a gate: the key sends regardless and the HUD reports
+ * whatever the server actually said, so a client that got this wrong cannot
+ * turn a refusal into a placement or hide one it would have allowed.
+ */
+function ghostIsLegal(position: Vector3): boolean {
+  const occupied: Vector3[] = [...deployablePositions.values(), ...STATIONS.map((s) => s.position),
+    ...NODES.map((n) => n.position)];
+  for (const other of occupied) {
+    if (Math.hypot(position.x - other.x, position.z - other.z) < PLACEMENT_CLEARANCE_M) return false;
+  }
+  return heldQuantity('small_crate') > 0;
+}
+
+function attemptPlaceCrate(): void {
+  const position = ghostPosition();
+  send({ type: 'placeDeployable', definitionId: 'small_crate', x: position.x, y: position.y, z: position.z });
+}
+
+/** The nearest crate; GDD section 8 has no owner-only storage. */
+function nearestContainerId(): string | undefined {
+  let best: string | undefined;
+  let bestDistance = Infinity;
+  for (const [id, position] of deployablePositions) {
+    const distance = Vector3.Distance(camera.position, position);
+    if (distance >= bestDistance) continue;
+    best = id;
+    bestDistance = distance;
+  }
+  return best;
+}
+
+function attemptContainerTake(): void {
+  const containerId = nearestContainerId();
+  if (containerId) send({ type: 'containerTake', containerId });
+}
+
+/**
+ * Stores the biggest stack in the pack. A slot-by-slot container panel is real
+ * UI work; until then "put that away" is the useful single action, and it is
+ * the one that makes a crate worth placing at all.
+ */
+function attemptContainerInsert(): void {
+  const containerId = nearestContainerId();
+  if (!containerId) return;
+  let biggest: { definitionId: string; quantity: number } | undefined;
+  for (const [definitionId, quantity] of inventoryTotals()) {
+    if (!biggest || quantity > biggest.quantity) biggest = { definitionId, quantity };
+  }
+  if (!biggest) return;
+  send({
+    type: 'containerInsert',
+    containerId,
+    definitionId: biggest.definitionId,
+    quantity: Math.min(250, biggest.quantity),
+  });
+}
+
 /**
  * One swing key for everything you swing at. Picks whatever is closest --
  * animal, carcass or node -- rather than making the player remember a
@@ -593,12 +726,17 @@ function attemptStationLight(): void {
 }
 
 /** Sums each distinct item in the pack, so the HUD is not wood-only. */
-function describeInventory(): string {
+function inventoryTotals(): Map<string, number> {
   const totals = new Map<string, number>();
   for (const slot of inventorySlots) {
     if (!slot) continue;
     totals.set(slot.definitionId, (totals.get(slot.definitionId) ?? 0) + slot.quantity);
   }
+  return totals;
+}
+
+function describeInventory(): string {
+  const totals = inventoryTotals();
   if (totals.size === 0) return 'empty';
   return [...totals].map(([id, qty]) => `${id} ${qty}`).join(', ');
 }
@@ -684,6 +822,24 @@ function describeCorpse(): string {
   return `${corpseId} ${distance.toFixed(1)}m : ${listed}${more}${held} (Q)`;
 }
 
+/** The crate you are standing at, as the server last reported it to you. */
+function describeContainer(): string {
+  if (heldQuantity('small_crate') > 0) {
+    const position = ghostPosition();
+    const verdict = ghostIsLegal(position) ? 'clear' : 'BLOCKED';
+    return `holding one -- X places it here (${verdict})`;
+  }
+  const containerId = nearestContainerId();
+  if (!containerId) return 'none nearby (craft one with 40 wood)';
+  const distance = Vector3.Distance(camera.position, deployablePositions.get(containerId)!);
+  const contents = containerContents.get(containerId);
+  if (!contents) return `${containerId} ${distance.toFixed(1)}m (walk closer to see inside)`;
+  const filled = contents.slots.filter((slot) => slot !== null);
+  const listed =
+    filled.length === 0 ? 'empty' : filled.map((slot) => `${slot!.definitionId} ${slot!.quantity}`).join(', ');
+  return `${containerId} ${distance.toFixed(1)}m : ${listed} (Z store, H take)`;
+}
+
 engine.runRenderLoop(() => {
   // Time-based, so meshes actually animate between patches. The old constant
   // 0.5 parked every remote player permanently at the midpoint of its last
@@ -714,6 +870,16 @@ engine.runRenderLoop(() => {
     mesh.material = stationStates.get(stationId)?.lit ? litMaterial : stationMaterial;
   }
 
+  // The ghost is only shown while the player is actually holding a crate;
+  // a permanent translucent box in front of the camera is just clutter.
+  const holdingCrate = heldQuantity('small_crate') > 0;
+  ghostMesh.setEnabled(holdingCrate && !death);
+  if (holdingCrate) {
+    const position = ghostPosition();
+    ghostMesh.position.set(position.x, position.y + 0.35, position.z);
+    ghostMesh.material = ghostIsLegal(position) ? ghostOkMaterial : ghostBadMaterial;
+  }
+
   const now = performance.now();
   if (now - hudAtMs >= HUD_INTERVAL_MS) {
     hudAtMs = now;
@@ -731,14 +897,16 @@ engine.runRenderLoop(() => {
           `near: ${describeNearest()}`,
           `station: ${describeStation()}`,
           `body: ${describeCorpse()}`,
+          `crate: ${describeContainer()}`,
           `using: ${
             channel && channel.definitionId
               ? `${channel.definitionId} ${channel.elapsedS.toFixed(1)}/${channel.durationS.toFixed(0)}s`
               : 'nothing'
           }`,
           `last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : `  (${lookError ?? 'click canvas to look'})`}`,
-          'WASD move : shift sprint : space jump : LMB swing at what you face : E take : C craft hatchet',
-          'B bandage : V eat : Q loot the nearest body : at a station -- F fuel : R input : G light/snuff : T take',
+          'WASD move : shift sprint : space jump : LMB swing at what you face : E take',
+          'C craft hatchet : N craft crate : X place crate : Z store : H take from crate : Q loot a body',
+          'B bandage : V eat : at a station -- F fuel : R input : G light/snuff : T take output',
         ].join('\n')
       : disconnectReason
         ? `${disconnectReason} -- reload to reconnect`
