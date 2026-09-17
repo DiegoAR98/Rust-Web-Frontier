@@ -1,0 +1,22 @@
+{
+  "name": "@rwf/client",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./input": "./src/input.ts",
+    "./interpolate": "./src/interpolate.ts"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@babylonjs/core": "9.26.2",
+    "@colyseus/sdk": "0.18.2",
+    "@rwf/protocol": "*"
+  },
+  "devDependencies": {
+    "vite": "8.3.0"
+  }
+}

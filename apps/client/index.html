@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Rust Web Frontier - M0</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #1a1410; overflow: hidden; }
+      #renderCanvas { width: 100%; height: 100%; display: block; touch-action: none; }
+      #enterOverlay {
+        position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+        background: rgba(20, 15, 10, 0.85); color: #e8d9b8; font-family: system-ui, sans-serif;
+        z-index: 10;
+      }
+      #enterOverlay button {
+        font-size: 1.2rem; padding: 0.75rem 1.5rem; cursor: pointer;
+        background: #6b4a2b; color: #f5e9c8; border: 1px solid #a0764a; border-radius: 4px;
+      }
+      #status {
+        position: fixed; top: 8px; left: 8px; color: #e8d9b8; font-family: monospace;
+        font-size: 12px; z-index: 5; white-space: pre;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="renderCanvas"></canvas>
+    <div id="status"></div>
+    <div id="enterOverlay">
+      <button id="enterButton">Enter world</button>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
