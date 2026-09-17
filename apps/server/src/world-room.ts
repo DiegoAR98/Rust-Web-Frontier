@@ -16,6 +16,9 @@ import {
   structuralMeleeDamage,
   structuralSplashDamage,
   characterBlastDamage,
+  repairCost,
+  repairableHp,
+  REPAIR_CHANNEL_S,
   EXPLOSIVES,
   stepDecay,
   DECAY_INTERVAL_S,
@@ -378,7 +381,18 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
    * an assertion at all.
    */
   private respawnRoll: () => number = Math.random;
-  private readonly channelsByAccount = new Map<string, { definitionId: string; channel: ChannelState }>();
+  private readonly channelsByAccount = new Map<
+    string,
+    {
+      definitionId: string;
+      channel: ChannelState;
+      /**
+       * A repair is the second thing that holds interact (GDD section 10), so
+       * the channel carries what it is for rather than assuming an item.
+       */
+      repair?: { site: PieceSite; door: boolean };
+    }
+  >();
   private readonly useCooldownUntilTick = new Map<string, number>();
   private readonly poisonByAccount = new Map<string, BleedWound>();
   /** When each account last took damage, for GDD section 6's 10s regen delay. */
@@ -1755,6 +1769,95 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     }
   }
 
+  /**
+   * What a repair would put back and what it would cost, or a refusal. Shared
+   * by the command (which must refuse before starting the hold) and the
+   * completion (which must re-check, because two seconds is long enough for
+   * the wall to have been hit again).
+   */
+  private planRepair(
+    accountId: string,
+    site: PieceSite,
+    door: boolean,
+  ):
+    | { restored: number; cost: Record<string, number>; key: string }
+    | CommandResult['reasonCode'] {
+    const key = siteKey(site);
+    const piece = this.buildingPieces.get(key);
+    if (!piece) return 'not_found';
+    const replicated = door ? this.state.doors.get(key) : this.state.buildingPieces.get(key);
+    const definitionId = door ? this.doors.get(key)?.definitionId : piece.definitionId;
+    if (!replicated || !definitionId) return 'not_found';
+
+    const maxHealth = door ? DOOR_PLACED_HP[definitionId] : getBuildingPiece(definitionId)?.placedHp;
+    if (!maxHealth) return 'not_found';
+    const restored = repairableHp(replicated.health, maxHealth);
+    if (restored <= 0) return 'not_found';
+
+    if (!this.mayBuildOn(accountId, this.buildingFrom([key]))) return 'forbidden';
+    // GDD section 11: the raid lock "blocks repair" -- a wall cannot be
+    // patched faster than it is being broken.
+    if (this.isRaidLocked(this.buildingFrom([key]))) return 'raid_locked';
+
+    const recipe = getRecipe(definitionId);
+    if (!recipe) return 'not_found';
+    const cost = repairCost(recipe.inputs, restored, maxHealth);
+    const slots = this.playerSlots.get(accountId) ?? [];
+    for (const [id, quantity] of Object.entries(cost)) {
+      if (countInInventory(slots, id) < quantity) return 'insufficient_resources';
+    }
+    return { restored, cost, key };
+  }
+
+  private resolveRepairStructure(
+    accountId: string,
+    site: PieceSite,
+    door: boolean,
+    sequence: number,
+  ): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    const plan = this.planRepair(accountId, site, door);
+    if (typeof plan === 'string') return { ...base, accepted: false, reasonCode: plan };
+    if (!this.canReachThrough(accountId, worldPositionOf(site) as Vec3)) {
+      return { ...base, accepted: false, reasonCode: 'out_of_range' };
+    }
+    if (this.channelsByAccount.has(accountId)) return { ...base, accepted: false, reasonCode: 'busy' };
+
+    // Nothing is spent and nothing is restored yet: section 10 says "hold
+    // interact ... for 2 seconds", and an interrupted hold costs nothing, the
+    // same rule a bandage follows (D36).
+    this.channelsByAccount.set(accountId, {
+      definitionId: 'repair',
+      channel: startChannel(REPAIR_CHANNEL_S),
+      repair: { site: { ...site }, door },
+    });
+    this.sendChannel(accountId);
+    return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  /**
+   * Pays for and applies a finished repair. Re-planned rather than trusting
+   * what the hold started with: two seconds is long enough for the wall to
+   * have been hit again, for the raid lock to have come on, or for the
+   * materials to have been spent elsewhere.
+   */
+  private completeRepair(accountId: string, site: PieceSite, door: boolean): void {
+    const plan = this.planRepair(accountId, site, door);
+    if (typeof plan === 'string') return;
+
+    let slots = this.playerSlots.get(accountId) ?? [];
+    for (const [id, quantity] of Object.entries(plan.cost)) {
+      slots = removeFromInventory(slots, id, quantity).slots;
+    }
+    this.playerSlots.set(accountId, slots);
+
+    const replicated = door ? this.state.doors.get(plan.key) : this.state.buildingPieces.get(plan.key);
+    if (replicated) replicated.health += plan.restored;
+
+    this.store.savePlayerSlots(accountId, slots);
+    this.clientsByAccount.get(accountId)?.send('inventory', { slots });
+  }
+
   private removeDoor(key: string): void {
     this.socketLockedUntilTick.set(key, this.state.tick + BROKEN_SOCKET_LOCK_TICKS);
     this.doors.delete(key);
@@ -2512,6 +2615,13 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         continue;
       }
 
+      if (open.repair) {
+        this.channelsByAccount.delete(accountId);
+        this.completeRepair(accountId, open.repair.site, open.repair.door);
+        this.sendChannel(accountId);
+        continue;
+      }
+
       // Consume and apply together: a completion that spent the bandage but
       // failed to clear the wound would be worse than not completing at all.
       const slots = this.playerSlots.get(accountId) ?? [];
@@ -2850,6 +2960,18 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         JSON.stringify(this.resolveAttackDeployable(accountId, deployableId, command.sequence)),
       );
       client.send('commandResult', JSON.parse(encoded) as CommandResult);
+      return;
+    }
+
+    if (command.action.type === 'repairStructure') {
+      const { form, door, storey, i, k, axis } = command.action;
+      const encoded = this.store.commitOutcome(key, () =>
+        JSON.stringify(
+          this.resolveRepairStructure(accountId, { form, storey, i, k, axis }, door, command.sequence),
+        ),
+      );
+      client.send('commandResult', JSON.parse(encoded) as CommandResult);
+      this.sendChannel(accountId);
       return;
     }
 

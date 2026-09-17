@@ -138,6 +138,21 @@ export const AttackStructureIntentSchema = z.object({
 });
 export type AttackStructureIntent = z.infer<typeof AttackStructureIntentSchema>;
 
+/**
+ * Starts GDD section 10's two-second repair hold on a structure. `door` picks
+ * the insert rather than the frame, exactly as attackStructure does.
+ */
+export const RepairStructureIntentSchema = z.object({
+  type: z.literal('repairStructure'),
+  form: z.enum(['foundation', 'pillar', 'wall', 'doorway', 'ceiling']),
+  door: z.boolean(),
+  storey: z.number().int().min(0).max(16),
+  i: z.number().int().min(-4096).max(4096),
+  k: z.number().int().min(-4096).max(4096),
+  axis: z.enum(['x', 'z']).nullable(),
+});
+export type RepairStructureIntent = z.infer<typeof RepairStructureIntentSchema>;
+
 /** A swing at a placed deployable (GDD section 11: "Destroying a box produces its loot"). */
 export const AttackDeployableIntentSchema = z.object({
   type: z.literal('attackDeployable'),
@@ -258,6 +273,7 @@ export const ActionPayloadSchema = z.discriminatedUnion('type', [
   PlaceBuildingPieceIntentSchema,
   AttackStructureIntentSchema,
   AttackDeployableIntentSchema,
+  RepairStructureIntentSchema,
   InstallDoorIntentSchema,
   OperateDoorIntentSchema,
   SetDoorAccessIntentSchema,
