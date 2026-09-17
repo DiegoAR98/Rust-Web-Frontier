@@ -60,6 +60,27 @@ export const UseItemIntentSchema = z.object({
 });
 export type UseItemIntent = z.infer<typeof UseItemIntentSchema>;
 
+/**
+ * Asks for a new body (GDD section 12). Carries nothing: where a respawning
+ * player lands is the server's choice among authored anchors, never the
+ * client's.
+ */
+export const RespawnIntentSchema = z.object({
+  type: z.literal('respawn'),
+});
+export type RespawnIntent = z.infer<typeof RespawnIntentSchema>;
+
+/**
+ * Empties a corpse into the actor's pack (GDD section 8: "Any person who
+ * reaches a box can open it"). Like stationTake it names no slot -- the
+ * server moves whatever fits and leaves the rest on the body.
+ */
+export const CorpseTakeIntentSchema = z.object({
+  type: z.literal('corpseTake'),
+  corpseId: z.string().min(1).max(64),
+});
+export type CorpseTakeIntent = z.infer<typeof CorpseTakeIntentSchema>;
+
 const stationId = () => z.string().min(1).max(64);
 
 /**
@@ -101,6 +122,8 @@ export const ActionPayloadSchema = z.discriminatedUnion('type', [
   AttackCreatureIntentSchema,
   HarvestCarcassIntentSchema,
   UseItemIntentSchema,
+  RespawnIntentSchema,
+  CorpseTakeIntentSchema,
 ]);
 export type ActionPayload = z.infer<typeof ActionPayloadSchema>;
 
@@ -128,6 +151,11 @@ export const REASON_CODES = [
   // Distinct from insufficient_resources so a UI can say which it is.
   'no_space',
   'busy',
+  // GDD section 12 marks the account dead: it has no live character to act
+  // with until it respawns.
+  'dead',
+  // ...and a living player has no death to recover from.
+  'not_dead',
 ] as const;
 export type ReasonCode = (typeof REASON_CODES)[number];
 

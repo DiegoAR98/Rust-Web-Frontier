@@ -4,6 +4,14 @@ import { getConsumable, getItem, getRecipe } from '@rwf/content';
 import {
   addToInventory,
   applyBleedWound,
+  buildCorpse,
+  cancelQueueEntry,
+  CORPSE_SLOTS,
+  chooseRespawnAnchor,
+  pageOverflowIn,
+  type CorpseInventory,
+  type ItemStack,
+  type RespawnAnchor,
   CALORIE_MAX,
   CALORIE_SPAWN,
   CREATURE_SPECS,
@@ -56,8 +64,15 @@ import {
   type StationState,
   type WorldItem,
 } from '@rwf/sim';
-import { WorldStore, type StatusEffectRecord, type Vec3 } from './persistence.js';
-import { CarcassState, CreatureState, PlayerState, WorldItemState, WorldState } from './world-state.js';
+import { WorldStore, type CorpseRecord, type StatusEffectRecord, type Vec3 } from './persistence.js';
+import {
+  CarcassState,
+  CorpseState,
+  CreatureState,
+  PlayerState,
+  WorldItemState,
+  WorldState,
+} from './world-state.js';
 
 /** Matches TECHNICAL section 3's simulation budget: 20 fixed ticks/s. */
 export const TICK_RATE_HZ = 20;
@@ -137,6 +152,24 @@ const MELEE_DAMAGE = 10;
 const ALARM_DURATION_S = 5;
 /** GDD section 7: "Unharvested carcasses expire after 10 online minutes." */
 const CARCASS_LIFETIME_TICKS = 10 * 60 * TICK_RATE_HZ;
+/**
+ * GDD section 8: "player death bags 30 minutes; the timer never refreshes on
+ * inspection." Counted in ticks like every other timer, so it freezes with the
+ * host (T17) rather than running down against a wall clock.
+ */
+const CORPSE_LIFETIME_TICKS = 30 * 60 * TICK_RATE_HZ;
+/**
+ * GDD section 12's "valid Coyote Wash or Juniper perimeter anchor". The real
+ * map authors 16 arrival anchors (GDD section 13); until the map exists these
+ * four stand in for them, placed clear of the hot-ore zone at the origin and
+ * of the wolf, so a respawn is not immediately another death.
+ */
+const RESPAWN_ANCHORS: RespawnAnchor[] = [
+  { id: 'coyote_wash_n', position: { x: -20, y: 0, z: -20 } },
+  { id: 'coyote_wash_s', position: { x: -20, y: 0, z: 20 } },
+  { id: 'juniper_e', position: { x: 20, y: 0, z: -20 } },
+  { id: 'juniper_w', position: { x: 24, y: 0, z: 24 } },
+];
 /** GDD section 5: "A player starts with a rock, a torch and bandages." */
 const SPAWN_KIT: Array<[string, number]> = [
   ['rock', 1],
@@ -271,6 +304,23 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private readonly poisonByAccount = new Map<string, BleedWound>();
   /** When each account last took damage, for GDD section 6's 10s regen delay. */
   private readonly lastDamagedTick = new Map<string, number>();
+  /**
+   * Dead players' bodies. Like stations, the contents live here rather than on
+   * the replicated schema (TECHNICAL section 3); only existence and position
+   * are public.
+   */
+  private readonly corpses = new Map<
+    string,
+    { ownerAccountId: string; position: Point3; inventory: CorpseInventory; diedAtTick: number }
+  >();
+  /**
+   * Accounts with no live character until they respawn (GDD section 12:
+   * "removes the live character, and marks the account dead"). Maps to the
+   * tick they died on.
+   */
+  private readonly deadAccounts = new Map<string, number>();
+  /** Who is currently standing over which corpse; see sendCorpsesToArrivals. */
+  private readonly corpseViewers = new Map<string, Set<string>>();
 
   onCreate(): void {
     // TECHNICAL section 17: the world keeps running even when nobody is
@@ -327,6 +377,28 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     }
     for (const [accountId, vitals] of this.store.loadPlayerVitals()) {
       this.playerVitals.set(accountId, vitals);
+    }
+    for (const [corpseId, record] of this.store.loadCorpses()) {
+      this.corpses.set(corpseId, {
+        ownerAccountId: record.ownerAccountId,
+        position: record.position,
+        // Only occupied slots are stored, so pad back out to the full 40.
+        inventory: { slots: padSlots(record.slots, CORPSE_SLOTS), overflow: record.overflow },
+        diedAtTick: record.diedAtTick,
+      });
+      const replicated = new CorpseState();
+      replicated.ownerAccountId = record.ownerAccountId;
+      replicated.x = record.position.x;
+      replicated.y = record.position.y;
+      replicated.z = record.position.z;
+      this.state.corpses.set(corpseId, replicated);
+    }
+    for (const [accountId, diedAtTick] of this.store.loadDeadAccounts()) {
+      // The checkpoint above restored a live body for every account with a
+      // transform; a dead one must not keep it (GDD section 12, T04).
+      this.deadAccounts.set(accountId, diedAtTick);
+      this.state.players.delete(accountId);
+      this.movementByAccount.delete(accountId);
     }
     for (const [accountId, effects] of this.store.loadStatusEffects()) {
       for (const effect of effects) {
@@ -662,6 +734,273 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         applyBleedWound(this.woundsByAccount.get(accountId) ?? null, BITE_BLEED_RATE_PER_S, BLEED_DURATION_S),
       );
     }
+
+    this.killIfDead(accountId);
+  }
+
+  /**
+   * GDD section 11: "zero HP is death" -- there is no downed state to be
+   * revived from. Called wherever health can fall rather than swept up at the
+   * end of the tick, so a dying player stops being a live target inside the
+   * same step that killed them.
+   */
+  private killIfDead(accountId: string): void {
+    if (this.deadAccounts.has(accountId)) return;
+    if ((this.playerVitals.get(accountId)?.health ?? Infinity) > 0) return;
+    this.killPlayer(accountId);
+  }
+
+  /**
+   * GDD section 12's death transaction: "cancels actions, moves backpack,
+   * belt, worn gear, loaded weapons and craft escrow into one corpse
+   * inventory, removes the live character, and marks the account dead."
+   *
+   * Belt, worn gear and loaded weapons have no representation yet; the
+   * backpack and the craft escrow do, and both move. The escrow is
+   * deliberately not left in the queue for a returning player to collect:
+   * section 8 requires that "overflow cannot be lost due to queued crafting",
+   * which means the escrow has to be somewhere reachable, and the corpse is
+   * the only place it can be once the live character is gone.
+   *
+   * Written to disk at the commit rather than at the next checkpoint: a
+   * force-kill between the two would otherwise restore a living body still
+   * holding everything the corpse now has (T04).
+   */
+  private killPlayer(accountId: string): void {
+    const position = this.movementByAccount.get(accountId)?.position ?? { x: 0, y: 0, z: 0 };
+
+    this.cancelChannel(accountId);
+
+    const carried: ItemStack[] = [];
+    for (const slot of this.playerSlots.get(accountId) ?? []) {
+      if (slot) carried.push({ ...slot });
+    }
+    const entry = this.craftingByAccount.get(accountId);
+    if (entry) {
+      for (const [definitionId, quantity] of Object.entries(cancelQueueEntry(entry))) {
+        if (quantity > 0) carried.push({ definitionId, quantity });
+      }
+    }
+
+    const corpseId = `corpse_${accountId}_${this.state.tick}`;
+    const inventory = buildCorpse(carried, (id) => getItem(id)?.stack ?? 1);
+    this.corpses.set(corpseId, {
+      ownerAccountId: accountId,
+      position: { ...position },
+      inventory,
+      diedAtTick: this.state.tick,
+    });
+
+    const replicated = new CorpseState();
+    replicated.ownerAccountId = accountId;
+    replicated.x = position.x;
+    replicated.y = position.y;
+    replicated.z = position.z;
+    this.state.corpses.set(corpseId, replicated);
+
+    const emptySlots: Slot[] = new Array(BACKPACK_SLOTS).fill(null);
+    this.playerSlots.set(accountId, emptySlots);
+    this.craftingByAccount.delete(accountId);
+    this.woundsByAccount.delete(accountId);
+    this.poisonByAccount.delete(accountId);
+    this.pendingMove.delete(accountId);
+    this.deadAccounts.set(accountId, this.state.tick);
+    this.state.players.delete(accountId);
+    // The body is gone, so it has no transform to checkpoint, no vitals to
+    // drain and nothing for a wolf to bite.
+    this.movementByAccount.delete(accountId);
+
+    this.store.runInTransaction(() => {
+      this.persistCorpse(corpseId);
+      this.store.savePlayerSlots(accountId, emptySlots);
+      this.store.deleteCraftingEntry(accountId);
+      this.store.saveStatusEffects(accountId, []);
+      this.store.setAccountDead(accountId, this.state.tick);
+    });
+
+    this.clientsByAccount.get(accountId)?.send('death', { corpseId, tick: this.state.tick });
+  }
+
+  private persistCorpse(corpseId: string): void {
+    const corpse = this.corpses.get(corpseId);
+    if (!corpse) return;
+    const record: CorpseRecord = {
+      ownerAccountId: corpse.ownerAccountId,
+      position: corpse.position,
+      diedAtTick: corpse.diedAtTick,
+      slots: corpse.inventory.slots,
+      overflow: corpse.inventory.overflow,
+    };
+    this.store.saveCorpse(corpseId, record);
+  }
+
+  private removeCorpse(corpseId: string): void {
+    this.corpses.delete(corpseId);
+    this.state.corpses.delete(corpseId);
+    this.store.deleteCorpse(corpseId);
+  }
+
+  /**
+   * A corpse's contents are container contents, so like a station's they are a
+   * targeted message to the players standing over it rather than shared state
+   * (TECHNICAL section 3).
+   */
+  private corpsePayload(corpseId: string): unknown {
+    const corpse = this.corpses.get(corpseId);
+    return {
+      corpseId,
+      ownerAccountId: corpse?.ownerAccountId ?? '',
+      slots: corpse?.inventory.slots ?? [],
+      // A count, not the contents: section 12 calls the manifest
+      // noninteractive, and a looter only needs to know more is coming.
+      overflowCount: corpse?.inventory.overflow.length ?? 0,
+      removed: !corpse,
+    };
+  }
+
+  private sendCorpse(corpseId: string): void {
+    const corpse = this.corpses.get(corpseId);
+    const payload = this.corpsePayload(corpseId);
+    for (const accountId of this.connectedAccounts) {
+      if (corpse && !this.isWithinReach(accountId, { ...corpse.position })) continue;
+      this.clientsByAccount.get(accountId)?.send('corpse', payload);
+    }
+  }
+
+  /**
+   * Shows a corpse's contents to a player the moment they come within reach,
+   * the same arrival rule stations use: a body that nobody has touched never
+   * changes, so waiting for a change would show them nothing at all.
+   */
+  private sendCorpsesToArrivals(): void {
+    for (const [corpseId, corpse] of this.corpses) {
+      const previous = this.corpseViewers.get(corpseId) ?? new Set<string>();
+      const current = new Set<string>();
+      for (const accountId of this.connectedAccounts) {
+        if (!this.isWithinReach(accountId, { ...corpse.position })) continue;
+        current.add(accountId);
+        if (previous.has(accountId)) continue;
+        this.clientsByAccount.get(accountId)?.send('corpse', this.corpsePayload(corpseId));
+      }
+      this.corpseViewers.set(corpseId, current);
+    }
+  }
+
+  /** GDD section 8's 30-minute death bag, counted in ticks so it freezes with the host. */
+  private expireCorpses(): void {
+    for (const [corpseId, corpse] of this.corpses) {
+      if (this.state.tick - corpse.diedAtTick < CORPSE_LIFETIME_TICKS) continue;
+      this.removeCorpse(corpseId);
+    }
+  }
+
+  /**
+   * GDD section 12: "Respawn grants the starter kit exactly once and resets
+   * survival stats." The "exactly once" is the replay guard -- this runs
+   * inside commitOutcome, so a duplicated respawn command returns the first
+   * outcome rather than handing out a second kit.
+   */
+  private resolveRespawn(accountId: string, sequence: number): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    if (!this.deadAccounts.has(accountId)) {
+      return { ...base, accepted: false, reasonCode: 'not_dead' };
+    }
+
+    const enemies: Point3[] = [];
+    for (const creature of this.creatures.values()) enemies.push(creature.position);
+    for (const [otherId, movement] of this.movementByAccount) {
+      if (otherId === accountId || this.deadAccounts.has(otherId)) continue;
+      enemies.push(movement.position);
+    }
+    const chosen = chooseRespawnAnchor(RESPAWN_ANCHORS, enemies, Math.random);
+    const position = chosen ? { ...chosen.anchor.position } : { x: 0, y: 0, z: 0 };
+
+    this.deadAccounts.delete(accountId);
+    this.movementByAccount.set(accountId, { position, velocityY: 0, grounded: true });
+    const player = new PlayerState();
+    player.x = position.x;
+    player.y = position.y;
+    player.z = position.z;
+    this.state.players.set(accountId, player);
+
+    const vitals = { calories: CALORIE_SPAWN, health: HEALTH_SPAWN, exposure: 0 };
+    this.playerVitals.set(accountId, vitals);
+    this.lastDamagedTick.delete(accountId);
+    this.useCooldownUntilTick.delete(accountId);
+    this.grantSpawnKit(accountId);
+
+    this.store.runInTransaction(() => {
+      this.store.setAccountDead(accountId, null);
+      this.store.savePlayerVitals(accountId, vitals);
+      this.store.savePlayerCheckpoint(accountId, { ...position, yaw: 0, grounded: true });
+    });
+
+    // safe: false is section 12's "communicate that the world is dangerous".
+    this.clientsByAccount.get(accountId)?.send('respawn', { ...position, safe: chosen?.safe ?? false });
+    return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  /**
+   * Empties a corpse into the actor's pack (GDD section 8: "Any person who
+   * reaches a box can open it; doors supply security"). Whatever will not fit
+   * stays on the body, and the manifest pages into the freed slots so nothing
+   * is stranded.
+   */
+  private resolveCorpseTake(accountId: string, corpseId: string, sequence: number): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    const corpse = this.corpses.get(corpseId);
+    if (!corpse) return { ...base, accepted: false, reasonCode: 'not_found' };
+    if (!this.isWithinReach(accountId, { ...corpse.position })) {
+      return { ...base, accepted: false, reasonCode: 'out_of_range' };
+    }
+
+    let slots = this.playerSlots.get(accountId) ?? new Array(BACKPACK_SLOTS).fill(null);
+    const remaining: Slot[] = [];
+    let moved = 0;
+    for (const slot of corpse.inventory.slots) {
+      if (!slot) {
+        remaining.push(null);
+        continue;
+      }
+      const stackLimit = getItem(slot.definitionId)?.stack ?? 1;
+      const result = addToInventory(slots, slot.definitionId, slot.quantity, stackLimit);
+      slots = result.slots;
+      moved += slot.quantity - result.overflow;
+      remaining.push(result.overflow > 0 ? { definitionId: slot.definitionId, quantity: result.overflow } : null);
+    }
+
+    if (moved === 0) {
+      return {
+        ...base,
+        accepted: false,
+        reasonCode: corpse.inventory.slots.some((slot) => slot) ? 'no_space' : 'depleted',
+      };
+    }
+
+    corpse.inventory = pageOverflowIn(
+      { slots: remaining, overflow: corpse.inventory.overflow },
+      (id) => getItem(id)?.stack ?? 1,
+    );
+    this.playerSlots.set(accountId, slots);
+
+    const emptied =
+      !corpse.inventory.slots.some((slot) => slot) && corpse.inventory.overflow.length === 0;
+    this.store.runInTransaction(() => {
+      this.store.savePlayerSlots(accountId, slots);
+      if (emptied) {
+        this.store.deleteCorpse(corpseId);
+      } else {
+        this.persistCorpse(corpseId);
+      }
+    });
+    if (emptied) {
+      // An empty body is scenery nobody can interact with; GDD section 8's
+      // 30-minute timer is for bags that still hold something.
+      this.corpses.delete(corpseId);
+      this.state.corpses.delete(corpseId);
+    }
+
+    return { ...base, accepted: true, reasonCode: 'ok' };
   }
 
   /**
@@ -687,6 +1026,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         // Bleeding counts as damage for the regeneration delay, but it does
         // not cancel a use channel; see damagePlayer and D36.
         this.lastDamagedTick.set(accountId, this.state.tick);
+        this.killIfDead(accountId);
       }
     }
   }
@@ -1032,8 +1372,10 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     // client SDK's own post-join message listener registration.
     this.clock.setTimeout(() => client.send('session', { sessionEpoch }), 0);
 
-    if (!this.state.players.has(accountId)) {
-      // Fresh player: spawn kit position, GDD section 5's ground level.
+    if (!this.state.players.has(accountId) && !this.deadAccounts.has(accountId)) {
+      // Fresh player: spawn kit position, GDD section 5's ground level. A dead
+      // account is skipped deliberately -- GDD section 12 gives it "a death
+      // recap and respawn options", not a new body just for reconnecting.
       this.state.players.set(accountId, new PlayerState());
       this.movementByAccount.set(accountId, {
         position: { x: 0, y: 0, z: 0 },
@@ -1071,6 +1413,13 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       // A reconnect mid-craft must not present an empty queue while escrow
       // is still held.
       this.sendCrafting(accountId);
+      // GDD section 12: "If killed while away, show a death recap and respawn
+      // options." Without this a player who was killed as a sleeper comes back
+      // to a world they cannot act in and no explanation.
+      if (this.deadAccounts.has(accountId)) {
+        const own = [...this.corpses].find(([, corpse]) => corpse.ownerAccountId === accountId);
+        client.send('death', { corpseId: own?.[0] ?? null, tick: this.deadAccounts.get(accountId) });
+      }
     }, 0);
   }
 
@@ -1109,12 +1458,47 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       return;
     }
 
+    const key = { accountId, sessionEpoch: command.sessionEpoch, sequence: command.sequence };
+
+    // GDD section 12 marks a dead account dead until it respawns: it has no
+    // live character, so nothing but the respawn itself can be acted on. The
+    // check comes before the move shortcut so a corpse cannot be walked
+    // around either.
+    if (this.deadAccounts.has(accountId) && command.action.type !== 'respawn') {
+      client.send('commandResult', {
+        sequence: command.sequence,
+        accepted: false,
+        reasonCode: 'dead',
+        serverTick: this.state.tick,
+      } satisfies CommandResult);
+      return;
+    }
+
+    if (command.action.type === 'respawn') {
+      const encoded = this.store.commitOutcome(key, () =>
+        JSON.stringify(this.resolveRespawn(accountId, command.sequence)),
+      );
+      client.send('commandResult', JSON.parse(encoded) as CommandResult);
+      client.send('inventory', { slots: this.playerSlots.get(accountId) });
+      client.send('vitals', this.playerVitals.get(accountId));
+      return;
+    }
+
     if (command.action.type === 'move') {
       this.pendingMove.set(accountId, { action: command.action, tick: this.state.tick });
       return;
     }
 
-    const key = { accountId, sessionEpoch: command.sessionEpoch, sequence: command.sequence };
+    if (command.action.type === 'corpseTake') {
+      const corpseId = command.action.corpseId;
+      const encoded = this.store.commitOutcome(key, () =>
+        JSON.stringify(this.resolveCorpseTake(accountId, corpseId, command.sequence)),
+      );
+      client.send('commandResult', JSON.parse(encoded) as CommandResult);
+      client.send('inventory', { slots: this.playerSlots.get(accountId) });
+      this.sendCorpse(corpseId);
+      return;
+    }
 
     if (command.action.type === 'takeItem') {
       const itemInstanceId = command.action.itemInstanceId;
@@ -1185,6 +1569,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     // items, so they are transactions like takeItem and craft and go through
     // commitOutcome; lighting is keyed the same way purely for uniformity.
     const action = command.action;
+    if (action.type !== 'stationInsert' && action.type !== 'stationTake' && action.type !== 'stationLight') {
+      return; // every other action type returned above
+    }
     const stationId = action.stationId;
     const encoded = this.store.commitOutcome(key, () => {
       if (action.type === 'stationInsert') {
@@ -1657,6 +2044,28 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.tickCrafting(dt);
   }
 
+  isDeadForTest(accountId: string): boolean {
+    return this.deadAccounts.has(accountId);
+  }
+
+  corpseForTest(
+    corpseId: string,
+  ): { ownerAccountId: string; position: Point3; inventory: CorpseInventory; diedAtTick: number } | undefined {
+    return this.corpses.get(corpseId);
+  }
+
+  corpseIdForTest(ownerAccountId: string): string | undefined {
+    return [...this.corpses].find(([, corpse]) => corpse.ownerAccountId === ownerAccountId)?.[0];
+  }
+
+  respawnAnchorsForTest(): RespawnAnchor[] {
+    return RESPAWN_ANCHORS;
+  }
+
+  expireCorpsesForTest(): void {
+    this.expireCorpses();
+  }
+
   /** Test-only read accessors; no client-facing binding. */
   isConnectedForTest(accountId: string): boolean {
     return this.connectedAccounts.has(accountId);
@@ -1697,6 +2106,8 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.tickCreatures(dt);
 
     this.expireCarcasses();
+    this.expireCorpses();
+    this.sendCorpsesToArrivals();
 
     // Before tickSurvival, so a bite landing this tick is reflected in the
     // vitals message that goes out at the end of it.
@@ -1818,6 +2229,10 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         coldDeficit,
         phase: dayPhase(this.state.tick),
       });
+
+      // Starvation, exposure and cold can all finish a player off, not only a
+      // wolf (GDD section 11: "zero HP is death").
+      this.killIfDead(accountId);
     }
   }
 }

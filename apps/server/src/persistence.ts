@@ -68,6 +68,38 @@ interface StatusEffectRow {
   remaining_s: number;
 }
 
+export interface CorpseRecord {
+  ownerAccountId: string;
+  position: Vec3;
+  diedAtTick: number;
+  /** The 40 interactive slots; sparse on disk, only occupied ones are stored. */
+  slots: Slot[];
+  /** GDD section 12's noninteractive manifest, in order. */
+  overflow: Array<{ definitionId: string; quantity: number }>;
+}
+
+interface CorpseRow {
+  corpse_id: string;
+  owner_account_id: string;
+  x: number;
+  y: number;
+  z: number;
+  died_at_tick: number;
+}
+
+interface CorpseSlotRow {
+  corpse_id: string;
+  compartment: string;
+  slot_index: number;
+  definition_id: string;
+  quantity: number;
+}
+
+interface DeadAccountRow {
+  account_id: string;
+  died_at_tick: number;
+}
+
 export interface StationRecord {
   kind: StationKind;
   lit: boolean;
@@ -256,6 +288,26 @@ export class WorldStore {
         definition_id TEXT NOT NULL,
         quantity INTEGER NOT NULL,
         PRIMARY KEY (station_id, compartment, slot_index)
+      );
+      CREATE TABLE IF NOT EXISTS corpses (
+        corpse_id TEXT PRIMARY KEY,
+        owner_account_id TEXT NOT NULL,
+        x REAL NOT NULL,
+        y REAL NOT NULL,
+        z REAL NOT NULL,
+        died_at_tick INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS corpse_slots (
+        corpse_id TEXT NOT NULL,
+        compartment TEXT NOT NULL,
+        slot_index INTEGER NOT NULL,
+        definition_id TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        PRIMARY KEY (corpse_id, compartment, slot_index)
+      );
+      CREATE TABLE IF NOT EXISTS dead_accounts (
+        account_id TEXT PRIMARY KEY,
+        died_at_tick INTEGER NOT NULL
       );
     `);
 
@@ -684,6 +736,112 @@ export class WorldStore {
       list.push({ kind: row.kind as StatusEffectKind, ratePerS: row.rate_per_s, remainingS: row.remaining_s });
       result.set(row.account_id, list);
     }
+    return result;
+  }
+
+  /**
+   * Replaces a corpse's whole durable state. Class-1 (TECHNICAL section 7):
+   * a death is a committed transfer of everything a player owned, so it is
+   * written at the commit rather than waiting for a checkpoint -- a force-kill
+   * in between must not resurrect the pack on the living body.
+   */
+  saveCorpse(corpseId: string, corpse: CorpseRecord): void {
+    const replace = this.db.transaction((record: CorpseRecord) => {
+      this.db
+        .prepare(
+          `INSERT INTO corpses (corpse_id, owner_account_id, x, y, z, died_at_tick) VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(corpse_id) DO UPDATE SET
+             owner_account_id = excluded.owner_account_id, x = excluded.x, y = excluded.y,
+             z = excluded.z, died_at_tick = excluded.died_at_tick`,
+        )
+        .run(
+          corpseId,
+          record.ownerAccountId,
+          record.position.x,
+          record.position.y,
+          record.position.z,
+          record.diedAtTick,
+        );
+      this.db.prepare('DELETE FROM corpse_slots WHERE corpse_id = ?').run(corpseId);
+      const insert = this.db.prepare(
+        'INSERT INTO corpse_slots (corpse_id, compartment, slot_index, definition_id, quantity) VALUES (?, ?, ?, ?, ?)',
+      );
+      record.slots.forEach((slot, index) => {
+        if (slot) insert.run(corpseId, 'slot', index, slot.definitionId, slot.quantity);
+      });
+      record.overflow.forEach((stack, index) => {
+        insert.run(corpseId, 'overflow', index, stack.definitionId, stack.quantity);
+      });
+    });
+    replace(corpse);
+  }
+
+  deleteCorpse(corpseId: string): void {
+    const remove = this.db.transaction(() => {
+      this.db.prepare('DELETE FROM corpse_slots WHERE corpse_id = ?').run(corpseId);
+      this.db.prepare('DELETE FROM corpses WHERE corpse_id = ?').run(corpseId);
+    });
+    remove();
+  }
+
+  loadCorpses(): Map<string, CorpseRecord> {
+    const rows = this.db
+      .prepare('SELECT corpse_id, owner_account_id, x, y, z, died_at_tick FROM corpses')
+      .all() as CorpseRow[];
+    const slotRows = this.db
+      .prepare('SELECT corpse_id, compartment, slot_index, definition_id, quantity FROM corpse_slots')
+      .all() as CorpseSlotRow[];
+
+    const result = new Map<string, CorpseRecord>();
+    for (const row of rows) {
+      result.set(row.corpse_id, {
+        ownerAccountId: row.owner_account_id,
+        position: { x: row.x, y: row.y, z: row.z },
+        diedAtTick: row.died_at_tick,
+        slots: [],
+        overflow: [],
+      });
+    }
+    for (const slot of slotRows) {
+      const corpse = result.get(slot.corpse_id);
+      if (!corpse) continue;
+      const stack = { definitionId: slot.definition_id, quantity: slot.quantity };
+      if (slot.compartment === 'overflow') {
+        corpse.overflow[slot.slot_index] = stack;
+      } else {
+        corpse.slots[slot.slot_index] = stack;
+      }
+    }
+    // A manifest is an ordered list, not a slot array; SQLite returns rows in
+    // no guaranteed order, so compact away the holes the indexed writes left.
+    for (const corpse of result.values()) {
+      corpse.overflow = corpse.overflow.filter((stack) => stack);
+    }
+    return result;
+  }
+
+  /**
+   * Marks or clears an account's dead state. Class-1 alongside the corpse:
+   * a restart that forgot a death would hand the player back a body that
+   * still had everything the corpse is now holding.
+   */
+  setAccountDead(accountId: string, diedAtTick: number | null): void {
+    if (diedAtTick === null) {
+      this.db.prepare('DELETE FROM dead_accounts WHERE account_id = ?').run(accountId);
+      return;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO dead_accounts (account_id, died_at_tick) VALUES (?, ?)
+         ON CONFLICT(account_id) DO UPDATE SET died_at_tick = excluded.died_at_tick`,
+      )
+      .run(accountId, diedAtTick);
+  }
+
+  loadDeadAccounts(): Map<string, number> {
+    const rows = this.db.prepare('SELECT account_id, died_at_tick FROM dead_accounts').all() as DeadAccountRow[];
+    const result = new Map<string, number>();
+    for (const row of rows) result.set(row.account_id, row.died_at_tick);
     return result;
   }
 

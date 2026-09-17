@@ -56,12 +56,30 @@ export const CarcassState = schema(
 );
 export type CarcassState = SchemaType<typeof CarcassState>;
 
+/**
+ * A dead player's body (GDD section 12). Its existence and position are
+ * public -- a corpse is something anyone can walk up to and loot -- while its
+ * contents stay off the schema like every other container (TECHNICAL
+ * section 3). The owner rides along so a player can recognise their own body.
+ */
+export const CorpseState = schema(
+  {
+    ownerAccountId: t.string().default(''),
+    x: t.number().default(0),
+    y: t.number().default(0),
+    z: t.number().default(0),
+  },
+  'CorpseState',
+);
+export type CorpseState = SchemaType<typeof CorpseState>;
+
 export const WorldState = schema(
   {
     players: t.map(PlayerState),
     items: t.map(WorldItemState),
     creatures: t.map(CreatureState),
     carcasses: t.map(CarcassState),
+    corpses: t.map(CorpseState),
     tick: t.number().default(0),
   },
   'WorldState',
