@@ -63,12 +63,14 @@ interface PlayerSlotRow {
 export interface PlayerVitals {
   calories: number;
   health: number;
+  exposure: number;
 }
 
 interface PlayerVitalsRow {
   account_id: string;
   calories: number;
   health: number;
+  exposure: number;
 }
 
 /**
@@ -134,7 +136,8 @@ export class WorldStore {
       CREATE TABLE IF NOT EXISTS player_vitals (
         account_id TEXT PRIMARY KEY,
         calories REAL NOT NULL,
-        health REAL NOT NULL
+        health REAL NOT NULL,
+        exposure REAL NOT NULL DEFAULT 0
       );
     `);
   }
@@ -325,19 +328,20 @@ export class WorldStore {
   savePlayerVitals(accountId: string, vitals: PlayerVitals): void {
     this.db
       .prepare(
-        `INSERT INTO player_vitals (account_id, calories, health) VALUES (?, ?, ?)
-         ON CONFLICT(account_id) DO UPDATE SET calories = excluded.calories, health = excluded.health`,
+        `INSERT INTO player_vitals (account_id, calories, health, exposure) VALUES (?, ?, ?, ?)
+         ON CONFLICT(account_id) DO UPDATE SET
+           calories = excluded.calories, health = excluded.health, exposure = excluded.exposure`,
       )
-      .run(accountId, vitals.calories, vitals.health);
+      .run(accountId, vitals.calories, vitals.health, vitals.exposure);
   }
 
   loadPlayerVitals(): Map<string, PlayerVitals> {
     const rows = this.db
-      .prepare('SELECT account_id, calories, health FROM player_vitals')
+      .prepare('SELECT account_id, calories, health, exposure FROM player_vitals')
       .all() as PlayerVitalsRow[];
     const result = new Map<string, PlayerVitals>();
     for (const row of rows) {
-      result.set(row.account_id, { calories: row.calories, health: row.health });
+      result.set(row.account_id, { calories: row.calories, health: row.health, exposure: row.exposure });
     }
     return result;
   }

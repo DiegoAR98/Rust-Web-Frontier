@@ -4,8 +4,13 @@ import { getItem } from '@rwf/content';
 import {
   addToInventory,
   CALORIE_SPAWN,
+  computeExposureDamage,
+  computeExposureIntake,
   computeStarvationDamage,
+  decayExposure,
   drainCalories,
+  EXPOSURE_MAX,
+  EXPOSURE_ZONE_RATES,
   HEALTH_MAX,
   HEALTH_SPAWN,
   harvestNode,
@@ -33,6 +38,14 @@ const BACKPACK_SLOTS = 24;
  * standing_tree vs wood_pile both yielding wood).
  */
 const DEFAULT_YIELD_PER_HIT: Record<string, number> = { wood: 10 };
+/**
+ * Client-side placeholder hazard zone (GDD section 6's hot-ore exposure),
+ * centered on spawn so it's immediately exercisable without needing real
+ * authored terrain/zone geometry yet. No worn-armor protection is modeled
+ * (0), since armor doesn't exist until M3.
+ */
+const HAZARD_ZONE_CENTER = { x: 0, z: 0 };
+const HAZARD_ZONE_RADIUS_M = 5;
 
 interface ClientUserData {
   accountId: string;
@@ -55,7 +68,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private readonly resourceNodes = new Map<string, ResourceNode>();
   private readonly nodeConfigs = new Map<string, NodeConfig>();
   private readonly playerSlots = new Map<string, Slot[]>();
-  private readonly playerVitals = new Map<string, { calories: number; health: number }>();
+  private readonly playerVitals = new Map<string, { calories: number; health: number; exposure: number }>();
   private readonly connectedAccounts = new Set<string>();
   private readonly clientsByAccount = new Map<string, RoomClient>();
 
@@ -193,7 +206,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       this.playerSlots.set(accountId, this.store.loadPlayerSlots(accountId, BACKPACK_SLOTS));
     }
     if (!this.playerVitals.has(accountId)) {
-      this.playerVitals.set(accountId, { calories: CALORIE_SPAWN, health: HEALTH_SPAWN });
+      this.playerVitals.set(accountId, { calories: CALORIE_SPAWN, health: HEALTH_SPAWN, exposure: 0 });
     }
     this.connectedAccounts.add(accountId); // sleepers (disconnected) do not drain, GDD section 12
     this.clientsByAccount.set(accountId, client);
@@ -319,13 +332,23 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
 
     for (const accountId of this.connectedAccounts) {
       const vitals = this.playerVitals.get(accountId);
-      if (!vitals) continue;
+      const movement = this.movementByAccount.get(accountId);
+      if (!vitals || !movement) continue;
 
       const sprinting = this.pendingMove.get(accountId)?.sprint ?? false;
       const calories = drainCalories(vitals.calories, dt, sprinting);
+
+      const dx = movement.position.x - HAZARD_ZONE_CENTER.x;
+      const dz = movement.position.z - HAZARD_ZONE_CENTER.z;
+      const inHazardZone = Math.hypot(dx, dz) <= HAZARD_ZONE_RADIUS_M;
+      const exposure = inHazardZone
+        ? Math.min(EXPOSURE_MAX, vitals.exposure + computeExposureIntake(EXPOSURE_ZONE_RATES.medium, 0, dt))
+        : decayExposure(vitals.exposure, dt);
+
       const starvation = computeStarvationDamage(calories, dt);
-      const health = Math.max(0, Math.min(HEALTH_MAX, vitals.health - starvation));
-      const next = { calories, health };
+      const exposureDamage = computeExposureDamage(exposure) * dt;
+      const health = Math.max(0, Math.min(HEALTH_MAX, vitals.health - starvation - exposureDamage));
+      const next = { calories, health, exposure };
       this.playerVitals.set(accountId, next);
 
       this.clientsByAccount.get(accountId)?.send('vitals', next);

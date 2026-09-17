@@ -1,7 +1,7 @@
 import { boot, type ColyseusTestServer } from '@colyseus/testing';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import appConfig from '@rwf/server/app.config';
-import { CALORIE_SPAWN } from '@rwf/sim';
+import { CALORIE_SPAWN, EXPOSURE_ZONE_RATES } from '@rwf/sim';
 import type { WorldRoom } from '@rwf/server/world-room';
 
 let colyseus: ColyseusTestServer;
@@ -19,13 +19,21 @@ afterAll(async () => {
 });
 
 describe('WorldRoom survival wiring (T05)', () => {
-  it('sends the spawn calorie/health values to a freshly joined player', async () => {
+  it('sends vitals close to spawn defaults to a freshly joined player', async () => {
     const room = (await colyseus.createRoom('world', {})) as WorldRoom;
     const client = await colyseus.connectTo(room, { accountId: 'acct_a' });
 
     const vitals = await client.waitForMessage('vitals');
 
-    expect(vitals).toEqual({ calories: CALORIE_SPAWN, health: 100 });
+    // Not an exact match: room creation and the join handshake can
+    // themselves take long enough for a few real ticks to elapse before
+    // this message is captured, so a small amount of drain/exposure by
+    // this point is expected, not a bug (bounded generously below).
+    expect(vitals.calories).toBeGreaterThan(CALORIE_SPAWN - 1);
+    expect(vitals.calories).toBeLessThanOrEqual(CALORIE_SPAWN);
+    expect(vitals.health).toBe(100);
+    expect(vitals.exposure).toBeGreaterThanOrEqual(0);
+    expect(vitals.exposure).toBeLessThan(1);
   });
 
   it('drains calories over real elapsed ticks at the standing/walking rate', async () => {
@@ -55,5 +63,31 @@ describe('WorldRoom survival wiring (T05)', () => {
     expect(drained).toBeGreaterThan(0);
     expect(drained).toBeLessThanOrEqual(0.25 * 0.05 * (room.state.tick + 1) + 1e-9);
     expect(latestVitals!.health).toBe(100);
+  });
+});
+
+describe('WorldRoom hazard zone exposure wiring (T06)', () => {
+  it('accumulates exposure for a player standing in the hazard zone at spawn', async () => {
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const client = await colyseus.connectTo(room, { accountId: 'acct_a' });
+
+    let latestVitals: { exposure: number } | undefined;
+    client.onMessage('vitals', (payload: { exposure: number }) => {
+      latestVitals = payload;
+    });
+    await client.waitForMessage('inventory');
+
+    for (let i = 0; i < 5; i++) {
+      await room.waitForNextTimestep();
+    }
+    await client.waitForMessage('vitals');
+
+    // Spawn (0,0,0) sits inside the placeholder hazard zone, so exposure
+    // should have accumulated at the medium zone rate (tolerant window,
+    // same reasoning as the calorie-drain test above).
+    expect(latestVitals!.exposure).toBeGreaterThan(0);
+    expect(latestVitals!.exposure).toBeLessThanOrEqual(
+      EXPOSURE_ZONE_RATES.medium * 0.05 * (room.state.tick + 1) + 1e-9,
+    );
   });
 });
