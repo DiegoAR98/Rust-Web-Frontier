@@ -84,6 +84,8 @@ const creatureMeshes = new Map<string, ReturnType<typeof MeshBuilder.CreateBox>>
 const creaturePositions = new Map<string, Vector3>();
 const carcassMeshes = new Map<string, ReturnType<typeof MeshBuilder.CreateBox>>();
 const carcassPositions = new Map<string, Vector3>();
+const corpseMeshes = new Map<string, ReturnType<typeof MeshBuilder.CreateBox>>();
+const corpsePositions = new Map<string, Vector3>();
 
 const deerMaterial = new StandardMaterial('deerMat', scene);
 deerMaterial.diffuseColor = new Color3(0.65, 0.5, 0.3);
@@ -91,6 +93,10 @@ const wolfMaterial = new StandardMaterial('wolfMat', scene);
 wolfMaterial.diffuseColor = new Color3(0.35, 0.35, 0.38);
 const carcassMaterial = new StandardMaterial('carcassMat', scene);
 carcassMaterial.diffuseColor = new Color3(0.5, 0.15, 0.15);
+// Deliberately not the carcass colour: a player's body and a deer's are
+// different things to walk up to, and both are lootable.
+const corpseMaterial = new StandardMaterial('corpseMat', scene);
+corpseMaterial.diffuseColor = new Color3(0.2, 0.2, 0.45);
 
 const itemMaterial = new StandardMaterial('itemMat', scene);
 itemMaterial.diffuseColor = new Color3(0.7, 0.5, 0.2);
@@ -138,6 +144,17 @@ interface StationPayload {
   outputs: Array<{ definitionId: string; quantity: number } | null>;
 }
 const stationStates = new Map<string, StationPayload>();
+interface CorpsePayload {
+  corpseId: string;
+  ownerAccountId: string;
+  slots: Array<{ definitionId: string; quantity: number } | null>;
+  overflowCount: number;
+  removed: boolean;
+}
+const corpseContents = new Map<string, CorpsePayload>();
+/** Set while this account is dead; GDD section 12's death recap and respawn prompt. */
+let death: { corpseId: string | null } | undefined;
+let respawnNotice: string | undefined;
 let vitals = { calories: 0, health: 0, exposure: 0, coldDeficit: 0, phase: 'day' };
 let channel: { definitionId: string | null; elapsedS: number; durationS: number } | undefined;
 let yaw = 0;
@@ -192,6 +209,10 @@ window.addEventListener('keydown', (e) => {
   if (e.code === 'KeyV') {
     send({ type: 'useItem', definitionId: heldQuantity('cooked_meat') > 0 ? 'cooked_meat' : 'raw_meat' });
   }
+  // GDD section 12: a dead account has no live character until it asks for a
+  // new one. Everything else the server refuses outright while dead.
+  if (e.code === 'Enter' && death) send({ type: 'respawn' });
+  if (e.code === 'KeyQ') attemptCorpseTake();
 });
 
 document.addEventListener('pointerlockchange', () => {
@@ -307,6 +328,26 @@ async function connect(): Promise<void> {
   // Station contents are container contents, which TECHNICAL section 3 keeps
   // off the shared state; the server sends them only to players standing at
   // the station.
+  // GDD section 12's death recap. Arrives on the death itself and again on a
+  // reconnect that finds the account still dead.
+  joined.onMessage('death', (payload: { corpseId: string | null }) => {
+    death = payload;
+    respawnNotice = undefined;
+  });
+  joined.onMessage('respawn', (payload: { x: number; y: number; z: number; safe: boolean }) => {
+    death = undefined;
+    // safe: false is the server saying it could not find an anchor clear of
+    // trouble, which section 12 requires be communicated rather than hidden.
+    respawnNotice = payload.safe ? undefined : 'respawned in a dangerous spot';
+  });
+  joined.onMessage('corpse', (payload: CorpsePayload) => {
+    if (payload.removed) {
+      corpseContents.delete(payload.corpseId);
+      return;
+    }
+    corpseContents.set(payload.corpseId, payload);
+  });
+
   joined.onMessage('station', (payload: StationPayload) => {
     stationStates.set(payload.stationId, payload);
   });
@@ -372,6 +413,17 @@ async function connect(): Promise<void> {
     carcassMeshes.delete(key);
     carcassPositions.delete(key);
   });
+  $(joined.state).corpses!.onAdd((_corpse: ReplicatedCreature, key: string) => {
+    const mesh = MeshBuilder.CreateBox(`corpse_${key}`, { width: 0.8, height: 0.4, depth: 1.8 }, scene);
+    mesh.material = corpseMaterial;
+    corpseMeshes.set(key, mesh);
+  });
+  $(joined.state).corpses!.onRemove((_corpse: ReplicatedCreature, key: string) => {
+    corpseMeshes.get(key)?.dispose();
+    corpseMeshes.delete(key);
+    corpsePositions.delete(key);
+    corpseContents.delete(key);
+  });
 
   joined.onStateChange(() => {
     patchAtMs = performance.now();
@@ -406,6 +458,12 @@ async function connect(): Promise<void> {
       if (!carcass) continue;
       mesh.position.set(carcass.x, carcass.y + 0.2, carcass.z);
       carcassPositions.set(key, new Vector3(carcass.x, carcass.y, carcass.z));
+    }
+    for (const [key, mesh] of corpseMeshes) {
+      const corpse = joined.state.corpses.get(key);
+      if (!corpse) continue;
+      mesh.position.set(corpse.x, corpse.y + 0.2, corpse.z);
+      corpsePositions.set(key, new Vector3(corpse.x, corpse.y, corpse.z));
     }
   });
 }
@@ -456,6 +514,24 @@ function nearestOf<T extends { position: Vector3 }>(candidates: readonly T[]): T
 }
 
 const nearestStation = () => nearestOf(STATIONS);
+
+/** The nearest body, whoever it belonged to: GDD section 8 has no owner-only loot. */
+function nearestCorpseId(): string | undefined {
+  let best: string | undefined;
+  let bestDistance = Infinity;
+  for (const [id, position] of corpsePositions) {
+    const distance = Vector3.Distance(camera.position, position);
+    if (distance >= bestDistance) continue;
+    best = id;
+    bestDistance = distance;
+  }
+  return best;
+}
+
+function attemptCorpseTake(): void {
+  const corpseId = nearestCorpseId();
+  if (corpseId) send({ type: 'corpseTake', corpseId });
+}
 
 /**
  * One swing key for everything you swing at. Picks whatever is closest --
@@ -586,6 +662,28 @@ function describeStation(): string {
   ].join(' : ');
 }
 
+/** The body you are standing over, as the server last reported it to you. */
+function describeCorpse(): string {
+  const corpseId = nearestCorpseId();
+  if (!corpseId) return 'none nearby';
+  const distance = Vector3.Distance(camera.position, corpsePositions.get(corpseId)!);
+  const contents = corpseContents.get(corpseId);
+  if (!contents) return `${corpseId} ${distance.toFixed(1)}m (walk closer to see inside)`;
+  const filled = contents.slots.filter((slot) => slot !== null);
+  const listed =
+    filled.length === 0
+      ? 'empty'
+      : filled
+          .slice(0, 6)
+          .map((slot) => `${slot!.definitionId} ${slot!.quantity}`)
+          .join(', ');
+  const more = filled.length > 6 ? ` +${filled.length - 6} more` : '';
+  // The manifest is noninteractive (GDD section 12), so it is a count rather
+  // than a list: it pages into the slots as they empty.
+  const held = contents.overflowCount > 0 ? ` [${contents.overflowCount} held back]` : '';
+  return `${corpseId} ${distance.toFixed(1)}m : ${listed}${more}${held} (Q)`;
+}
+
 engine.runRenderLoop(() => {
   // Time-based, so meshes actually animate between patches. The old constant
   // 0.5 parked every remote player permanently at the midpoint of its last
@@ -621,6 +719,10 @@ engine.runRenderLoop(() => {
     hudAtMs = now;
     statusEl.textContent = room
       ? [
+          // GDD section 12's respawn prompt. First line, because while it is
+          // showing nothing else the player presses will be accepted.
+          ...(death ? [`YOU DIED -- press ENTER to respawn  (your body: ${death.corpseId ?? 'gone'})`] : []),
+          ...(respawnNotice ? [respawnNotice] : []),
           `account ${accountId.slice(0, 8)}  epoch ${sessionEpoch}  players ${room.state.players.size}`,
           `${engine.getFps().toFixed(0)} fps render : ${MOVE_SEND_HZ} Hz sim`,
           `hp ${vitals.health.toFixed(0)}  cal ${vitals.calories.toFixed(0)}  exposure ${vitals.exposure.toFixed(0)}  ${vitals.phase}${vitals.coldDeficit > 0 ? `  COLD ${vitals.coldDeficit.toFixed(0)}` : ''}`,
@@ -628,6 +730,7 @@ engine.runRenderLoop(() => {
           `craft: ${describeCrafting()}`,
           `near: ${describeNearest()}`,
           `station: ${describeStation()}`,
+          `body: ${describeCorpse()}`,
           `using: ${
             channel && channel.definitionId
               ? `${channel.definitionId} ${channel.elapsedS.toFixed(1)}/${channel.durationS.toFixed(0)}s`
@@ -635,7 +738,7 @@ engine.runRenderLoop(() => {
           }`,
           `last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : `  (${lookError ?? 'click canvas to look'})`}`,
           'WASD move : shift sprint : space jump : LMB swing at what you face : E take : C craft hatchet',
-          'B bandage : V eat : at a station -- F add fuel : R add input : G light/snuff : T take output',
+          'B bandage : V eat : Q loot the nearest body : at a station -- F fuel : R input : G light/snuff : T take',
         ].join('\n')
       : disconnectReason
         ? `${disconnectReason} -- reload to reconnect`
