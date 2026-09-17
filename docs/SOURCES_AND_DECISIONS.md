@@ -214,3 +214,23 @@ Death is checked wherever health can fall rather than swept up at the end of the
 Recorded against **D28**: death is the first command outcome that destroys a player's holdings, so a forged `accountId` is now worth more than it was. Nothing changed about the trust model — the host must still not be exposed beyond a trusted private test — but the cost of that gap has gone up.
 
 Recorded against **D27**: `corpseTake` is the fourth action performing synchronous SQLite writes with no per-action cooldown. The general 40/s action ceiling remains unimplemented and remains the right fix.
+
+### 2026-09-17 — Storage crates and the placement pipeline (T11 in part)
+
+The first thing a player puts into the world themselves. GDD §10's pipeline at its simplest — an inventory item becomes a placed thing, and "a server-accepted placement consumes one item" — deliberately without the 4 m grid, snapping or support rules, which belong to building pieces and would have been fitted to a single example if they had arrived here.
+
+**T11 is met in part.** "Accessible open-box loot allowed" holds: any player who can reach a crate can open it, which GDD §8 states outright ("Boxes are not magically private. Any person who reaches a box can open it; doors supply security"), and a test pins it so that the door-permission vertical cannot quietly change it. The rest of T11 — unauthorized door and socket operations, and through-wall loot denial — needs doors and walls to exist.
+
+Placement is the sixth instance of capacity-before-consume. §10 requires that "reaching a cap produces an understandable error before consumption", and the same has to hold for every other refusal: an out-of-reach or overlapping placement leaves the crate in the pack. An insert moves only as much as the crate can hold, for the same reason.
+
+| ID | Decision | Status and reason |
+|---|---|---|
+| D50 | Deployable spacing is §10's 1 m foundation clearance, reused | Proposed. §10 requires "minimum non-overlapping spacing" for deployables without giving a figure, and gives exactly one clearance number in the same paragraph — "at least 1 m from any existing foundation edge". Reusing it beats inventing a second number, and it is measured on the ground plane rather than in three dimensions because nothing stacks yet |
+| D51 | Placement reach is the interact reach, and the ghost stands 2 m ahead at ground level | Proposed. §10 does not give a placement range. Using the same reach as every other interaction means a player who can open a station can place a crate beside it, which is the intuition the rest of the controls already teach. Pitch is ignored: a crate goes on the ground, so aiming it at the sky could only ever produce a refusal |
+| D52 | `small_crate` is the only deployable | Proposed. CONTENT §7 also gives the large crate (Learn/Bench, no research system yet), bedrolls and cots (spawn anchors rather than containers, with their own cooldown rules), and the stash (buried, which is its whole point). Each arrives with the vertical that makes it reachable, rather than as unreachable table rows |
+| D53 | A placed crate has health that nothing can damage yet | Known gap. CONTENT §7's 250 placed HP is stored and replicated because a crate without it could not be raided later without a migration, but no damage source reaches a deployable: §11's "destroying a box produces its loot" and §10's spill-once-on-removal need the combat and cascade work that T12 gates. Until then a crate is indestructible, which is not the design |
+| D54 | The world entity cap counts deployables only | Accurate today, incomplete by design. §10's 6000-entity cap covers "build/deployable"; there are no build pieces, so the count is exact. It becomes wrong the moment structural pieces exist, and the building vertical has to widen it rather than add a second cap |
+
+The client's ghost imports the server's own clearance constant rather than copying the number, so the preview and the answer cannot drift into two different rules. It stays a preview: the key sends regardless and the HUD reports what the server said, so a client that got it wrong can neither turn a refusal into a placement nor hide one that would have been allowed.
+
+`moveAllThatFits` was extracted while writing this: `stationTake` and `corpseTake` had each written out the same "move what fits, leave the rest where it was" loop, and `containerTake` would have been the third copy. `placed_at_tick` is recorded although nothing reads it — §10's 120-second demolition window counts from placement, and a row that never stored when it was placed cannot acquire the fact later without a migration.
