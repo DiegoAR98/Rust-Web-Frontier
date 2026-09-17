@@ -9,6 +9,14 @@ export interface ExplosiveSpec {
   contactDamage: number;
   /** Where the structural splash has fallen to zero. */
   splashRadiusM: number;
+  /** What it does to a person standing on it. */
+  characterDamage: number;
+  /**
+   * Character damage is flat inside this radius and falls off outside it:
+   * CONTENT section 8 reads "100 at <=1 m, linear to 0 at 4 m".
+   */
+  characterFullRadiusM: number;
+  characterRadiusM: number;
 }
 
 /**
@@ -17,8 +25,23 @@ export interface ExplosiveSpec {
  * 4 m for bombs".
  */
 export const EXPLOSIVES: Record<'powder_bomb' | 'satchel', ExplosiveSpec> = {
-  powder_bomb: { contactDamage: 100, splashRadiusM: 4 },
-  satchel: { contactDamage: 600, splashRadiusM: 3 },
+  powder_bomb: {
+    contactDamage: 100,
+    splashRadiusM: 4,
+    characterDamage: 80,
+    characterFullRadiusM: 1,
+    characterRadiusM: 5,
+  },
+  satchel: {
+    contactDamage: 600,
+    splashRadiusM: 3,
+    characterDamage: 100,
+    characterFullRadiusM: 1,
+    // Deliberately wider than the structural splash: CONTENT gives the two
+    // different radii, so a charge that cannot reach the wall behind you can
+    // still kill you.
+    characterRadiusM: 4,
+  },
 };
 
 /**
@@ -44,6 +67,19 @@ export function structuralMeleeDamage(baseDamage: number, material: StructureMat
 export function structuralSplashDamage(spec: ExplosiveSpec, distanceM: number): number {
   if (distanceM >= spec.splashRadiusM) return 0;
   return spec.contactDamage * (1 - distanceM / spec.splashRadiusM);
+}
+
+/**
+ * What a person this far from the blast takes (CONTENT section 8: "100 at
+ * <=1 m, linear to 0 at 4 m"). Flat inside the full radius rather than
+ * spiking, so standing exactly on a charge is no worse than standing beside
+ * it -- which is what the "at <=1 m" in the table says.
+ */
+export function characterBlastDamage(spec: ExplosiveSpec, distanceM: number): number {
+  if (distanceM <= spec.characterFullRadiusM) return spec.characterDamage;
+  if (distanceM >= spec.characterRadiusM) return 0;
+  const span = spec.characterRadiusM - spec.characterFullRadiusM;
+  return spec.characterDamage * (1 - (distanceM - spec.characterFullRadiusM) / span);
 }
 
 /**

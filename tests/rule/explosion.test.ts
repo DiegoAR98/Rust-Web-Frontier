@@ -3,6 +3,7 @@ import {
   EXPLOSIVES,
   STRUCTURE_MELEE_MULTIPLIER,
   chargesToBreak,
+  characterBlastDamage,
   structuralMeleeDamage,
   structuralSplashDamage,
 } from '@rwf/sim';
@@ -44,6 +45,35 @@ describe('explosive structural damage (CONTENT section 8)', () => {
 
   it('never claims a barrier can be broken with no charges at all', () => {
     expect(chargesToBreak(1, EXPLOSIVES.satchel.contactDamage)).toBe(1);
+  });
+});
+
+/** CONTENT section 8's character damage column: "100 at <=1 m, linear to 0 at 4 m". */
+describe('explosive damage to people (CONTENT section 8)', () => {
+  it('gives a satchel its full character damage anywhere inside a metre', () => {
+    expect(characterBlastDamage(EXPLOSIVES.satchel, 0)).toBe(100);
+    expect(characterBlastDamage(EXPLOSIVES.satchel, 1)).toBe(100);
+  });
+
+  it('falls away between one metre and four', () => {
+    // Halfway along the 1 m to 4 m span.
+    expect(characterBlastDamage(EXPLOSIVES.satchel, 2.5)).toBe(50);
+    expect(characterBlastDamage(EXPLOSIVES.satchel, 4)).toBe(0);
+    expect(characterBlastDamage(EXPLOSIVES.satchel, 10)).toBe(0);
+  });
+
+  it('reaches people further than it reaches walls', () => {
+    // CONTENT gives the two radii separately: 3 m structural, 4 m character.
+    // A charge that cannot touch the wall behind you can still kill you.
+    const { satchel } = EXPLOSIVES;
+    expect(satchel.characterRadiusM).toBeGreaterThan(satchel.splashRadiusM);
+    expect(structuralSplashDamage(satchel, 3.5)).toBe(0);
+    expect(characterBlastDamage(satchel, 3.5)).toBeGreaterThan(0);
+  });
+
+  it('gives a powder bomb the wider, weaker version', () => {
+    expect(characterBlastDamage(EXPLOSIVES.powder_bomb, 0)).toBe(80);
+    expect(characterBlastDamage(EXPLOSIVES.powder_bomb, 5)).toBe(0);
   });
 });
 

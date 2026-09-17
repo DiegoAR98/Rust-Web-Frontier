@@ -220,6 +220,35 @@ describe('WorldRoom doors (T11, GDD section 10)', () => {
     friend.leave();
   });
 
+  it('leaves a broken door s socket empty for sixty seconds', async () => {
+    // GDD section 10: "Breaking a door leaves its socket unavailable to
+    // everyone for 60 seconds." Without it a defender re-hangs a door the
+    // instant it breaks, and a breach that cost a satchel closes for free.
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const client = await doorwayFor(room, 'acct_breach');
+    client.send('command', install());
+    expect((await client.waitForMessage('commandResult')).accepted).toBe(true);
+
+    room.setDoorHealthForTest(DOORWAY, 1);
+    client.send('command', command({ type: 'attackStructure', door: true, ...DOORWAY }));
+    expect((await client.waitForMessage('commandResult')).accepted).toBe(true);
+    expect(room.doorForTest(DOORWAY)).toBeUndefined();
+
+    room.grantForTest('acct_breach', 'wood_door', 1);
+    client.send('command', install());
+    const refused = await client.waitForMessage('commandResult');
+    expect(refused.accepted).toBe(false);
+    expect(refused.reasonCode).toBe('busy');
+    expect(room.countForTest('acct_breach', 'wood_door')).toBe(1);
+
+    room.setTickForTest(room.tickForTest() + 60 * 20 + 1);
+    client.send('command', install());
+    const allowed = await client.waitForMessage('commandResult');
+    expect(allowed.accepted, allowed.reasonCode).toBe(true);
+
+    client.leave();
+  });
+
   it('refuses a stranger handing out access to somebody elses door', async () => {
     const room = (await colyseus.createRoom('world', {})) as WorldRoom;
     const owner = await doorwayFor(room, 'acct_real');

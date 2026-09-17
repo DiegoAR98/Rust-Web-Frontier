@@ -15,6 +15,7 @@ import {
   cascadeRemoval,
   structuralMeleeDamage,
   structuralSplashDamage,
+  characterBlastDamage,
   EXPLOSIVES,
   stepDecay,
   DECAY_INTERVAL_S,
@@ -151,6 +152,8 @@ const BUILD_REACH_M = 6;
 const DOOR_PLACED_HP: Record<string, number> = { wood_door: 500, metal_door: 1000 };
 /** GDD section 11: "A building-wide raid lock lasts 60 seconds after any hostile damage". */
 const RAID_LOCK_TICKS = 60 * TICK_RATE_HZ;
+/** GDD section 10: "Breaking a door leaves its socket unavailable to everyone for 60 seconds." */
+const BROKEN_SOCKET_LOCK_TICKS = 60 * TICK_RATE_HZ;
 
 /**
  * Which of CONTENT section 8's two structural damage multipliers a piece
@@ -472,6 +475,13 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
    * and by id for a deployable; both decay on the same rule.
    */
   private readonly lastActivityTick = new Map<string, number>();
+  /**
+   * GDD section 10: "Breaking a door leaves its socket unavailable to everyone
+   * for 60 seconds." Keyed by the doorway site, in ticks like every other
+   * timer, and deliberately not limited to the attacker -- the point is that
+   * the defender cannot re-hang a door the instant it breaks.
+   */
+  private readonly socketLockedUntilTick = new Map<string, number>();
   /** The tick the last decay minute ran on; see tickDecay. */
   private lastDecayTick = 0;
 
@@ -1453,6 +1463,12 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       return { ...base, accepted: false, reasonCode: 'not_found' };
     }
     if (this.doors.has(key)) return { ...base, accepted: false, reasonCode: 'overlap' };
+    // "Breaking a door leaves its socket unavailable to everyone for 60
+    // seconds": without it a defender re-hangs a door the instant it breaks,
+    // and a breach that cost a satchel closes for free.
+    if ((this.socketLockedUntilTick.get(key) ?? -Infinity) > this.state.tick) {
+      return { ...base, accepted: false, reasonCode: 'busy' };
+    }
 
     const slots = this.playerSlots.get(accountId) ?? [];
     if (countInInventory(slots, definitionId) < 1) {
@@ -1703,6 +1719,24 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       consider(id, deployable.position, false, true);
     }
 
+    // CONTENT section 8's other column. A different, wider falloff than the
+    // structural one, so a raider standing on their own charge is hurt by it
+    // even where the wall behind them is out of reach.
+    for (const [accountId, movement] of this.movementByAccount) {
+      const distance = Math.hypot(
+        movement.position.x - at.x,
+        movement.position.y + EYE_HEIGHT_M / 2 - at.y,
+        movement.position.z - at.z,
+      );
+      const damage = characterBlastDamage(spec, distance);
+      // Line of sight for people too: GDD section 11's "Explosion damage uses
+      // distance falloff and line of sight from its center".
+      if (damage <= 0 || isReachBlocked(at, movement.position, barriers)) continue;
+      // 'melee' rather than 'bite': section 6's bleed roll is for bites, and
+      // an explosion is not one.
+      this.damagePlayer(accountId, damage, 'melee');
+    }
+
     for (const hit of hits) {
       const replicated = hit.deployable
         ? this.state.deployables.get(hit.key)
@@ -1722,6 +1756,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   }
 
   private removeDoor(key: string): void {
+    this.socketLockedUntilTick.set(key, this.state.tick + BROKEN_SOCKET_LOCK_TICKS);
     this.doors.delete(key);
     this.state.doors.delete(key);
     this.doorAccess.delete(key);
@@ -3466,6 +3501,11 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     if (replicated) replicated.health = health;
   }
 
+  setDoorHealthForTest(site: PieceSite, health: number): void {
+    const replicated = this.state.doors.get(siteKey(site));
+    if (replicated) replicated.health = health;
+  }
+
   /** Test-only: drops a piece to one swing from destruction instead of a hundred. */
   setPieceHealthForTest(site: PieceSite, health: number): void {
     const replicated = this.state.buildingPieces.get(siteKey(site));
@@ -3484,6 +3524,10 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   /** Test-only: runs one decay minute without waiting for the real tick timer. */
   decayTickForTest(): void {
     this.tickDecay();
+  }
+
+  socketLockedForTest(site: PieceSite): boolean {
+    return (this.socketLockedUntilTick.get(siteKey(site)) ?? -Infinity) > this.state.tick;
   }
 
   raidLockedForTest(site: PieceSite): boolean {

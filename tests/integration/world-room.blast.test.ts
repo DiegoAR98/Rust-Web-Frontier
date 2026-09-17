@@ -175,6 +175,54 @@ describe('WorldRoom explosions against structures (T12, GDD section 11)', () => 
   });
 });
 
+/** CONTENT section 8's character damage column: "100 at <=1 m, linear to 0 at 4 m". */
+describe('WorldRoom explosions against people (CONTENT section 8)', () => {
+  it('hurts a raider standing on their own charge', async () => {
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const client = await twoWalls(room, 'acct_careless');
+    room.setVitalsForTest('acct_careless', { calories: 1000, health: 100, exposure: 0 });
+    const standing = { x: 122, y: 0, z: 122 };
+    room.teleportForTest('acct_careless', standing);
+
+    room.detonateForTest(standing, 'satchel');
+
+    // A satchel does 100 at the centre, which is a full-health player exactly
+    // dead -- the reason nobody places one and stands there.
+    expect(room.isDeadForTest('acct_careless')).toBe(true);
+
+    client.leave();
+  });
+
+  it('spares somebody on the other side of a wall', async () => {
+    // GDD section 11: "Explosion damage uses distance falloff and line of
+    // sight from its center."
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const client = await twoWalls(room, 'acct_sheltered');
+    room.setVitalsForTest('acct_sheltered', { calories: 1000, health: 100, exposure: 0 });
+    room.teleportForTest('acct_sheltered', { x: 122, y: 0, z: 120.5 });
+
+    // Just outside the south wall, within the 4 m character radius.
+    room.detonateForTest({ x: 122, y: 0, z: 119 }, 'satchel');
+
+    expect(room.vitalsForTest('acct_sheltered')!.health).toBe(100);
+
+    client.leave();
+  });
+
+  it('leaves someone standing well clear of it alone', async () => {
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const client = await twoWalls(room, 'acct_distant');
+    room.setVitalsForTest('acct_distant', { calories: 1000, health: 100, exposure: 0 });
+    room.teleportForTest('acct_distant', { x: 140, y: 0, z: 140 });
+
+    room.detonateForTest({ x: 122, y: 0, z: 122 }, 'satchel');
+
+    expect(room.vitalsForTest('acct_distant')!.health).toBe(100);
+
+    client.leave();
+  });
+});
+
 /** CONTENT section 8: "Tools deal their base melee damage x0.5 to wood". */
 describe('WorldRoom melee against a structure (CONTENT section 8)', () => {
   it('takes half a rock s damage off a wooden wall, not all of it', async () => {
