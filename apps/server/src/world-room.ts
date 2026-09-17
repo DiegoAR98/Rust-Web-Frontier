@@ -326,6 +326,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       if (this.clientsByAccount.get(accountId) !== client) return;
       client.send('inventory', { slots: this.playerSlots.get(accountId) });
       client.send('vitals', this.playerVitals.get(accountId));
+      // A reconnect mid-craft must not present an empty queue while escrow
+      // is still held.
+      this.sendCrafting(accountId);
     }, 0);
   }
 
@@ -396,6 +399,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     );
     client.send('commandResult', JSON.parse(encoded) as CommandResult);
     client.send('inventory', { slots: this.playerSlots.get(accountId) });
+    this.sendCrafting(accountId);
   }
 
   private resolveTakeItem(accountId: string, itemInstanceId: string, sequence: number): CommandResult {
@@ -510,6 +514,22 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     return { ...base, accepted: true, reasonCode: 'ok' };
   }
 
+  /**
+   * Tells one owner about their own crafting queue. Private per TECHNICAL
+   * section 3, so it is a targeted message rather than shared schema state.
+   * A null recipeId means "nothing queued" -- sent on completion so the UI
+   * can clear, rather than showing a craft in progress forever.
+   */
+  private sendCrafting(accountId: string): void {
+    const entry = this.craftingByAccount.get(accountId);
+    this.clientsByAccount.get(accountId)?.send('crafting', {
+      recipeId: entry?.recipe.id ?? null,
+      completedUnits: entry?.completedUnits ?? 0,
+      totalUnits: entry?.totalUnits ?? 0,
+      progressS: entry?.progressS ?? 0,
+    });
+  }
+
   private persistCrafting(accountId: string, entry: QueueEntry): void {
     this.store.saveCraftingEntry(accountId, {
       recipeId: entry.recipe.id,
@@ -580,8 +600,10 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       if (nextEntry.completedUnits >= nextEntry.totalUnits) {
         this.craftingByAccount.delete(accountId);
         this.store.deleteCraftingEntry(accountId);
+        this.sendCrafting(accountId);
       } else {
         this.craftingByAccount.set(accountId, nextEntry);
+        if (producedUnits > 0) this.sendCrafting(accountId);
         // Persist only when a unit actually landed. TECHNICAL section 7:
         // a delivered unit is class-1 (durable at commit), while a partially
         // elapsed unit is class-2 continuous state that checkpoint() covers

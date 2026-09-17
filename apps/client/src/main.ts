@@ -75,6 +75,8 @@ let inventorySlots: Array<{ definitionId: string; quantity: number } | null> = [
 let sendTimer: number | undefined;
 let disconnectReason: string | undefined;
 let lookError: string | undefined;
+let crafting: { recipeId: string | null; completedUnits: number; totalUnits: number; progressS: number } | undefined;
+let vitals = { calories: 0, health: 0, exposure: 0 };
 let yaw = 0;
 let pitch = 0;
 
@@ -105,6 +107,10 @@ window.addEventListener('keyup', (e) => setKey(e.code, false));
 
 window.addEventListener('keydown', (e) => {
   if (e.code === 'KeyE') attemptTakeItem();
+  // GDD section 9's crafting queue. One recipe exists so far, so this is a
+  // direct keybind rather than a recipe browser; the browser arrives with the
+  // rest of the catalog.
+  if (e.code === 'KeyC') attemptCraft('stone_hatchet', 1);
 });
 
 document.addEventListener('pointerlockchange', () => {
@@ -213,6 +219,17 @@ async function connect(): Promise<void> {
     inventorySlots = payload.slots;
   });
 
+  joined.onMessage('crafting', (payload: typeof crafting) => {
+    crafting = payload;
+  });
+
+  // Vitals are private per TECHNICAL section 3, so they arrive as a targeted
+  // message rather than on the shared state. They were already being sent
+  // every tick and simply thrown away by the client.
+  joined.onMessage('vitals', (payload: typeof vitals) => {
+    vitals = payload;
+  });
+
   // Without sharing @rwf/server's concrete schema classes (deliberately not
   // a client dependency), the callback proxy's type falls back to a shape
   // TS can't prove has `.players`; it does at runtime.
@@ -260,6 +277,18 @@ function sendMoveCommand(): void {
   });
 }
 
+function attemptCraft(recipeId: string, quantity: number): void {
+  if (!room) return;
+  sequence += 1;
+  room.send('command', {
+    protocolVersion: PROTOCOL_VERSION,
+    sessionEpoch,
+    sequence,
+    clientTick: 0,
+    action: { type: 'craft', recipeId, quantity },
+  });
+}
+
 function attemptTakeItem(): void {
   if (!room) return;
   if (Vector3.Distance(camera.position, ITEM_WORLD_POSITION) > INTERACT_REACH_M) return;
@@ -286,6 +315,23 @@ function attemptHitNode(): void {
   });
 }
 
+/** Sums each distinct item in the pack, so the HUD is not wood-only. */
+function describeInventory(): string {
+  const totals = new Map<string, number>();
+  for (const slot of inventorySlots) {
+    if (!slot) continue;
+    totals.set(slot.definitionId, (totals.get(slot.definitionId) ?? 0) + slot.quantity);
+  }
+  if (totals.size === 0) return 'empty';
+  return [...totals].map(([id, qty]) => `${id} ${qty}`).join(', ');
+}
+
+function describeCrafting(): string {
+  if (!crafting || crafting.recipeId === null) return 'idle';
+  const { recipeId, completedUnits, totalUnits } = crafting;
+  return `${recipeId} ${completedUnits}/${totalUnits}`;
+}
+
 engine.runRenderLoop(() => {
   const alpha = 0.5; // fixed blend factor between the last two patches; good enough for M0
   for (const [key, mesh] of remoteMeshes) {
@@ -300,9 +346,15 @@ engine.runRenderLoop(() => {
   const item = room?.state.items?.get('item_1');
   itemMesh.setEnabled(!item || item.claimedBy === '');
 
-  const woodCount = inventorySlots.reduce((sum, slot) => sum + (slot?.definitionId === 'wood' ? slot.quantity : 0), 0);
   statusEl.textContent = room
-    ? `account ${accountId.slice(0, 8)} epoch ${sessionEpoch} players ${room.state.players.size} wood ${woodCount} last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : ` (${lookError ?? 'click canvas to look'})`}`
+    ? [
+        `account ${accountId.slice(0, 8)}  epoch ${sessionEpoch}  players ${room.state.players.size}`,
+        `hp ${vitals.health.toFixed(0)}  cal ${vitals.calories.toFixed(0)}  exposure ${vitals.exposure.toFixed(0)}`,
+        `pack: ${describeInventory()}`,
+        `craft: ${describeCrafting()}`,
+        `last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : `  (${lookError ?? 'click canvas to look'})`}`,
+        'WASD move : shift sprint : space jump : LMB gather : E take : C craft hatchet',
+      ].join('\n')
     : disconnectReason
       ? `${disconnectReason} -- reload to reconnect`
       : 'not connected';
