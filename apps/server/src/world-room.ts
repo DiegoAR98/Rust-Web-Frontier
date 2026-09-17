@@ -12,6 +12,9 @@ import {
   pageOverflowIn,
   validateDeployablePlacement,
   validatePieceSite,
+  isReachBlocked,
+  wallSegment,
+  type GroundSegment,
   linkedSiteKeys,
   siteKey,
   worldPositionOf,
@@ -2073,7 +2076,33 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     const dx = movement.position.x - target.x;
     const dy = movement.position.y + EYE_HEIGHT_M - target.y;
     const dz = movement.position.z - target.z;
-    return Math.sqrt(dx * dx + dy * dy + dz * dz) <= INTERACT_REACH_M + INTERACT_REACH_TOLERANCE_M;
+    if (Math.sqrt(dx * dx + dy * dy + dz * dz) > INTERACT_REACH_M + INTERACT_REACH_TOLERANCE_M) {
+      return false;
+    }
+    // T11's "through-wall loot denied". Close enough is not the same as
+    // reachable: without this a base's walls are decoration and its door is
+    // the only thing doing any work, which contradicts GDD section 8's
+    // "doors supply security".
+    return !isReachBlocked(movement.position, target, this.barriers());
+  }
+
+  /**
+   * The walls standing between people and things. A doorway counts only while
+   * it holds a shut door: GDD section 10 says "a door left open lets anyone
+   * walk through", and an empty frame is a hole rather than security.
+   */
+  private barriers(): GroundSegment[] {
+    const segments: GroundSegment[] = [];
+    for (const [key, piece] of this.buildingPieces) {
+      if (piece.site.form === 'wall') {
+        segments.push(wallSegment(piece.site));
+        continue;
+      }
+      if (piece.site.form !== 'doorway') continue;
+      const door = this.doors.get(key);
+      if (door && !door.open) segments.push(wallSegment(piece.site));
+    }
+    return segments;
   }
 
   onJoin(client: RoomClient, options: { accountId?: string }): void {
