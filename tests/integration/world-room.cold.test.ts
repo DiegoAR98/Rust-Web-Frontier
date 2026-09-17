@@ -1,6 +1,7 @@
 import { boot, type ColyseusTestServer } from '@colyseus/testing';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import appConfig from '@rwf/server/app.config';
+import { PROTOCOL_VERSION } from '@rwf/protocol';
 import { DAYLIGHT_TICKS } from '@rwf/sim';
 import type { WorldRoom } from '@rwf/server/world-room';
 
@@ -68,5 +69,59 @@ describe('WorldRoom cold (T07, GDD section 6)', () => {
     room.advanceSurvivalForTest(10);
 
     expect(before - room.vitalsForTest('acct_ctrl')!.calories).toBeCloseTo(2.5, 5);
+  });
+});
+
+/**
+ * T07's other half, for the fire case: GDD section 6 gives "a fire within 4 m
+ * with unobstructed warmth ray ... 40 [warmth]", which clears lowland night's
+ * pressure of 20 outright.
+ */
+describe('WorldRoom fire warmth (T07, GDD section 6)', () => {
+  it('clears the cold penalty for a player stood at a lit campfire', async () => {
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    room.spawnStation('campfire_w', 'campfire', { x: 1, y: 0, z: 0 });
+    const client = await colyseus.connectTo(room, { accountId: 'acct_warm' });
+    await client.waitForMessage('session');
+    room.setTickForTest(DAYLIGHT_TICKS); // night
+
+    expect(room.coldDeficitForTest('acct_warm')).toBe(20);
+
+    client.send('command', {
+      protocolVersion: PROTOCOL_VERSION,
+      sessionEpoch: 1,
+      sequence: 1,
+      clientTick: 0,
+      action: { type: 'stationLight', stationId: 'campfire_w', lit: true },
+    });
+    await client.waitForMessage('commandResult');
+
+    expect(room.coldDeficitForTest('acct_warm')).toBe(0);
+
+    client.leave();
+  });
+
+  it('leaves a player out of reach of the fire just as cold', async () => {
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    room.spawnStation('campfire_w', 'campfire', { x: 1, y: 0, z: 0 });
+    const lighter = await colyseus.connectTo(room, { accountId: 'acct_lighter' });
+    await lighter.waitForMessage('session');
+    room.setTickForTest(DAYLIGHT_TICKS);
+
+    lighter.send('command', {
+      protocolVersion: PROTOCOL_VERSION,
+      sessionEpoch: 1,
+      sequence: 1,
+      clientTick: 0,
+      action: { type: 'stationLight', stationId: 'campfire_w', lit: true },
+    });
+    await lighter.waitForMessage('commandResult');
+
+    // A player who never joined has no body; use one parked far away instead.
+    room.teleportForTest('acct_lighter', { x: 100, y: 0, z: 100 });
+
+    expect(room.coldDeficitForTest('acct_lighter')).toBe(20);
+
+    lighter.leave();
   });
 });

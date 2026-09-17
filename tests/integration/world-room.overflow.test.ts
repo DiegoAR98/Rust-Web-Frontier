@@ -22,8 +22,13 @@ function command(action: unknown, sequence: number, sessionEpoch = 1) {
   return { protocolVersion: PROTOCOL_VERSION, sessionEpoch, sequence, clientTick: 0, action };
 }
 
-/** Fills all 24 backpack slots with full 250-stacks of wood. */
+/**
+ * Fills all 24 backpack slots with full 250-stacks of wood. Clears first,
+ * because a player now joins carrying GDD section 5's spawn kit, and these
+ * tests are about exact capacity boundaries.
+ */
 function fillBackpackWithWood(room: WorldRoom, accountId: string): void {
+  room.clearInventoryForTest(accountId);
   room.grantForTest(accountId, 'wood', 24 * 250);
 }
 
@@ -52,6 +57,7 @@ describe('WorldRoom inventory overflow (GDD section 8)', () => {
     // free slot. Fill all 24: wood and stone take one slot each (both stack to
     // 250) and `rock` is stack:1, so 22 rocks occupy 22 slots. Escrow then
     // empties the wood and stone slots, leaving room for exactly 2 of the 3.
+    room.clearInventoryForTest('acct_craft'); // drop the spawn kit; see above
     room.grantForTest('acct_craft', 'wood', 15 * 3);
     room.grantForTest('acct_craft', 'stone', 10 * 3);
     room.grantForTest('acct_craft', 'rock', 22);

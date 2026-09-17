@@ -117,7 +117,9 @@ describe('WorldRoom take-item grants the item (GDD section 5)', () => {
     const client = await colyseus.connectTo(room, { accountId: 'acct_full' });
     await client.waitForMessage('session');
     // Stone hatchets do not stack, so 24 of them occupy every backpack slot
-    // and leave wood nowhere to go.
+    // and leave wood nowhere to go. Cleared first: a player now joins with
+    // GDD section 5's spawn kit already taking three of those slots.
+    room.clearInventoryForTest('acct_full');
     room.grantForTest('acct_full', 'stone_hatchet', 24);
 
     client.send('command', takeItemCommand(1, 'item_1'));

@@ -162,6 +162,8 @@ const CAMPFIRE_WARMTH_RADIUS_M = 4;
 const USE_COOLDOWN_TICKS = 2 * TICK_RATE_HZ;
 /** GDD section 6: raw meat "applies 20 seconds of sickness at 0.5 HP/s". */
 const POISON_RATE_PER_S = 0.5;
+/** GDD section 6: "a fire within 4 m with unobstructed warmth ray gives 40". */
+const FIRE_WARMTH = 40;
 
 interface ClientUserData {
   accountId: string;
@@ -1593,18 +1595,29 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
 
   /**
    * Cold deficit for a player right now (GDD section 6): environment pressure
-   * minus worn/fire/shelter warmth. Warmth is 0 for everyone until clothing
-   * and fires exist, and the whole map is one lowland plane, so this is
-   * currently uniform -- hence one value per tick rather than per player.
+   * minus worn/fire/shelter warmth. Per player rather than per tick, because
+   * standing at a fire is now the difference between the two.
    */
-  private currentColdDeficit(): number {
+  private coldDeficitFor(accountId: string): number {
     const pressure = lowlandColdPressure(dayPhase(this.state.tick));
-    return computeColdDeficit(pressure, 0);
+    const movement = this.movementByAccount.get(accountId);
+    // GDD section 6: "a fire within 4 m with unobstructed warmth ray gives
+    // 40". There is nothing to obstruct it yet -- walls are M2 -- so the ray
+    // is always clear. Worn clothing (20 for a full cloth set) and a held lit
+    // torch (10) still contribute nothing, because neither is equippable.
+    const warmth = movement && this.isNearLitCampfire(movement.position) ? FIRE_WARMTH : 0;
+    return computeColdDeficit(pressure, warmth);
   }
 
-  /** Test-only read accessors for the cold vertical. */
-  coldDeficitForTest(_accountId: string): number {
-    return this.currentColdDeficit();
+  /** Test-only read accessor for the cold vertical. */
+  coldDeficitForTest(accountId: string): number {
+    return this.coldDeficitFor(accountId);
+  }
+
+  /** Test-only: moves a body without driving it there. */
+  teleportForTest(accountId: string, position: Point3): void {
+    const movement = this.movementByAccount.get(accountId);
+    if (movement) this.movementByAccount.set(accountId, { ...movement, position: { ...position } });
   }
 
   vitalsForTest(accountId: string): { calories: number; health: number; exposure: number } | undefined {
@@ -1750,12 +1763,12 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
 
   /** Calories, starvation, hot-ore exposure and cold, for every connected player. */
   private tickSurvival(dt: number): void {
-    const coldDeficit = this.currentColdDeficit();
-
     for (const accountId of this.connectedAccounts) {
       const vitals = this.playerVitals.get(accountId);
       const movement = this.movementByAccount.get(accountId);
       if (!vitals || !movement) continue;
+
+      const coldDeficit = this.coldDeficitFor(accountId);
 
       const sprinting = this.pendingMove.get(accountId)?.action.sprint ?? false;
       // Cold adds its drain on top of the movement drain (GDD section 6):
