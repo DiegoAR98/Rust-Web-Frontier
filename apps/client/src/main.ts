@@ -31,7 +31,11 @@ function getOrCreateAccountId(): string {
 }
 
 const MOVE_SEND_HZ = 20; // matches TECHNICAL section 3's simulation rate
-const PATCH_INTERVAL_MS = 1000 / MOVE_SEND_HZ; // the cadence state patches arrive at
+// Colyseus's own default patch rate (DEFAULT_PATCH_RATE = 1000/20), which the
+// room does not override. Deliberately not derived from MOVE_SEND_HZ: the two
+// happen to be equal, but one is how often we send and this is how often the
+// server's state arrives, which is what the interpolation blends between.
+const PATCH_INTERVAL_MS = 50;
 const EYE_HEIGHT_M = 1.7; // matches the server's own eye height for reach
 const ITEM_WORLD_POSITION = new Vector3(2, 0.5, 2); // client-side placeholder; see note below
 const NODE_WORLD_POSITION = new Vector3(-2, 0.5, 2); // client-side placeholder; matches server's node_1
@@ -356,17 +360,18 @@ function describeCrafting(): string {
 
 /**
  * The two placeholder boxes are both brown and neither is labelled, so which
- * key applies to the one you are looking at is pure guesswork. This names the
- * closer one and its key, and shows the distance so an out-of-reach press is
- * self-explanatory rather than a mystery.
+ * key applies to which is pure guesswork. Both are listed rather than just the
+ * closer one -- with only two objects there is room, and naming one would
+ * still leave you guessing when you are stood at the other. The distances make
+ * an out-of-reach press self-explanatory.
  */
 function describeNearest(): string {
-  const toItem = itemMesh.isEnabled() ? Vector3.Distance(camera.position, ITEM_WORLD_POSITION) : Infinity;
-  const toNode = Vector3.Distance(camera.position, NODE_WORLD_POSITION);
-  if (toItem === Infinity && toNode === Infinity) return '-';
-  return toItem <= toNode
-    ? `item_1 wood ${toItem.toFixed(1)}m (E take)`
-    : `node_1 tree ${toNode.toFixed(1)}m (LMB gather)`;
+  const parts: string[] = [];
+  if (itemMesh.isEnabled()) {
+    parts.push(`wood ${Vector3.Distance(camera.position, ITEM_WORLD_POSITION).toFixed(1)}m (E)`);
+  }
+  parts.push(`tree ${Vector3.Distance(camera.position, NODE_WORLD_POSITION).toFixed(1)}m (LMB)`);
+  return parts.join('  ');
 }
 
 engine.runRenderLoop(() => {
