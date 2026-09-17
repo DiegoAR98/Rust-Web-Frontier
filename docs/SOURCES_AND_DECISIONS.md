@@ -293,3 +293,22 @@ Four verticals that only made sense together: a base that could not be damaged w
 **A live defect, found by reading CONTENT §8 for T12 and fixed with it:** melee damage to structures was applying the full tool damage, where §8 says "Tools deal their base melee damage ×0.5 to wood and ×0.05 to metal". A rock was a viable raiding tool, which left no reason for anyone to build an explosive at all. Four tests had encoded the wrong number and were corrected with the rule.
 
 **Still open in M2.** Repair (§10's hold-interact-for-2-seconds and its `ceil(cost × restoredHP / maxHP × 0.5)` formula) and demolition (the 120-second window; `placed_at_tick` is already recorded so it needs no migration) are not implemented, and the raid lock that would block both is. §10's tier swap, the 60-second broken-socket lockout and the no-build polygons are also unimplemented. None is a gate clause for T10–T13.
+
+### 2026-09-17 — Closing M2: repair, the broken socket, and two defects
+
+Three fixes and one addition that finish the milestone's deliverables. PRODUCTION §1 lists M2 as "Snapped wood buildings, door permissions, containers, bedrolls, death, decay, durable saves"; all seven are implemented, and its exit gates — T03/T04 full, T10–T13 — are met apart from T12's satchel *item*, which PRODUCTION's own table places in M3.
+
+**A live exploit, created by the previous change.** Door destruction became reachable with the blast work, and §10's "Breaking a door leaves its socket unavailable to everyone for 60 seconds" was still on the deferred list under D63. That turned a deferred nicety into a defender-side exploit: a breach that cost a satchel could be closed for free by re-hanging a door the instant it broke. The lockout applies to everyone, owner included, which is what "to everyone" says.
+
+**A whole column of CONTENT §8 was missing.** Both explosives have a character damage figure on a *different* falloff from their structural splash — a satchel reaches 4 m for people and 3 m for walls — and the detonation only touched structures, so a raider standing on their own charge took nothing at all.
+
+**A defect found by an intermittent test failure.** The placeholder hazard zone was centred on the spawn point, so every new player began taking exposure the moment they joined. The test that caught it asserted "exposure under 1 after joining", which was really measuring how loaded the machine was: it passed on a quiet run and failed on a busy one. Moving the zone twenty metres east makes the assertion exact, and the zone is now drawn and announced — an unmarked patch of ground that quietly damages you is worse than one you were already standing in.
+
+| ID | Decision | Status and reason |
+|---|---|---|
+| D73 | The broken-socket lockout applies to everyone, including the owner | Required reading, and it supersedes the part of D63 that deferred it. §10 says "unavailable to everyone"; exempting the owner would return the exploit it exists to prevent |
+| D74 | A repair is a channel, and the channel now carries what it is for | Proposed. §10's repair is the second thing in the game that holds interact, so the channel stopped assuming an item. An interrupted hold costs nothing, which is D36's rule for a bandage applied to the same machinery |
+| D75 | A repair's cost and legality are recomputed at completion, not trusted from its start | Required. Two seconds is long enough for the wall to be hit again, for the raid lock to come on, or for the materials to be spent elsewhere. Charging what was planned two seconds ago would let a player start a repair and then spend the wood on something else |
+| D76 | A fresh spawn is placed clear of hazards | Required reading. §12 places a *respawn* "outside structures/hazards"; there is no reading where a player's first spawn should be worse than the one they get after dying |
+
+**Still open and not a gate clause for M2:** demolition's 120-second window (`placed_at_tick` is recorded, so it needs no migration), §10's metal tier swap, and the no-build polygons. The metal tier itself is Learn/Bench and waits on research (M3), as do windows, stairs, ramps and steps (D62).
