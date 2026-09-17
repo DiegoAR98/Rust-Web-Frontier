@@ -46,16 +46,39 @@ describe('WorldRoom crafting (GDD section 9)', () => {
     room.grantForTest('acct_a', 'wood', 15);
     room.grantForTest('acct_a', 'stone', 10);
     const client = await colyseus.connectTo(room, { accountId: 'acct_a' });
-    await client.waitForMessage('session');
 
+    // Registered before awaiting 'session', not after: the room sends the
+    // join-time inventory on the same deferred tick as the session, so a
+    // listener installed after that await has already missed it.
+    //
+    // A persistent listener plus a delivery count, because waitForMessage is
+    // unusable here: it only resolves for frames arriving strictly after the
+    // call, so depending on which socket read a frame landed in it either
+    // misses the update or times out waiting for one that already arrived.
     let latestInventory: { slots: Array<{ definitionId: string; quantity: number } | null> } | undefined;
+    let deliveries = 0;
     client.onMessage('inventory', (payload: typeof latestInventory) => {
       latestInventory = payload;
+      deliveries += 1;
     });
+    client.onMessage('vitals', () => {}); // silence the SDK's unregistered-type warning
+
+    await client.waitForMessage('session');
+
+    const waitForDelivery = async (count: number) => {
+      const deadline = Date.now() + 3000;
+      while (deliveries < count) {
+        if (Date.now() > deadline) throw new Error(`only ${deliveries} inventory updates, wanted ${count}`);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    };
+
+    await waitForDelivery(1); // the join-time inventory
 
     client.send('command', craftCommand(1, 'stone_hatchet', 1));
     const accepted = await client.waitForMessage('commandResult');
     expect(accepted.accepted).toBe(true);
+    await waitForDelivery(2); // the post-escrow inventory
 
     // Materials are escrowed immediately: gone from the inventory before
     // the recipe finishes (GDD section 9: "Ingredients ... escrowed when
@@ -64,10 +87,7 @@ describe('WorldRoom crafting (GDD section 9)', () => {
     expect(afterEscrow).toBeUndefined();
 
     room.advanceCraftingForTest(10); // the stone_hatchet recipe's durationS
-    // The resulting send() travels a real WebSocket; wait for it to
-    // actually arrive rather than asserting synchronously right after
-    // the call.
-    await client.waitForMessage('inventory');
+    await waitForDelivery(3); // the delivered output
 
     const hatchet = latestInventory!.slots.find((s) => s?.definitionId === 'stone_hatchet');
     expect(hatchet).toEqual({ definitionId: 'stone_hatchet', quantity: 1 });

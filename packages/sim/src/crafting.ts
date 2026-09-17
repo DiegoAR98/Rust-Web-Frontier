@@ -1,4 +1,6 @@
 export interface Recipe {
+  /** The recipe's own identity; see RecipeDefinition in @rwf/content. */
+  id: string;
   outputId: string;
   outputQuantityPerUnit: number;
   inputs: Record<string, number>;

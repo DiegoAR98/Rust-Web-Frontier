@@ -499,7 +499,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
 
   private persistCrafting(accountId: string, entry: QueueEntry): void {
     this.store.saveCraftingEntry(accountId, {
-      recipeId: entry.recipe.outputId,
+      recipeId: entry.recipe.id,
       totalUnits: entry.totalUnits,
       completedUnits: entry.completedUnits,
       progressS: entry.progressS,

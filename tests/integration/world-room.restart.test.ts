@@ -94,10 +94,23 @@ describe('WorldRoom durability across a real process restart (T04/T17)', () => {
 
     await colyseus.cleanup();
 
+    // Anchor on what was actually persisted, not on the reading above: the old
+    // room keeps ticking between that read and its disposal, so
+    // tickBeforeRestart is already stale by an unpredictable amount.
+    const store = new WorldStore(dbFile);
+    const persistedTick = store.loadWorldTick();
+    store.close();
+    expect(persistedTick).toBeGreaterThanOrEqual(tickBeforeRestart);
+
     const after = (await colyseus.createRoom('world', {})) as WorldRoom;
-    // No ticks have run yet in the new room instance; it must resume from
-    // at least the last value the previous instance had reached, not zero.
-    expect(after.state.tick).toBeGreaterThanOrEqual(tickBeforeRestart);
+    // Resumes from the checkpoint rather than zero...
+    expect(after.state.tick).toBeGreaterThanOrEqual(persistedTick);
+    // ...and does not catch up the downtime. A lower bound alone cannot prove
+    // the "never advancing while stopped" half of this test's name: it stays
+    // green even if onCreate derived the tick from wall-clock elapsed time,
+    // which is precisely the T17 defect it exists to catch. The small
+    // allowance covers ticks the new room runs before this line executes.
+    expect(after.state.tick).toBeLessThanOrEqual(persistedTick + 3);
   });
 
   it('restores a player at their last checkpointed position after a restart', async () => {

@@ -1,4 +1,11 @@
 export interface RecipeDefinition {
+  /**
+   * The recipe's own identity, which is what the protocol's `recipeId` names.
+   * Distinct from outputId because two recipes may produce the same item --
+   * a bench variant with a shorter durationS, say -- and keying lookup on the
+   * output would make the second one permanently unreachable.
+   */
+  id: string;
   outputId: string;
   outputQuantityPerUnit: number;
   inputs: Record<string, number>;
@@ -8,9 +15,15 @@ export interface RecipeDefinition {
 // Transcribed from CONTENT.md section 2. Starting with the single recipe
 // M1's crafting vertical needs; expand as later milestones need more.
 export const RECIPES: RecipeDefinition[] = [
-  { outputId: 'stone_hatchet', outputQuantityPerUnit: 1, inputs: { wood: 15, stone: 10 }, durationS: 10 },
+  {
+    id: 'stone_hatchet',
+    outputId: 'stone_hatchet',
+    outputQuantityPerUnit: 1,
+    inputs: { wood: 15, stone: 10 },
+    durationS: 10,
+  },
 ];
 
-export function getRecipe(outputId: string): RecipeDefinition | undefined {
-  return RECIPES.find((recipe) => recipe.outputId === outputId);
+export function getRecipe(recipeId: string): RecipeDefinition | undefined {
+  return RECIPES.find((recipe) => recipe.id === recipeId);
 }
