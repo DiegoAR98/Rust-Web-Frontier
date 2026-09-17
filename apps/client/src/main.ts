@@ -126,8 +126,17 @@ async function connect(): Promise<void> {
   const joined = await client.joinOrCreate('world', { accountId });
   room = joined;
 
+  let sendingStarted = false;
   joined.onMessage('session', (payload: { sessionEpoch: number }) => {
     sessionEpoch = payload.sessionEpoch;
+    // Don't start sending until the epoch is known: a command sent before
+    // this arrives would carry the stale default (0) and be rejected as
+    // stale_session forever if this message were ever lost, rather than
+    // just for the first few commands.
+    if (!sendingStarted) {
+      sendingStarted = true;
+      setInterval(sendMoveCommand, 1000 / MOVE_SEND_HZ);
+    }
   });
 
   joined.onMessage('commandResult', (payload: { accepted: boolean; reasonCode: string }) => {
@@ -166,8 +175,6 @@ async function connect(): Promise<void> {
       remoteTargetTransform.set(key, { x: player.x, y: player.y, z: player.z, yaw: player.yaw });
     }
   });
-
-  setInterval(sendMoveCommand, 1000 / MOVE_SEND_HZ);
 }
 
 function sendMoveCommand(): void {
