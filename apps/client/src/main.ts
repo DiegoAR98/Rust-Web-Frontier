@@ -31,9 +31,11 @@ function getOrCreateAccountId(): string {
 }
 
 const MOVE_SEND_HZ = 20; // matches TECHNICAL section 3's simulation rate
+const PATCH_INTERVAL_MS = 1000 / MOVE_SEND_HZ; // the cadence state patches arrive at
+const EYE_HEIGHT_M = 1.7; // matches the server's own eye height for reach
 const ITEM_WORLD_POSITION = new Vector3(2, 0.5, 2); // client-side placeholder; see note below
 const NODE_WORLD_POSITION = new Vector3(-2, 0.5, 2); // client-side placeholder; matches server's node_1
-const INTERACT_REACH_M = 2.5; // GDD section 5
+const HUD_INTERVAL_MS = 100; // the HUD is read by a human; no reason to rebuild it per frame
 
 const statusEl = document.getElementById('status')!;
 const overlayEl = document.getElementById('enterOverlay')!;
@@ -42,6 +44,12 @@ const canvas = document.getElementById('renderCanvas') as HTMLCanvasElement;
 
 const engine = new Engine(canvas, true);
 const scene = new Scene(engine);
+
+// Which GPU (if any) Chrome actually gave us. A renderer reading "SwiftShader"
+// or "ANGLE ... Software" means WebGL fell back to the CPU, which caps the
+// frame rate no matter what the scene contains -- worth ruling out first when
+// rendering is slow.
+console.log('[rwf] webgl renderer:', engine.getGlInfo().renderer);
 
 const camera = new UniversalCamera('player', new Vector3(0, 1.7, 0), scene);
 camera.minZ = 0.05;
@@ -79,6 +87,10 @@ let crafting: { recipeId: string | null; completedUnits: number; totalUnits: num
 let vitals = { calories: 0, health: 0, exposure: 0, coldDeficit: 0, phase: 'day' };
 let yaw = 0;
 let pitch = 0;
+let localLastTransform: Transform | undefined;
+let localTargetTransform: Transform | undefined;
+let patchAtMs = 0;
+let hudAtMs = 0;
 
 const keys: KeyState = {
   forward: false,
@@ -251,9 +263,16 @@ async function connect(): Promise<void> {
   });
 
   joined.onStateChange(() => {
+    patchAtMs = performance.now();
     const local = joined.state.players.get(accountId);
     if (local) {
-      camera.position.set(local.x, local.y + 1.7, local.z); // snap, no local prediction
+      const target = { x: local.x, y: local.y, z: local.z, yaw: local.yaw };
+      // Still no client-side prediction: these are both server positions, and
+      // the render loop only blends between the last two. Snapping straight
+      // to each patch made every movement step at 20 Hz however fast the
+      // renderer was running, which reads as a slideshow.
+      localLastTransform = localTargetTransform ?? target;
+      localTargetTransform = target;
     }
     for (const [key, target] of remoteTargetTransform) {
       const player = joined.state.players.get(key);
@@ -289,9 +308,13 @@ function attemptCraft(recipeId: string, quantity: number): void {
   });
 }
 
+// Reach is deliberately NOT pre-checked here. The server enforces it (a
+// modified client would simply omit the check), and a silent client-side
+// early return made an out-of-reach press indistinguishable from a broken
+// keybind: nothing happened and nothing said why. Now the server answers and
+// the HUD's `last:` line shows out_of_range/already_taken/ok.
 function attemptTakeItem(): void {
   if (!room) return;
-  if (Vector3.Distance(camera.position, ITEM_WORLD_POSITION) > INTERACT_REACH_M) return;
   sequence += 1;
   room.send('command', {
     protocolVersion: PROTOCOL_VERSION,
@@ -304,7 +327,6 @@ function attemptTakeItem(): void {
 
 function attemptHitNode(): void {
   if (!room) return;
-  if (Vector3.Distance(camera.position, NODE_WORLD_POSITION) > INTERACT_REACH_M) return;
   sequence += 1;
   room.send('command', {
     protocolVersion: PROTOCOL_VERSION,
@@ -332,8 +354,27 @@ function describeCrafting(): string {
   return `${recipeId} ${completedUnits}/${totalUnits}`;
 }
 
+/**
+ * The two placeholder boxes are both brown and neither is labelled, so which
+ * key applies to the one you are looking at is pure guesswork. This names the
+ * closer one and its key, and shows the distance so an out-of-reach press is
+ * self-explanatory rather than a mystery.
+ */
+function describeNearest(): string {
+  const toItem = itemMesh.isEnabled() ? Vector3.Distance(camera.position, ITEM_WORLD_POSITION) : Infinity;
+  const toNode = Vector3.Distance(camera.position, NODE_WORLD_POSITION);
+  if (toItem === Infinity && toNode === Infinity) return '-';
+  return toItem <= toNode
+    ? `item_1 wood ${toItem.toFixed(1)}m (E take)`
+    : `node_1 tree ${toNode.toFixed(1)}m (LMB gather)`;
+}
+
 engine.runRenderLoop(() => {
-  const alpha = 0.5; // fixed blend factor between the last two patches; good enough for M0
+  // Time-based, so meshes actually animate between patches. The old constant
+  // 0.5 parked every remote player permanently at the midpoint of its last
+  // two positions and never moved it within a patch.
+  const alpha = Math.min(1, (performance.now() - patchAtMs) / PATCH_INTERVAL_MS);
+
   for (const [key, mesh] of remoteMeshes) {
     const from = remoteLastTransform.get(key);
     const to = remoteTargetTransform.get(key);
@@ -343,21 +384,35 @@ engine.runRenderLoop(() => {
     mesh.rotation.y = blended.yaw;
   }
 
+  if (localLastTransform && localTargetTransform) {
+    const blended = interpolateTransform(localLastTransform, localTargetTransform, alpha);
+    // Position only. Yaw and pitch are local mouse input applied at full rate
+    // in the mousemove handler; feeding the server's replicated yaw back into
+    // the camera here would make looking around lag by a patch.
+    camera.position.set(blended.x, blended.y + EYE_HEIGHT_M, blended.z);
+  }
+
   const item = room?.state.items?.get('item_1');
   itemMesh.setEnabled(!item || item.claimedBy === '');
 
-  statusEl.textContent = room
-    ? [
-        `account ${accountId.slice(0, 8)}  epoch ${sessionEpoch}  players ${room.state.players.size}`,
-        `hp ${vitals.health.toFixed(0)}  cal ${vitals.calories.toFixed(0)}  exposure ${vitals.exposure.toFixed(0)}  ${vitals.phase}${vitals.coldDeficit > 0 ? `  COLD ${vitals.coldDeficit.toFixed(0)}` : ''}`,
-        `pack: ${describeInventory()}`,
-        `craft: ${describeCrafting()}`,
-        `last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : `  (${lookError ?? 'click canvas to look'})`}`,
-        'WASD move : shift sprint : space jump : LMB gather : E take : C craft hatchet',
-      ].join('\n')
-    : disconnectReason
-      ? `${disconnectReason} -- reload to reconnect`
-      : 'not connected';
+  const now = performance.now();
+  if (now - hudAtMs >= HUD_INTERVAL_MS) {
+    hudAtMs = now;
+    statusEl.textContent = room
+      ? [
+          `account ${accountId.slice(0, 8)}  epoch ${sessionEpoch}  players ${room.state.players.size}`,
+          `${engine.getFps().toFixed(0)} fps render : ${MOVE_SEND_HZ} Hz sim`,
+          `hp ${vitals.health.toFixed(0)}  cal ${vitals.calories.toFixed(0)}  exposure ${vitals.exposure.toFixed(0)}  ${vitals.phase}${vitals.coldDeficit > 0 ? `  COLD ${vitals.coldDeficit.toFixed(0)}` : ''}`,
+          `pack: ${describeInventory()}`,
+          `craft: ${describeCrafting()}`,
+          `near: ${describeNearest()}`,
+          `last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : `  (${lookError ?? 'click canvas to look'})`}`,
+          'WASD move : shift sprint : space jump : LMB gather : E take : C craft hatchet',
+        ].join('\n')
+      : disconnectReason
+        ? `${disconnectReason} -- reload to reconnect`
+        : 'not connected';
+  }
 
   scene.render();
 });
