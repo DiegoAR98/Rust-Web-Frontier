@@ -2,3 +2,5 @@ export * from './movement.js';
 export * from './inventory.js';
 export * from './harvest.js';
 export * from './transactions.js';
+export * from './survival.js';
+export * from './bleed.js';
