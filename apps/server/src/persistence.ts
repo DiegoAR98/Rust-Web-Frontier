@@ -76,6 +76,21 @@ interface PlayerSlotRow {
   quantity: number;
 }
 
+export interface CraftingEntryRecord {
+  recipeId: string;
+  totalUnits: number;
+  completedUnits: number;
+  progressS: number;
+}
+
+interface CraftingQueueRow {
+  account_id: string;
+  recipe_id: string;
+  total_units: number;
+  completed_units: number;
+  progress_s: number;
+}
+
 export interface PlayerVitals {
   calories: number;
   health: number;
@@ -162,6 +177,13 @@ export class WorldStore {
         quantity INTEGER NOT NULL,
         PRIMARY KEY (account_id, slot_index)
       );
+      CREATE TABLE IF NOT EXISTS crafting_queue (
+        account_id TEXT PRIMARY KEY,
+        recipe_id TEXT NOT NULL,
+        total_units INTEGER NOT NULL,
+        completed_units INTEGER NOT NULL,
+        progress_s REAL NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS player_vitals (
         account_id TEXT PRIMARY KEY,
         calories REAL NOT NULL,
@@ -247,6 +269,44 @@ export class WorldStore {
       return outcome;
     });
     return commit();
+  }
+
+  /**
+   * Persists an account's active crafting entry. Accepting a craft debits the
+   * inputs immediately and durably, so the entry that owes the output has to
+   * be just as durable -- otherwise a restart keeps the materials and delivers
+   * nothing (GDD section 9 requires escrow to be retained, never voided).
+   */
+  saveCraftingEntry(accountId: string, entry: CraftingEntryRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO crafting_queue (account_id, recipe_id, total_units, completed_units, progress_s)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(account_id) DO UPDATE SET
+           recipe_id = excluded.recipe_id, total_units = excluded.total_units,
+           completed_units = excluded.completed_units, progress_s = excluded.progress_s`,
+      )
+      .run(accountId, entry.recipeId, entry.totalUnits, entry.completedUnits, entry.progressS);
+  }
+
+  deleteCraftingEntry(accountId: string): void {
+    this.db.prepare('DELETE FROM crafting_queue WHERE account_id = ?').run(accountId);
+  }
+
+  loadCraftingEntries(): Map<string, CraftingEntryRecord> {
+    const rows = this.db
+      .prepare('SELECT account_id, recipe_id, total_units, completed_units, progress_s FROM crafting_queue')
+      .all() as CraftingQueueRow[];
+    const result = new Map<string, CraftingEntryRecord>();
+    for (const row of rows) {
+      result.set(row.account_id, {
+        recipeId: row.recipe_id,
+        totalUnits: row.total_units,
+        completedUnits: row.completed_units,
+        progressS: row.progress_s,
+      });
+    }
+    return result;
   }
 
   /** Persists the simulation's own tick counter. Never derived from wall-clock time. */

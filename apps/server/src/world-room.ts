@@ -171,6 +171,23 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     for (const [accountId, vitals] of this.store.loadPlayerVitals()) {
       this.playerVitals.set(accountId, vitals);
     }
+    for (const [accountId, record] of this.store.loadCraftingEntries()) {
+      const recipe = getRecipe(record.recipeId);
+      if (!recipe) {
+        // The recipe left CONTENT while this entry was owed. The row is left
+        // in place rather than dropped: deleting it would silently keep the
+        // player's escrow, and only the recipe knows what the inputs were, so
+        // it cannot be refunded from here either. Restoring the recipe makes
+        // the entry live again.
+        continue;
+      }
+      this.craftingByAccount.set(accountId, {
+        recipe,
+        totalUnits: record.totalUnits,
+        completedUnits: record.completedUnits,
+        progressS: record.progressS,
+      });
+    }
 
     // Seed the M0/M1 proof-of-mechanism content on a genuinely fresh world
     // only -- never re-seed over a restored (possibly claimed/depleted)
@@ -474,9 +491,21 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.playerSlots.set(accountId, slots);
     this.store.savePlayerSlots(accountId, slots);
 
-    this.craftingByAccount.set(accountId, startQueueEntry(recipe, quantity));
+    const entry = startQueueEntry(recipe, quantity);
+    this.craftingByAccount.set(accountId, entry);
+    this.persistCrafting(accountId, entry);
     return { ...base, accepted: true, reasonCode: 'ok' };
   }
+
+  private persistCrafting(accountId: string, entry: QueueEntry): void {
+    this.store.saveCraftingEntry(accountId, {
+      recipeId: entry.recipe.outputId,
+      totalUnits: entry.totalUnits,
+      completedUnits: entry.completedUnits,
+      progressS: entry.progressS,
+    });
+  }
+
 
   /**
    * A move intent describes what the player is doing right now, so it must not
@@ -537,8 +566,12 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
 
       if (nextEntry.completedUnits >= nextEntry.totalUnits) {
         this.craftingByAccount.delete(accountId);
+        this.store.deleteCraftingEntry(accountId);
       } else {
         this.craftingByAccount.set(accountId, nextEntry);
+        // Only write when something actually moved: a paused entry (full pack)
+        // returns unchanged every tick and must not rewrite the row at 20Hz.
+        if (nextEntry !== entry) this.persistCrafting(accountId, nextEntry);
       }
     }
   }

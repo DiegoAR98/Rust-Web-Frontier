@@ -33,9 +33,13 @@ describe('WorldRoom hit-node conservation (T03, gathering)', () => {
     const room = (await colyseus.createRoom('world', {})) as WorldRoom;
     room.spawnNode('node_1', 'wood', 10, 10); // exactly one hit's worth
 
+    // Await each client's own 'session' right after its connect. Connecting
+    // both first and awaiting afterwards lets A's session arrive during B's
+    // connect, and waitForMessage only catches what arrives after it is called.
     const clientA = await colyseus.connectTo(room, { accountId: 'acct_a' });
+    await clientA.waitForMessage('session');
     const clientB = await colyseus.connectTo(room, { accountId: 'acct_b' });
-    await Promise.all([clientA.waitForMessage('session'), clientB.waitForMessage('session')]);
+    await clientB.waitForMessage('session');
 
     // Register every listener before sending: the server replies with
     // commandResult then inventory back to back, so awaiting the first
