@@ -1,3 +1,5 @@
+import { mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 import Database from 'better-sqlite3';
 import type { TransactionKey } from '@rwf/sim';
 
@@ -51,6 +53,9 @@ export class WorldStore {
   private readonly db: Database.Database;
 
   constructor(filename: string) {
+    if (filename !== ':memory:') {
+      mkdirSync(dirname(filename), { recursive: true });
+    }
     this.db = new Database(filename);
     this.db.pragma('journal_mode = WAL');
     this.migrate();

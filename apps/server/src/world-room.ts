@@ -7,7 +7,7 @@ import { PlayerState, WorldItemState, WorldState } from './world-state.js';
 /** Matches TECHNICAL section 3's simulation budget: 20 fixed ticks/s. */
 const TICK_RATE_HZ = 20;
 /** TECHNICAL section 7: continuous state checkpoints every 5 seconds. */
-const CHECKPOINT_INTERVAL_TICKS = 5 * TICK_RATE_HZ;
+export const CHECKPOINT_INTERVAL_TICKS = 5 * TICK_RATE_HZ;
 
 interface ClientUserData {
   accountId: string;
@@ -23,11 +23,16 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private readonly movementByAccount = new Map<string, MovementState>();
   private readonly pendingMove = new Map<string, MoveAction>();
 
-  onCreate(options: { dbPath?: string }): void {
+  onCreate(): void {
     // TECHNICAL section 17: the world keeps running even when nobody is
     // connected. It is stopped only by stopping the host process.
     this.autoDispose = false;
-    this.store = new WorldStore(options?.dbPath ?? ':memory:');
+    // dbPath deliberately never comes from room-creation options: those
+    // are reachable from a real client's joinOrCreate() call (see
+    // MatchMaker's merge(clientOptions, handler.options)), and TECHNICAL
+    // section 10 is explicit: never evaluate a client-supplied filesystem
+    // path. Only the server process's own environment controls this.
+    this.store = new WorldStore(process.env.RWF_DB_PATH ?? ':memory:');
     this.state = new WorldState();
 
     // Crash recovery (TECHNICAL section 7): resume from the last

@@ -16,6 +16,22 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+describe('WorldStore fresh deployment', () => {
+  it('creates its parent directory when it does not exist yet', () => {
+    const nestedPath = join(dir, 'nested', 'does', 'not', 'exist', 'world.sqlite');
+
+    const store = new WorldStore(nestedPath);
+    store.saveWorldTick(1);
+    store.close();
+
+    const reopened = new WorldStore(nestedPath);
+    const tick = reopened.loadWorldTick();
+    reopened.close();
+
+    expect(tick).toBe(1);
+  });
+});
+
 describe('WorldStore transaction durability (T04)', () => {
   it('restores a committed outcome once after a simulated crash, never recomputing it', () => {
     const key = { accountId: 'acct_1', sessionEpoch: 1, sequence: 1 };
