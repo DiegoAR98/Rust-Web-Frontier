@@ -69,6 +69,22 @@ const INTERACT_REACH_M = 2.5;
 const INTERACT_REACH_TOLERANCE_M = 1;
 /** Camera offset above the player's feet; the client measures reach from here. */
 const EYE_HEIGHT_M = 1.7;
+/**
+ * CONTENT section 4: "Rock swing interval 1 s" -- the bare-hands/rock rate.
+ * Counted in simulation ticks, not wall-clock: GDD section 20 requires every
+ * gameplay timer to freeze while the host is stopped rather than resuming with
+ * a backlog of owed swings. Tool-specific intervals (hatchet 0.9s, iron 0.7s)
+ * arrive with tool equipping.
+ */
+const SWING_INTERVAL_TICKS = TICK_RATE_HZ;
+/**
+ * Blunt backstop on total command volume per client. Colyseus disconnects a
+ * client that exceeds this, so it sits well clear of honest traffic: the
+ * client sends 20 move commands/s plus occasional actions, and this is 3x
+ * that. It bounds what a spammer can force the room to even look at; the
+ * per-action cooldowns above are what bound the gameplay effect.
+ */
+const MAX_MESSAGES_PER_SECOND = 60;
 
 interface ClientUserData {
   accountId: string;
@@ -97,11 +113,13 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private readonly connectedAccounts = new Set<string>();
   private readonly clientsByAccount = new Map<string, RoomClient>();
   private readonly craftingByAccount = new Map<string, QueueEntry>();
+  private readonly lastSwingTick = new Map<string, number>();
 
   onCreate(): void {
     // TECHNICAL section 17: the world keeps running even when nobody is
     // connected. It is stopped only by stopping the host process.
     this.autoDispose = false;
+    this.maxMessagesPerSecond = MAX_MESSAGES_PER_SECOND;
     // dbPath deliberately never comes from room-creation options: those
     // are reachable from a real client's joinOrCreate() call (see
     // MatchMaker's merge(clientOptions, handler.options)), and TECHNICAL
@@ -377,6 +395,13 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     if (!this.isWithinReach(accountId, config.position)) {
       return { ...base, accepted: false, reasonCode: 'out_of_range' };
     }
+    const lastSwing = this.lastSwingTick.get(accountId);
+    if (lastSwing !== undefined && this.state.tick - lastSwing < SWING_INTERVAL_TICKS) {
+      // Without this, a node's whole budget falls to as many packets as a
+      // scripted client can write, each costing a synchronous SQLite write
+      // on the game-loop thread.
+      return { ...base, accepted: false, reasonCode: 'rate_limited' };
+    }
 
     // Peek at the harvest before committing it: decrementing the node budget
     // and then discarding what the backpack cannot hold would destroy the
@@ -394,6 +419,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       return { ...base, accepted: false, reasonCode: 'insufficient_resources' };
     }
 
+    // Only an accepted swing starts the cooldown; a refused one (out of
+    // reach, full pack, depleted) must not also cost the player their rhythm.
+    this.lastSwingTick.set(accountId, this.state.tick);
     const { node: nextNode, result } = harvestNode(node, config.yieldPerHit);
     this.resourceNodes.set(nodeId, nextNode);
     this.store.saveNodeState(nodeId, config.definitionId, nextNode.remaining, config.yieldPerHit, config.position);

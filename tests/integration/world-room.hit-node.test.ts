@@ -77,6 +77,10 @@ describe('WorldRoom hit-node conservation (T03, gathering)', () => {
     client.send('command', hitNodeCommand(1, 'node_1', 1));
     await client.waitForMessage('commandResult');
 
+    // Wait out CONTENT section 4's 1s swing interval, so this asserts what it
+    // is named for -- the node being empty -- rather than the rate limiter.
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+
     client.send('command', hitNodeCommand(1, 'node_1', 2));
     const second = await client.waitForMessage('commandResult');
 
