@@ -12,6 +12,7 @@ import {
   pageOverflowIn,
   validateDeployablePlacement,
   validatePieceSite,
+  cascadeRemoval,
   isReachBlocked,
   wallSegment,
   type GroundSegment,
@@ -142,6 +143,8 @@ const BUILD_REACH_M = 6;
  * needs metal a player cannot smelt enough of yet.
  */
 const DOOR_PLACED_HP: Record<string, number> = { wood_door: 500, metal_door: 1000 };
+/** GDD section 11: "A building-wide raid lock lasts 60 seconds after any hostile damage". */
+const RAID_LOCK_TICKS = 60 * TICK_RATE_HZ;
 /** Camera offset above the player's feet; the client measures reach from here. */
 const EYE_HEIGHT_M = 1.7;
 /**
@@ -407,6 +410,13 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private readonly buildAccess = new Map<string, Set<string>>();
   /** Invalidated whenever a piece goes up or a door swings; see barriers(). */
   private barrierCache: GroundSegment[] | null = null;
+  /**
+   * GDD section 11's raid lock, kept per piece so that "building-wide" can be
+   * answered by walking the building the same way ownership is -- a building
+   * has no id to key it on. Counted in ticks, so it freezes with the host like
+   * every other timer (T17).
+   */
+  private readonly raidLockUntilTick = new Map<string, number>();
 
   onCreate(): void {
     // TECHNICAL section 17: the world keeps running even when nobody is
@@ -698,6 +708,16 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         // Class-2 only: the partially elapsed quantum. Contents were already
         // written at the commit that changed them.
         this.store.saveStationProgress(stationId, station.progressS, station.lit);
+      }
+      // Structure health is class-2 (TECHNICAL section 7): a raid is hundreds
+      // of hits, and writing each one would put an fsync on the game loop per
+      // swing. T04 allows losing up to 5 s of continuous state, which is a few
+      // swings of damage; destruction itself is class-1 and already written.
+      for (const [key, replicated] of this.state.buildingPieces) {
+        this.store.saveBuildingPieceHealth(key, replicated.health);
+      }
+      for (const [key, replicated] of this.state.doors) {
+        this.store.saveDoorHealth(key, replicated.health);
       }
     });
   }
@@ -1187,6 +1207,11 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     if (!this.mayBuildOn(accountId, building)) {
       return { ...base, accepted: false, reasonCode: 'forbidden' };
     }
+    // GDD section 11: the raid lock "blocks ... new attached construction", so
+    // a defender cannot wall a breach shut while it is being made.
+    if (this.isRaidLocked(building)) {
+      return { ...base, accepted: false, reasonCode: 'raid_locked' };
+    }
 
     let ownerPieceCount = 0;
     for (const piece of this.buildingPieces.values()) {
@@ -1424,6 +1449,116 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.buildAccess.set(accountId, list);
     this.store.setBuildAccess(accountId, targetAccountId, granted);
     return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  /** GDD section 11: the lock is building-wide, so any locked piece locks all of it. */
+  private isRaidLocked(building: Set<string>): boolean {
+    for (const key of building) {
+      if ((this.raidLockUntilTick.get(key) ?? -Infinity) > this.state.tick) return true;
+    }
+    return false;
+  }
+
+  /**
+   * A swing at a wall, ceiling, doorway or the door hanging in one (GDD
+   * section 11: "After the window, use normal combat on destructible
+   * pieces"). Foundations and pillars are refused outright -- section 10 calls
+   * their combat immunity intentional.
+   */
+  private resolveAttackStructure(
+    accountId: string,
+    site: PieceSite,
+    door: boolean,
+    sequence: number,
+  ): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    const key = siteKey(site);
+    const piece = this.buildingPieces.get(key);
+    if (!piece) return { ...base, accepted: false, reasonCode: 'not_found' };
+    if (door && !this.doors.has(key)) return { ...base, accepted: false, reasonCode: 'not_found' };
+
+    if (!door && getBuildingPiece(piece.definitionId)?.combatImmune) {
+      return { ...base, accepted: false, reasonCode: 'forbidden' };
+    }
+    if (!this.isWithinReach(accountId, worldPositionOf(site) as Vec3)) {
+      return { ...base, accepted: false, reasonCode: 'out_of_range' };
+    }
+    if (this.isSwingOnCooldown(accountId)) return { ...base, accepted: false, reasonCode: 'rate_limited' };
+    this.lastSwingTick.set(accountId, this.state.tick);
+    this.chargeSwingCalorie(accountId);
+
+    // "A building-wide raid lock lasts 60 seconds after any hostile damage
+    // ... Owner damage also starts the lock", so this is set before the hit
+    // resolves and regardless of who swung.
+    const until = this.state.tick + RAID_LOCK_TICKS;
+    for (const member of this.buildingFrom([key])) {
+      this.raidLockUntilTick.set(member, until);
+    }
+
+    const replicated = door ? this.state.doors.get(key) : this.state.buildingPieces.get(key);
+    if (!replicated) return { ...base, accepted: false, reasonCode: 'not_found' };
+    const health = replicated.health - MELEE_DAMAGE;
+    if (health > 0) {
+      // Class-2 continuous state (TECHNICAL section 7): checkpointed rather
+      // than written per hit, because a raid is hundreds of hits and each one
+      // would be an fsync on the game loop. T04 allows losing up to 5 s of it.
+      replicated.health = health;
+      return { ...base, accepted: true, reasonCode: 'ok' };
+    }
+
+    if (door) {
+      this.removeDoor(key);
+    } else {
+      this.destroyPiece(key);
+    }
+    return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  private removeDoor(key: string): void {
+    this.doors.delete(key);
+    this.state.doors.delete(key);
+    this.doorAccess.delete(key);
+    this.barrierCache = null;
+    this.store.runInTransaction(() => {
+      this.store.deleteDoor(key);
+      this.store.clearDoorAccess(key);
+    });
+  }
+
+  /**
+   * Removes a piece and everything that was standing on it (GDD section 10's
+   * cascade). Class-1: a removal is a committed outcome, so it is written at
+   * once rather than waiting for a checkpoint.
+   */
+  private destroyPiece(key: string): void {
+    const sites = new Map<string, PieceSite>();
+    for (const [otherKey, piece] of this.buildingPieces) sites.set(otherKey, piece.site);
+    const fallen = cascadeRemoval(key, sites);
+
+    this.store.runInTransaction(() => {
+      for (const fallenKey of fallen) {
+        // A door dies with the frame it hangs in (CONTENT section 7:
+        // "insert dies with frame").
+        if (this.doors.has(fallenKey)) {
+          this.doors.delete(fallenKey);
+          this.state.doors.delete(fallenKey);
+          this.doorAccess.delete(fallenKey);
+          this.store.deleteDoor(fallenKey);
+          this.store.clearDoorAccess(fallenKey);
+        }
+        this.buildingPieces.delete(fallenKey);
+        this.state.buildingPieces.delete(fallenKey);
+        this.raidLockUntilTick.delete(fallenKey);
+        // The links go with the pieces; a stale one would keep a fallen
+        // building's ownership alive over empty ground.
+        for (const neighbour of this.pieceLinks.get(fallenKey) ?? []) {
+          this.pieceLinks.get(neighbour)?.delete(fallenKey);
+        }
+        this.pieceLinks.delete(fallenKey);
+        this.store.deleteBuildingPiece(fallenKey);
+      }
+    });
+    this.barrierCache = null;
   }
 
   private linkPieces(a: string, b: string): void {
@@ -2277,6 +2412,17 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       return;
     }
 
+    if (command.action.type === 'attackStructure') {
+      const { form, door, storey, i, k, axis } = command.action;
+      const encoded = this.store.commitOutcome(key, () =>
+        JSON.stringify(
+          this.resolveAttackStructure(accountId, { form, storey, i, k, axis }, door, command.sequence),
+        ),
+      );
+      client.send('commandResult', JSON.parse(encoded) as CommandResult);
+      return;
+    }
+
     if (command.action.type === 'placeBuildingPiece') {
       const { definitionId, form, storey, i, k, axis } = command.action;
       const encoded = this.store.commitOutcome(key, () =>
@@ -2907,6 +3053,25 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
 
   doorForTest(site: PieceSite): { ownerAccountId: string; open: boolean } | undefined {
     return this.doors.get(siteKey(site));
+  }
+
+  /** Test-only: drops a piece to one swing from destruction instead of a hundred. */
+  setPieceHealthForTest(site: PieceSite, health: number): void {
+    const replicated = this.state.buildingPieces.get(siteKey(site));
+    if (replicated) replicated.health = health;
+  }
+
+  /**
+   * Test-only: removes a piece the way decay or demolition will, exercising
+   * the same cascade a destruction does. Pillars are combat immune, so this is
+   * the only way to knock one out today.
+   */
+  removePieceForTest(site: PieceSite): void {
+    this.destroyPiece(siteKey(site));
+  }
+
+  raidLockedForTest(site: PieceSite): boolean {
+    return this.isRaidLocked(this.buildingFrom([siteKey(site)]));
   }
 
   containerForTest(containerId: string): Slot[] | undefined {

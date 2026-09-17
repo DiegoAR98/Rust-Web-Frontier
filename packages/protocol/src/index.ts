@@ -116,6 +116,22 @@ export const PlaceBuildingPieceIntentSchema = z.object({
 });
 export type PlaceBuildingPieceIntent = z.infer<typeof PlaceBuildingPieceIntentSchema>;
 
+/**
+ * A swing at a structure (GDD section 11: "use normal combat on destructible
+ * pieces"). `door` picks the insert rather than the frame it hangs in, since
+ * both stand at the same site.
+ */
+export const AttackStructureIntentSchema = z.object({
+  type: z.literal('attackStructure'),
+  form: z.enum(['foundation', 'pillar', 'wall', 'doorway', 'ceiling']),
+  door: z.boolean(),
+  storey: z.number().int().min(0).max(16),
+  i: z.number().int().min(-4096).max(4096),
+  k: z.number().int().min(-4096).max(4096),
+  axis: z.enum(['x', 'z']).nullable(),
+});
+export type AttackStructureIntent = z.infer<typeof AttackStructureIntentSchema>;
+
 /** The doorway site a door command acts on; the same lattice as a piece. */
 const doorwaySite = {
   storey: z.number().int().min(0).max(16),
@@ -227,6 +243,7 @@ export const ActionPayloadSchema = z.discriminatedUnion('type', [
   CorpseTakeIntentSchema,
   PlaceDeployableIntentSchema,
   PlaceBuildingPieceIntentSchema,
+  AttackStructureIntentSchema,
   InstallDoorIntentSchema,
   OperateDoorIntentSchema,
   SetDoorAccessIntentSchema,
@@ -271,8 +288,11 @@ export const REASON_CODES = [
   'cap_reached',
   // GDD section 10's support rules: nothing holds this site up.
   'unsupported',
-  // The actor is not the building's owner or an authorised builder.
+  // The actor is not the building's owner or an authorised builder, or the
+  // target is combat immune.
   'forbidden',
+  // GDD section 11's 60-second building-wide lock after hostile damage.
+  'raid_locked',
 ] as const;
 export type ReasonCode = (typeof REASON_CODES)[number];
 

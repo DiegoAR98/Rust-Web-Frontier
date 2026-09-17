@@ -1086,6 +1086,15 @@ export class WorldStore {
       );
   }
 
+  /** Class-2 half only: what a raid has knocked off it since the last checkpoint. */
+  saveBuildingPieceHealth(siteKey: string, health: number): void {
+    this.db.prepare('UPDATE building_pieces SET health = ? WHERE site_key = ?').run(health, siteKey);
+  }
+
+  saveDoorHealth(siteKey: string, health: number): void {
+    this.db.prepare('UPDATE doors SET health = ? WHERE site_key = ?').run(health, siteKey);
+  }
+
   deleteBuildingPiece(siteKey: string): void {
     this.db.prepare('DELETE FROM building_pieces WHERE site_key = ?').run(siteKey);
   }
@@ -1138,6 +1147,15 @@ export class WorldStore {
         door.health,
         door.installedAtTick,
       );
+  }
+
+  deleteDoor(siteKey: string): void {
+    this.db.prepare('DELETE FROM doors WHERE site_key = ?').run(siteKey);
+  }
+
+  /** A destroyed door takes its access list with it; a new one starts private. */
+  clearDoorAccess(siteKey: string): void {
+    this.db.prepare('DELETE FROM door_access WHERE site_key = ?').run(siteKey);
   }
 
   loadDoors(): Map<string, DoorRecord> {
