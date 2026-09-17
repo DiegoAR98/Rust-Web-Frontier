@@ -102,5 +102,6 @@ Before writing implementation code, queried the live npm registry rather than tr
 | ID | Decision | Status and reason |
 |---|---|---|
 | D25 | Client SDK is `@colyseus/sdk` (not `colyseus.js`), paired with `@colyseus/schema` v5 matching the server | Required correction; verified against the live npm registry 2026-09-16, see TECHNICAL §1 |
+| D26 | Depend on `@colyseus/core` + `@colyseus/ws-transport` directly, not the `colyseus` umbrella package | Proposed; the umbrella package additionally pulls in unused `@colyseus/auth`/Redis sub-packages. `npm audit` still reports 8 low/moderate advisories because `@colyseus/core` 0.18.14 itself hard-depends on `@colyseus/auth` (OAuth `grant`/`jwk-to-pem`/`elliptic`, and `request-oauth`'s `uuid`), none of which this project's own invite-code/recovery-secret auth (TECHNICAL §5) exercises. `npm audit fix` offers no non-breaking resolution. Accepted as a known risk for the private M0 prototype; re-check before any public exposure per TECHNICAL §10 |
 
 Subsequent changes must record the affected decision IDs, player-visible consequence, evidence and modified acceptance cases. Replacing a default with a new rule is allowed; contradictory rules in separate files are not.
