@@ -32,6 +32,8 @@ function getOrCreateAccountId(): string {
 
 const MOVE_SEND_HZ = 20; // matches TECHNICAL section 3's simulation rate
 const ITEM_WORLD_POSITION = new Vector3(2, 0.5, 2); // client-side placeholder; see note below
+const NODE_WORLD_POSITION = new Vector3(-2, 0.5, 2); // client-side placeholder; matches server's node_1
+const INTERACT_REACH_M = 2.5; // GDD section 5
 
 const statusEl = document.getElementById('status')!;
 const overlayEl = document.getElementById('enterOverlay')!;
@@ -58,11 +60,18 @@ const itemMesh = MeshBuilder.CreateBox('item_1', { size: 0.4 }, scene);
 itemMesh.position.copyFrom(ITEM_WORLD_POSITION);
 itemMesh.material = itemMaterial;
 
+const nodeMaterial = new StandardMaterial('nodeMat', scene);
+nodeMaterial.diffuseColor = new Color3(0.4, 0.3, 0.15);
+const nodeMesh = MeshBuilder.CreateBox('node_1', { width: 0.8, height: 0.5, depth: 0.8 }, scene);
+nodeMesh.position.copyFrom(NODE_WORLD_POSITION);
+nodeMesh.material = nodeMaterial;
+
 const accountId = getOrCreateAccountId();
 let sessionEpoch = 0;
 let sequence = 0;
 let room: Room | undefined;
 let entered = false;
+let inventorySlots: Array<{ definitionId: string; quantity: number } | null> = [];
 
 const keys: KeyState = {
   forward: false,
@@ -103,6 +112,12 @@ window.addEventListener('mousemove', (e) => {
   camera.rotation.y += e.movementX * sensitivity;
 });
 
+// GDD section 5: "Use/aim | Left/right mouse". Gathering is a tool-use
+// action, not the E interact key that takeItem uses.
+window.addEventListener('mousedown', (e) => {
+  if (entered && e.button === 0) attemptHitNode();
+});
+
 // Mouse-look needs pointer lock, but a lock rejection/delay must never block
 // the connection or WASD movement: those are gated on `room`, not `entered`.
 enterButton.addEventListener('click', async () => {
@@ -141,6 +156,10 @@ async function connect(): Promise<void> {
 
   joined.onMessage('commandResult', (payload: { accepted: boolean; reasonCode: string }) => {
     statusEl.dataset.lastResult = `${payload.accepted ? 'ok' : payload.reasonCode}`;
+  });
+
+  joined.onMessage('inventory', (payload: { slots: typeof inventorySlots }) => {
+    inventorySlots = payload.slots;
   });
 
   // Without sharing @rwf/server's concrete schema classes (deliberately not
@@ -192,8 +211,7 @@ function sendMoveCommand(): void {
 
 function attemptTakeItem(): void {
   if (!room) return;
-  const distance = Vector3.Distance(camera.position, ITEM_WORLD_POSITION);
-  if (distance > 2.5) return; // matches GDD section 5's 2.5 m interact reach
+  if (Vector3.Distance(camera.position, ITEM_WORLD_POSITION) > INTERACT_REACH_M) return;
   sequence += 1;
   room.send('command', {
     protocolVersion: PROTOCOL_VERSION,
@@ -201,6 +219,19 @@ function attemptTakeItem(): void {
     sequence,
     clientTick: 0,
     action: { type: 'takeItem', itemInstanceId: 'item_1' },
+  });
+}
+
+function attemptHitNode(): void {
+  if (!room) return;
+  if (Vector3.Distance(camera.position, NODE_WORLD_POSITION) > INTERACT_REACH_M) return;
+  sequence += 1;
+  room.send('command', {
+    protocolVersion: PROTOCOL_VERSION,
+    sessionEpoch,
+    sequence,
+    clientTick: 0,
+    action: { type: 'hitNode', nodeId: 'node_1' },
   });
 }
 
@@ -218,8 +249,9 @@ engine.runRenderLoop(() => {
   const item = room?.state.items?.get('item_1');
   itemMesh.setEnabled(!item || item.claimedBy === '');
 
+  const woodCount = inventorySlots.reduce((sum, slot) => sum + (slot?.definitionId === 'wood' ? slot.quantity : 0), 0);
   statusEl.textContent = room
-    ? `account ${accountId.slice(0, 8)} epoch ${sessionEpoch} players ${room.state.players.size} last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : ' (click canvas to look)'}`
+    ? `account ${accountId.slice(0, 8)} epoch ${sessionEpoch} players ${room.state.players.size} wood ${woodCount} last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : ' (click canvas to look)'}`
     : 'not connected';
 
   scene.render();
