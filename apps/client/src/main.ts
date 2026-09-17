@@ -129,6 +129,20 @@ timberMaterial.diffuseColor = new Color3(0.48, 0.33, 0.16);
 const doorMaterial = new StandardMaterial('doorMat', scene);
 doorMaterial.diffuseColor = new Color3(0.62, 0.45, 0.2);
 
+/**
+ * CONTENT section 7's placed HP, so the HUD can say how damaged something is.
+ * The server is the authority on all of it; these only decide what to show and
+ * which piece the repair key aims at.
+ */
+const PIECE_MAX_HP: Record<string, number> = {
+  foundation: 2000,
+  pillar: 1000,
+  wall: 1000,
+  doorway: 1000,
+  ceiling: 1000,
+};
+const DOOR_MAX_HP: Record<string, number> = { wood_door: 500, metal_door: 1000 };
+
 /** The box each structural form is drawn as, in metres (GDD section 10's grid). */
 const PIECE_SHAPES: Record<string, { width: number; height: number; depth: number }> = {
   foundation: { width: CELL_SIZE_M, height: 0.3, depth: CELL_SIZE_M },
@@ -321,6 +335,7 @@ window.addEventListener('keydown', (e) => {
   if (e.code === 'KeyH') attemptContainerTake();
   // GDD section 10's doors and its two separate grants.
   if (e.code === 'KeyO') attemptOperateDoor();
+  if (e.code === 'KeyP') attemptRepair();
   if (e.code === 'KeyK') attemptSetDoorAccess(!e.shiftKey);
   if (e.code === 'KeyJ') attemptSetBuildAccess(!e.shiftKey);
   const placeable = PLACEABLES.find((entry) => entry.key === e.code);
@@ -800,6 +815,41 @@ function nearestDoorway(): { key: string; site: PieceSite } | undefined {
   return best;
 }
 
+/**
+ * Repairs the most damaged piece in reach (GDD section 10). Most damaged
+ * rather than nearest: after a raid a player is standing among several, and
+ * the one they mean is the one about to fall over.
+ */
+function attemptRepair(): void {
+  if (!room) return;
+  let best: { action: Record<string, unknown>; missing: number } | undefined;
+  for (const [key, piece] of room.state.buildingPieces.entries()) {
+    const site: PieceSite = {
+      form: piece.form as PieceForm,
+      storey: piece.storey,
+      i: piece.i,
+      k: piece.k,
+      axis: piece.axis === '' ? null : (piece.axis as 'x' | 'z'),
+    };
+    const at = worldPositionOf(site);
+    if (Vector3.Distance(camera.position, new Vector3(at.x, at.y, at.z)) > 4) continue;
+
+    const door = room.state.doors.get(key);
+    const candidates: Array<{ health: number; max: number; door: boolean }> = [
+      { health: piece.health, max: PIECE_MAX_HP[piece.form] ?? 0, door: false },
+    ];
+    if (door) candidates.push({ health: door.health, max: DOOR_MAX_HP[door.definitionId] ?? 0, door: true });
+
+    for (const candidate of candidates) {
+      const missing = candidate.max - candidate.health;
+      if (missing <= 0) continue;
+      if (best && missing <= best.missing) continue;
+      best = { action: { type: 'repairStructure', door: candidate.door, ...site }, missing };
+    }
+  }
+  if (best) send(best.action);
+}
+
 function attemptOperateDoor(): void {
   const doorway = nearestDoorway();
   if (!doorway || !room) return;
@@ -1127,7 +1177,9 @@ function describeDoor(): string {
     ? `K/shift-K door access, J/shift-J build access for ${neighbour.slice(0, 8)}`
     : 'nobody nearby to grant access to';
   if (!door) return `empty doorway ${distance.toFixed(1)}m -- 7 then X hangs a door`;
-  return `${door.open ? 'OPEN' : 'shut'} ${distance.toFixed(1)}m (O) : ${grants}`;
+  const max = DOOR_MAX_HP[door.definitionId] ?? 0;
+  const condition = door.health < max ? ` ${door.health.toFixed(0)}/${max} hp` : '';
+  return `${door.open ? 'OPEN' : 'shut'}${condition} ${distance.toFixed(1)}m (O) : ${grants}`;
 }
 
 /** The crate you are standing at, as the server last reported it to you. */
@@ -1233,7 +1285,7 @@ engine.runRenderLoop(() => {
           `last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : `  (${lookError ?? 'click canvas to look'})`}`,
           'WASD move : shift sprint : space jump : LMB swing at what you face : E take',
           'C craft hatchet : N craft crate : 1-8 pick what to place : X place it : Q loot a body : O door',
-          'Z store in crate : H take from crate : M craft one of the selected piece',
+          'Z store in crate : H take from crate : M craft one of the selected piece : P repair',
           'B bandage : V eat : at a station -- F fuel : R input : G light/snuff : T take output',
         ].join('\n')
       : disconnectReason
