@@ -1,6 +1,6 @@
 import { Room, type Client } from '@colyseus/core';
 import { CommandSchema, type Command, type CommandResult } from '@rwf/protocol';
-import { getConsumable, getDeployable, getItem, getRecipe } from '@rwf/content';
+import { getBuildingPiece, getConsumable, getDeployable, getItem, getRecipe } from '@rwf/content';
 import {
   addToInventory,
   applyBleedWound,
@@ -11,6 +11,15 @@ import {
   chooseRespawnAnchor,
   pageOverflowIn,
   validateDeployablePlacement,
+  validatePieceSite,
+  linkedSiteKeys,
+  siteKey,
+  worldPositionOf,
+  PIECES_PER_BUILDING,
+  PIECES_PER_OWNER,
+  PLACEMENT_CLEARANCE_M,
+  WORLD_ENTITY_CAP,
+  type PieceSite,
   type CorpseInventory,
   type ItemStack,
   type RespawnAnchor,
@@ -69,6 +78,7 @@ import {
 import { WorldStore, type CorpseRecord, type StatusEffectRecord, type Vec3 } from './persistence.js';
 import {
   CarcassState,
+  BuildingPieceState,
   CorpseState,
   CreatureState,
   DeployableState,
@@ -114,6 +124,14 @@ const INTERACT_REACH_M = 2.5;
  * enough never to refuse honest play, far too tight to farm from across the map.
  */
 const INTERACT_REACH_TOLERANCE_M = 1;
+/**
+ * How far a builder can snap a piece. GDD section 10 gives no figure, and the
+ * interact reach is too short for it: a 4 m cell's centre is 2.8 m from the
+ * corner a player is standing on before the eye height is counted, so a
+ * builder could not place the foundation they are stood on. Six metres lets
+ * them build the cell they occupy and the one next to it, and no further.
+ */
+const BUILD_REACH_M = 6;
 /** Camera offset above the player's feet; the client measures reach from here. */
 const EYE_HEIGHT_M = 1.7;
 /**
@@ -345,6 +363,21 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   >();
   private readonly deployableViewers = new Map<string, Set<string>>();
   private nextDeployableId = 1;
+  /**
+   * Placed structural pieces, keyed by grid site (GDD section 10). Unlike a
+   * crate a piece holds nothing, so this only carries what the schema cannot:
+   * the site itself and when it went up.
+   */
+  private readonly buildingPieces = new Map<
+    string,
+    { definitionId: string; ownerAccountId: string; site: PieceSite; placedAtTick: number }
+  >();
+  /**
+   * Undirected structural adjacency, maintained as pieces go up. Building
+   * membership is walked from here rather than stored as a cluster id, which
+   * would go stale the first time a collapse split a building in two.
+   */
+  private readonly pieceLinks = new Map<string, Set<string>>();
 
   onCreate(): void {
     // TECHNICAL section 17: the world keeps running even when nobody is
@@ -440,6 +473,38 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       const restoredNumber = Number(deployableId.replace('deployable_', ''));
       if (Number.isFinite(restoredNumber)) {
         this.nextDeployableId = Math.max(this.nextDeployableId, restoredNumber + 1);
+      }
+    }
+    for (const [key, record] of this.store.loadBuildingPieces()) {
+      const site: PieceSite = {
+        form: record.form as PieceSite['form'],
+        storey: record.storey,
+        i: record.i,
+        k: record.k,
+        axis: (record.axis as PieceSite['axis']) ?? null,
+      };
+      this.buildingPieces.set(key, {
+        definitionId: record.definitionId,
+        ownerAccountId: record.ownerAccountId,
+        site,
+        placedAtTick: record.placedAtTick,
+      });
+      const replicated = new BuildingPieceState();
+      replicated.definitionId = record.definitionId;
+      replicated.ownerAccountId = record.ownerAccountId;
+      replicated.form = record.form;
+      replicated.storey = record.storey;
+      replicated.i = record.i;
+      replicated.k = record.k;
+      replicated.axis = record.axis ?? '';
+      replicated.health = record.health;
+      this.state.buildingPieces.set(key, replicated);
+    }
+    // Rebuilt after every piece is back, because a link needs both ends to
+    // exist and the rows come out of SQLite in no particular order.
+    for (const [key, piece] of this.buildingPieces) {
+      for (const linked of linkedSiteKeys(piece.site)) {
+        if (this.buildingPieces.has(linked)) this.linkPieces(key, linked);
       }
     }
     for (const [accountId, diedAtTick] of this.store.loadDeadAccounts()) {
@@ -977,6 +1042,163 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       this.persistDeployable(deployableId);
     });
     return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  /**
+   * Every piece in the same connected building as this site, walked over the
+   * structural adjacency. GDD section 10 needs it twice: for "only a building
+   * owner or explicit builder can attach to its grid", and for the
+   * 1000-pieces-per-building cap.
+   */
+  private buildingFrom(seeds: string[]): Set<string> {
+    const seen = new Set<string>();
+    const queue = seeds.filter((key) => this.buildingPieces.has(key));
+    for (const key of queue) seen.add(key);
+    while (queue.length > 0) {
+      const key = queue.shift()!;
+      for (const neighbour of this.pieceLinks.get(key) ?? []) {
+        if (seen.has(neighbour) || !this.buildingPieces.has(neighbour)) continue;
+        seen.add(neighbour);
+        queue.push(neighbour);
+      }
+    }
+    return seen;
+  }
+
+  /**
+   * GDD section 10's placement: "Craft each piece into an inventory item,
+   * equip it and place its ghost. A server-accepted placement consumes one
+   * item." Same capacity-before-consume order as everything else -- the piece
+   * stays in the pack unless every rule passes.
+   */
+  private resolvePlaceBuildingPiece(
+    accountId: string,
+    definitionId: string,
+    site: PieceSite,
+    sequence: number,
+  ): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    const definition = getBuildingPiece(definitionId);
+    // A mismatch would let one recipe pay for another piece's cost and HP.
+    if (!definition || definition.form !== site.form) {
+      return { ...base, accepted: false, reasonCode: 'not_found' };
+    }
+
+    const slots = this.playerSlots.get(accountId) ?? [];
+    if (countInInventory(slots, definitionId) < 1) {
+      return { ...base, accepted: false, reasonCode: 'insufficient_resources' };
+    }
+
+    const movement = this.movementByAccount.get(accountId);
+    if (!movement) return { ...base, accepted: false, reasonCode: 'not_found' };
+
+    const placed = new Set(this.buildingPieces.keys());
+    const refusal = validatePieceSite(site, placed);
+    if (refusal === 'occupied') return { ...base, accepted: false, reasonCode: 'overlap' };
+    if (refusal === 'unsupported') return { ...base, accepted: false, reasonCode: 'unsupported' };
+    if (refusal === 'too_high') return { ...base, accepted: false, reasonCode: 'cap_reached' };
+
+    const position = worldPositionOf(site);
+    const dx = position.x - movement.position.x;
+    const dy = position.y - (movement.position.y + EYE_HEIGHT_M);
+    const dz = position.z - movement.position.z;
+    if (Math.sqrt(dx * dx + dy * dy + dz * dz) > BUILD_REACH_M) {
+      return { ...base, accepted: false, reasonCode: 'out_of_range' };
+    }
+
+    // "Reject overlap with players, sleepers, containers, resource anchors or
+    // world geometry."
+    for (const [otherId, other] of this.movementByAccount) {
+      if (otherId === accountId) continue;
+      if (Math.hypot(position.x - other.position.x, position.z - other.position.z) < PLACEMENT_CLEARANCE_M) {
+        return { ...base, accepted: false, reasonCode: 'overlap' };
+      }
+    }
+    for (const blocker of [
+      ...[...this.deployables.values()].map((d) => d.position),
+      ...[...this.stationConfigs.values()].map((c) => c.position),
+      ...[...this.nodeConfigs.values()].map((c) => c.position),
+    ]) {
+      if (Math.hypot(position.x - blocker.x, position.z - blocker.z) < PLACEMENT_CLEARANCE_M) {
+        return { ...base, accepted: false, reasonCode: 'overlap' };
+      }
+    }
+
+    const links = linkedSiteKeys(site).filter((key) => this.buildingPieces.has(key));
+    const building = this.buildingFrom(links);
+    for (const key of building) {
+      if (this.buildingPieces.get(key)!.ownerAccountId !== accountId) {
+        // "Only a building owner or explicit builder can attach to its grid";
+        // there is no builder list yet, so it is the owner alone.
+        return { ...base, accepted: false, reasonCode: 'forbidden' };
+      }
+    }
+
+    let ownerPieceCount = 0;
+    for (const piece of this.buildingPieces.values()) {
+      if (piece.ownerAccountId === accountId) ownerPieceCount += 1;
+    }
+    if (
+      ownerPieceCount >= PIECES_PER_OWNER ||
+      building.size >= PIECES_PER_BUILDING ||
+      this.buildingPieces.size + this.deployables.size >= WORLD_ENTITY_CAP
+    ) {
+      return { ...base, accepted: false, reasonCode: 'cap_reached' };
+    }
+
+    const key = siteKey(site);
+    const { slots: remaining } = removeFromInventory(slots, definitionId, 1);
+    this.playerSlots.set(accountId, remaining);
+    this.buildingPieces.set(key, {
+      definitionId,
+      ownerAccountId: accountId,
+      site: { ...site },
+      placedAtTick: this.state.tick,
+    });
+    for (const linked of links) {
+      this.linkPieces(key, linked);
+    }
+    // Also link to anything already standing that this piece holds up -- a
+    // pillar placed after its ceiling was impossible, but a foundation placed
+    // next to another one is not, and the link has to go both ways.
+    for (const [otherKey, other] of this.buildingPieces) {
+      if (otherKey === key) continue;
+      if (linkedSiteKeys(other.site).includes(key)) this.linkPieces(key, otherKey);
+    }
+
+    const replicated = new BuildingPieceState();
+    replicated.definitionId = definitionId;
+    replicated.ownerAccountId = accountId;
+    replicated.form = site.form;
+    replicated.storey = site.storey;
+    replicated.i = site.i;
+    replicated.k = site.k;
+    replicated.axis = site.axis ?? '';
+    replicated.health = definition.placedHp;
+    this.state.buildingPieces.set(key, replicated);
+
+    this.store.runInTransaction(() => {
+      this.store.savePlayerSlots(accountId, remaining);
+      this.store.saveBuildingPiece(key, {
+        definitionId,
+        ownerAccountId: accountId,
+        form: site.form,
+        storey: site.storey,
+        i: site.i,
+        k: site.k,
+        axis: site.axis,
+        health: definition.placedHp,
+        placedAtTick: this.state.tick,
+      });
+    });
+    return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  private linkPieces(a: string, b: string): void {
+    if (!this.pieceLinks.has(a)) this.pieceLinks.set(a, new Set());
+    if (!this.pieceLinks.has(b)) this.pieceLinks.set(b, new Set());
+    this.pieceLinks.get(a)!.add(b);
+    this.pieceLinks.get(b)!.add(a);
   }
 
   private persistDeployable(deployableId: string): void {
@@ -1773,6 +1995,18 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       const { definitionId, x, y, z } = command.action;
       const encoded = this.store.commitOutcome(key, () =>
         JSON.stringify(this.resolvePlaceDeployable(accountId, definitionId, { x, y, z }, command.sequence)),
+      );
+      client.send('commandResult', JSON.parse(encoded) as CommandResult);
+      client.send('inventory', { slots: this.playerSlots.get(accountId) });
+      return;
+    }
+
+    if (command.action.type === 'placeBuildingPiece') {
+      const { definitionId, form, storey, i, k, axis } = command.action;
+      const encoded = this.store.commitOutcome(key, () =>
+        JSON.stringify(
+          this.resolvePlaceBuildingPiece(accountId, definitionId, { form, storey, i, k, axis }, command.sequence),
+        ),
       );
       client.send('commandResult', JSON.parse(encoded) as CommandResult);
       client.send('inventory', { slots: this.playerSlots.get(accountId) });

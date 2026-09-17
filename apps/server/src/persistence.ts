@@ -133,6 +133,31 @@ interface DeployableSlotRow {
   quantity: number;
 }
 
+export interface BuildingPieceRecord {
+  definitionId: string;
+  ownerAccountId: string;
+  form: string;
+  storey: number;
+  i: number;
+  k: number;
+  axis: string | null;
+  health: number;
+  placedAtTick: number;
+}
+
+interface BuildingPieceRow {
+  site_key: string;
+  definition_id: string;
+  owner_account_id: string;
+  form: string;
+  storey: number;
+  i: number;
+  k: number;
+  axis: string | null;
+  health: number;
+  placed_at_tick: number;
+}
+
 export interface StationRecord {
   kind: StationKind;
   lit: boolean;
@@ -349,6 +374,18 @@ export class WorldStore {
         x REAL NOT NULL,
         y REAL NOT NULL,
         z REAL NOT NULL,
+        health REAL NOT NULL,
+        placed_at_tick INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS building_pieces (
+        site_key TEXT PRIMARY KEY,
+        definition_id TEXT NOT NULL,
+        owner_account_id TEXT NOT NULL,
+        form TEXT NOT NULL,
+        storey INTEGER NOT NULL,
+        i INTEGER NOT NULL,
+        k INTEGER NOT NULL,
+        axis TEXT,
         health REAL NOT NULL,
         placed_at_tick INTEGER NOT NULL
       );
@@ -962,6 +999,64 @@ export class WorldStore {
       const deployable = result.get(slot.deployable_id);
       if (!deployable) continue;
       deployable.slots[slot.slot_index] = { definitionId: slot.definition_id, quantity: slot.quantity };
+    }
+    return result;
+  }
+
+  /**
+   * A placed structural piece, keyed by its grid site. Class-1 like every
+   * other placement: the item is consumed at the commit, so the piece has to
+   * be on disk at the commit too.
+   */
+  saveBuildingPiece(siteKey: string, piece: BuildingPieceRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO building_pieces
+           (site_key, definition_id, owner_account_id, form, storey, i, k, axis, health, placed_at_tick)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(site_key) DO UPDATE SET
+           definition_id = excluded.definition_id, owner_account_id = excluded.owner_account_id,
+           form = excluded.form, storey = excluded.storey, i = excluded.i, k = excluded.k,
+           axis = excluded.axis, health = excluded.health, placed_at_tick = excluded.placed_at_tick`,
+      )
+      .run(
+        siteKey,
+        piece.definitionId,
+        piece.ownerAccountId,
+        piece.form,
+        piece.storey,
+        piece.i,
+        piece.k,
+        piece.axis,
+        piece.health,
+        piece.placedAtTick,
+      );
+  }
+
+  deleteBuildingPiece(siteKey: string): void {
+    this.db.prepare('DELETE FROM building_pieces WHERE site_key = ?').run(siteKey);
+  }
+
+  loadBuildingPieces(): Map<string, BuildingPieceRecord> {
+    const rows = this.db
+      .prepare(
+        `SELECT site_key, definition_id, owner_account_id, form, storey, i, k, axis, health, placed_at_tick
+         FROM building_pieces`,
+      )
+      .all() as BuildingPieceRow[];
+    const result = new Map<string, BuildingPieceRecord>();
+    for (const row of rows) {
+      result.set(row.site_key, {
+        definitionId: row.definition_id,
+        ownerAccountId: row.owner_account_id,
+        form: row.form,
+        storey: row.storey,
+        i: row.i,
+        k: row.k,
+        axis: row.axis,
+        health: row.health,
+        placedAtTick: row.placed_at_tick,
+      });
     }
     return result;
   }

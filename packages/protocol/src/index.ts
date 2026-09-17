@@ -96,6 +96,26 @@ export const PlaceDeployableIntentSchema = z.object({
 });
 export type PlaceDeployableIntent = z.infer<typeof PlaceDeployableIntentSchema>;
 
+/**
+ * Places a structural piece at a grid site (GDD section 10). The site is named
+ * in grid terms rather than metres because a piece is snapped: a position
+ * would have to be reverse-engineered back into a cell, and rounding at a cell
+ * boundary would decide which one. The server still checks that the builder
+ * can reach it.
+ */
+export const PlaceBuildingPieceIntentSchema = z.object({
+  type: z.literal('placeBuildingPiece'),
+  definitionId: z.string().min(1).max(64),
+  form: z.enum(['foundation', 'pillar', 'wall', 'doorway', 'ceiling']),
+  // Bounded so a forged command cannot ask for a site at 1e300 and make the
+  // server carry the number around.
+  storey: z.number().int().min(0).max(16),
+  i: z.number().int().min(-4096).max(4096),
+  k: z.number().int().min(-4096).max(4096),
+  axis: z.enum(['x', 'z']).nullable(),
+});
+export type PlaceBuildingPieceIntent = z.infer<typeof PlaceBuildingPieceIntentSchema>;
+
 const containerId = () => z.string().min(1).max(64);
 
 /** Moves items from the pack into a placed container (GDD section 8). */
@@ -158,6 +178,7 @@ export const ActionPayloadSchema = z.discriminatedUnion('type', [
   RespawnIntentSchema,
   CorpseTakeIntentSchema,
   PlaceDeployableIntentSchema,
+  PlaceBuildingPieceIntentSchema,
   ContainerInsertIntentSchema,
   ContainerTakeIntentSchema,
 ]);
@@ -196,6 +217,10 @@ export const REASON_CODES = [
   // which rule it broke rather than just turning red.
   'overlap',
   'cap_reached',
+  // GDD section 10's support rules: nothing holds this site up.
+  'unsupported',
+  // The actor is not the building's owner or an authorised builder.
+  'forbidden',
 ] as const;
 export type ReasonCode = (typeof REASON_CODES)[number];
 

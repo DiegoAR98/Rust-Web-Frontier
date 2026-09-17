@@ -94,6 +94,27 @@ export const DeployableState = schema(
 );
 export type DeployableState = SchemaType<typeof DeployableState>;
 
+/**
+ * A placed structural piece (GDD section 10). Keyed by its site, which is why
+ * the grid coordinates ride along: a client draws it from them, and there is
+ * no position to round. Public like every other piece of world geometry.
+ */
+export const BuildingPieceState = schema(
+  {
+    definitionId: t.string().default(''),
+    ownerAccountId: t.string().default(''),
+    form: t.string().default(''),
+    storey: t.number().default(0),
+    i: t.number().default(0),
+    k: t.number().default(0),
+    /** 'x', 'z', or empty for the forms that sit on a cell or corner. */
+    axis: t.string().default(''),
+    health: t.number().default(0),
+  },
+  'BuildingPieceState',
+);
+export type BuildingPieceState = SchemaType<typeof BuildingPieceState>;
+
 export const WorldState = schema(
   {
     players: t.map(PlayerState),
@@ -102,6 +123,7 @@ export const WorldState = schema(
     carcasses: t.map(CarcassState),
     corpses: t.map(CorpseState),
     deployables: t.map(DeployableState),
+    buildingPieces: t.map(BuildingPieceState),
     tick: t.number().default(0),
   },
   'WorldState',
