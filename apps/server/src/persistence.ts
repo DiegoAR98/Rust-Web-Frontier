@@ -13,6 +13,34 @@ interface WorldClockRow {
   tick: number;
 }
 
+export interface PlayerTransform {
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+  grounded: boolean;
+}
+
+interface PlayerCheckpointRow {
+  account_id: string;
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+  grounded: number;
+}
+
+export interface ItemClaim {
+  definitionId: string;
+  claimedBy: string | null;
+}
+
+interface ItemClaimRow {
+  instance_id: string;
+  definition_id: string;
+  claimed_by: string | null;
+}
+
 /**
  * Durable backing store for session epochs, committed transaction outcomes
  * and the world tick counter (TECHNICAL section 7). A single writer opens
@@ -44,6 +72,19 @@ export class WorldStore {
       CREATE TABLE IF NOT EXISTS world_clock (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         tick INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS player_checkpoints (
+        account_id TEXT PRIMARY KEY,
+        x REAL NOT NULL,
+        y REAL NOT NULL,
+        z REAL NOT NULL,
+        yaw REAL NOT NULL,
+        grounded INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS item_claims (
+        instance_id TEXT PRIMARY KEY,
+        definition_id TEXT NOT NULL,
+        claimed_by TEXT
       );
     `);
   }
@@ -111,6 +152,68 @@ export class WorldStore {
       | WorldClockRow
       | undefined;
     return row?.tick ?? 0;
+  }
+
+  /**
+   * Continuous-state checkpoint for one player's transform (TECHNICAL
+   * section 7: "checkpoint every 5 seconds, without overwriting newer
+   * committed transaction state"). Overwrites in place -- this is a
+   * rolling checkpoint, not a history log.
+   */
+  savePlayerCheckpoint(accountId: string, transform: PlayerTransform): void {
+    this.db
+      .prepare(
+        `INSERT INTO player_checkpoints (account_id, x, y, z, yaw, grounded) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(account_id) DO UPDATE SET
+           x = excluded.x, y = excluded.y, z = excluded.z,
+           yaw = excluded.yaw, grounded = excluded.grounded`,
+      )
+      .run(accountId, transform.x, transform.y, transform.z, transform.yaw, transform.grounded ? 1 : 0);
+  }
+
+  loadPlayerCheckpoints(): Map<string, PlayerTransform> {
+    const rows = this.db
+      .prepare('SELECT account_id, x, y, z, yaw, grounded FROM player_checkpoints')
+      .all() as PlayerCheckpointRow[];
+    const result = new Map<string, PlayerTransform>();
+    for (const row of rows) {
+      result.set(row.account_id, {
+        x: row.x,
+        y: row.y,
+        z: row.z,
+        yaw: row.yaw,
+        grounded: row.grounded === 1,
+      });
+    }
+    return result;
+  }
+
+  /**
+   * Persists an item's existence and current claim atomically at commit
+   * time (a class-1 committed transaction per TECHNICAL section 7, not a
+   * periodic checkpoint): a reconnect issues a new session epoch, so the
+   * transaction-key dedup alone cannot catch a resent "take item" command
+   * after a restart. The underlying claim state itself must survive.
+   */
+  saveItemClaim(instanceId: string, definitionId: string, claimedBy: string | null): void {
+    this.db
+      .prepare(
+        `INSERT INTO item_claims (instance_id, definition_id, claimed_by) VALUES (?, ?, ?)
+         ON CONFLICT(instance_id) DO UPDATE SET
+           definition_id = excluded.definition_id, claimed_by = excluded.claimed_by`,
+      )
+      .run(instanceId, definitionId, claimedBy);
+  }
+
+  loadItemClaims(): Map<string, ItemClaim> {
+    const rows = this.db
+      .prepare('SELECT instance_id, definition_id, claimed_by FROM item_claims')
+      .all() as ItemClaimRow[];
+    const result = new Map<string, ItemClaim>();
+    for (const row of rows) {
+      result.set(row.instance_id, { definitionId: row.definition_id, claimedBy: row.claimed_by });
+    }
+    return result;
   }
 
   close(): void {

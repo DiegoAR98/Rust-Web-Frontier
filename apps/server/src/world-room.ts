@@ -1,20 +1,13 @@
 import { Room, type Client } from '@colyseus/core';
 import { CommandSchema, type Command, type CommandResult } from '@rwf/protocol';
-import {
-  beginSession,
-  commitOutcome,
-  isSessionActive,
-  stepMovement,
-  takeItem as simTakeItem,
-  type MovementState,
-  type SessionRegistry,
-  type TransactionLog,
-  type WorldItem,
-} from '@rwf/sim';
+import { stepMovement, takeItem as simTakeItem, type MovementState, type WorldItem } from '@rwf/sim';
+import { WorldStore } from './persistence.js';
 import { PlayerState, WorldItemState, WorldState } from './world-state.js';
 
 /** Matches TECHNICAL section 3's simulation budget: 20 fixed ticks/s. */
 const TICK_RATE_HZ = 20;
+/** TECHNICAL section 7: continuous state checkpoints every 5 seconds. */
+const CHECKPOINT_INTERVAL_TICKS = 5 * TICK_RATE_HZ;
 
 interface ClientUserData {
   accountId: string;
@@ -25,17 +18,46 @@ type RoomClient = Client<{ userData: ClientUserData }>;
 type MoveAction = Extract<Command['action'], { type: 'move' }>;
 
 export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
-  private readonly sessionRegistry: SessionRegistry = { currentEpoch: new Map() };
-  private readonly transactionLog: TransactionLog<CommandResult> = { committed: new Map() };
+  private store!: WorldStore;
   private readonly worldItems = new Map<string, WorldItem>();
   private readonly movementByAccount = new Map<string, MovementState>();
   private readonly pendingMove = new Map<string, MoveAction>();
 
-  onCreate(): void {
+  onCreate(options: { dbPath?: string }): void {
     // TECHNICAL section 17: the world keeps running even when nobody is
     // connected. It is stopped only by stopping the host process.
     this.autoDispose = false;
+    this.store = new WorldStore(options?.dbPath ?? ':memory:');
     this.state = new WorldState();
+
+    // Crash recovery (TECHNICAL section 7): resume from the last
+    // checkpoint rather than starting a fresh world.
+    this.state.tick = this.store.loadWorldTick();
+    for (const [accountId, transform] of this.store.loadPlayerCheckpoints()) {
+      const player = new PlayerState();
+      player.x = transform.x;
+      player.y = transform.y;
+      player.z = transform.z;
+      player.yaw = transform.yaw;
+      player.grounded = transform.grounded;
+      this.state.players.set(accountId, player);
+      this.movementByAccount.set(accountId, {
+        position: { x: transform.x, y: transform.y, z: transform.z },
+        velocityY: 0,
+        grounded: transform.grounded,
+      });
+    }
+    for (const [instanceId, claim] of this.store.loadItemClaims()) {
+      this.worldItems.set(instanceId, {
+        instanceId,
+        definitionId: claim.definitionId,
+        claimedBy: claim.claimedBy,
+      });
+      const item = new WorldItemState();
+      item.definitionId = claim.definitionId;
+      item.claimedBy = claim.claimedBy ?? '';
+      this.state.items.set(instanceId, item);
+    }
 
     this.onMessage('command', CommandSchema, (client, command) => {
       this.handleCommand(client, command);
@@ -44,9 +66,29 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.setFixedTimestep((ctx) => this.tick(ctx.dt), TICK_RATE_HZ);
   }
 
+  onDispose(): void {
+    this.checkpoint();
+    this.store.close();
+  }
+
+  /** Persists the tick counter and every known player's transform. Public for tests/ops. */
+  checkpoint(): void {
+    this.store.saveWorldTick(this.state.tick);
+    for (const [accountId, movement] of this.movementByAccount) {
+      this.store.savePlayerCheckpoint(accountId, {
+        x: movement.position.x,
+        y: movement.position.y,
+        z: movement.position.z,
+        yaw: this.state.players.get(accountId)?.yaw ?? 0,
+        grounded: movement.grounded,
+      });
+    }
+  }
+
   /** Seeds a world item for tests/tools; not a player-facing command. */
   spawnItem(instanceId: string, definitionId: string): void {
     this.worldItems.set(instanceId, { instanceId, definitionId, claimedBy: null });
+    this.store.saveItemClaim(instanceId, definitionId, null);
     const item = new WorldItemState();
     item.definitionId = definitionId;
     this.state.items.set(instanceId, item);
@@ -58,7 +100,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       throw new Error('accountId is required to join the world');
     }
 
-    const sessionEpoch = beginSession(this.sessionRegistry, accountId);
+    const sessionEpoch = this.store.beginSession(accountId);
     client.userData = { accountId, sessionEpoch };
     // Deferred one tick: sending synchronously from onJoin can race the
     // client SDK's own post-join message listener registration.
@@ -89,7 +131,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private handleCommand(client: RoomClient, command: Command): void {
     if (!client.userData) return;
     const { accountId, sessionEpoch } = client.userData;
-    if (command.sessionEpoch !== sessionEpoch || !isSessionActive(this.sessionRegistry, accountId, command.sessionEpoch)) {
+    if (command.sessionEpoch !== sessionEpoch || !this.store.isSessionActive(accountId, command.sessionEpoch)) {
       // A delayed packet from a session a reconnect already replaced.
       const result: CommandResult = {
         sequence: command.sequence,
@@ -108,10 +150,10 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
 
     const itemInstanceId = command.action.itemInstanceId;
     const key = { accountId, sessionEpoch: command.sessionEpoch, sequence: command.sequence };
-    const result = commitOutcome<CommandResult>(this.transactionLog, key, () =>
-      this.resolveTakeItem(accountId, itemInstanceId, command.sequence),
+    const encoded = this.store.commitOutcome(key, () =>
+      JSON.stringify(this.resolveTakeItem(accountId, itemInstanceId, command.sequence)),
     );
-    client.send('commandResult', result);
+    client.send('commandResult', JSON.parse(encoded) as CommandResult);
   }
 
   private resolveTakeItem(accountId: string, itemInstanceId: string, sequence: number): CommandResult {
@@ -121,6 +163,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       const stateItem = this.state.items.get(itemInstanceId);
       if (stateItem) {
         stateItem.claimedBy = accountId;
+        this.store.saveItemClaim(itemInstanceId, stateItem.definitionId, accountId);
       }
       return { ...base, accepted: true, reasonCode: 'ok' };
     }
@@ -143,6 +186,10 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       player.z = next.position.z;
       player.yaw = action.yaw;
       player.grounded = next.grounded;
+    }
+
+    if (this.state.tick % CHECKPOINT_INTERVAL_TICKS === 0) {
+      this.checkpoint();
     }
   }
 }

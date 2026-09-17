@@ -85,3 +85,64 @@ describe('WorldStore world clock freeze (T17)', () => {
     expect(tick).toBe(0);
   });
 });
+
+describe('WorldStore player transform checkpoints (T04/T17 continuous state)', () => {
+  it('restores a player at their last checkpointed transform after a restart', () => {
+    const before = new WorldStore(dbFile);
+    before.savePlayerCheckpoint('acct_1', { x: 1.5, y: 0, z: 9.25, yaw: 1.2, grounded: true });
+    before.close();
+
+    const after = new WorldStore(dbFile);
+    const checkpoints = after.loadPlayerCheckpoints();
+    after.close();
+
+    expect(checkpoints.get('acct_1')).toEqual({ x: 1.5, y: 0, z: 9.25, yaw: 1.2, grounded: true });
+  });
+
+  it('overwrites a player\'s prior checkpoint rather than accumulating history', () => {
+    const store = new WorldStore(dbFile);
+    store.savePlayerCheckpoint('acct_1', { x: 0, y: 0, z: 0, yaw: 0, grounded: true });
+    store.savePlayerCheckpoint('acct_1', { x: 10, y: 0, z: 0, yaw: 0, grounded: false });
+
+    const checkpoints = store.loadPlayerCheckpoints();
+    store.close();
+
+    expect(checkpoints.size).toBe(1);
+    expect(checkpoints.get('acct_1')).toEqual({ x: 10, y: 0, z: 0, yaw: 0, grounded: false });
+  });
+
+  it('returns no checkpoints for a brand-new world', () => {
+    const store = new WorldStore(dbFile);
+    const checkpoints = store.loadPlayerCheckpoints();
+    store.close();
+
+    expect(checkpoints.size).toBe(0);
+  });
+});
+
+describe('WorldStore item claim durability (T04)', () => {
+  it('restores an unclaimed spawned item after a restart', () => {
+    const before = new WorldStore(dbFile);
+    before.saveItemClaim('item_1', 'wood', null);
+    before.close();
+
+    const after = new WorldStore(dbFile);
+    const items = after.loadItemClaims();
+    after.close();
+
+    expect(items.get('item_1')).toEqual({ definitionId: 'wood', claimedBy: null });
+  });
+
+  it('restores an already-claimed item as claimed, so a retried take cannot grant it twice', () => {
+    const before = new WorldStore(dbFile);
+    before.saveItemClaim('item_1', 'wood', null);
+    before.saveItemClaim('item_1', 'wood', 'acct_a');
+    before.close();
+
+    const after = new WorldStore(dbFile);
+    const items = after.loadItemClaims();
+    after.close();
+
+    expect(items.get('item_1')).toEqual({ definitionId: 'wood', claimedBy: 'acct_a' });
+  });
+});
