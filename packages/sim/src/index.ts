@@ -7,3 +7,4 @@ export * from './bleed.js';
 export * from './processing.js';
 export * from './carcass.js';
 export * from './stacks.js';
+export * from './crafting.js';
