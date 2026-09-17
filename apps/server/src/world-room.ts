@@ -546,6 +546,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         slots: padSlots(record.slots, definition.slots),
       });
       if (record.anchorReadyAtTick > 0) this.anchorReadyAtTick.set(deployableId, record.anchorReadyAtTick);
+      this.lastActivityTick.set(deployableId, record.lastActivityTick);
       const replicated = new DeployableState();
       replicated.definitionId = record.definitionId;
       replicated.ownerAccountId = record.ownerAccountId;
@@ -575,6 +576,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         site,
         placedAtTick: record.placedAtTick,
       });
+      // GDD section 10's decay clock has to survive the restart, or a host
+      // that restarts nightly never lets anything rot.
+      this.lastActivityTick.set(key, record.lastActivityTick);
       const replicated = new BuildingPieceState();
       replicated.definitionId = record.definitionId;
       replicated.ownerAccountId = record.ownerAccountId;
@@ -760,8 +764,15 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       // of hits, and writing each one would put an fsync on the game loop per
       // swing. T04 allows losing up to 5 s of continuous state, which is a few
       // swings of damage; destruction itself is class-1 and already written.
+      // The decay activity stamp rides along: it is continuous state too, and
+      // losing a few seconds of it only costs a few more seconds of grace.
+      // Kept in memory only, a nightly restart would reset every base's decay
+      // clock and nothing in the world would ever rot.
       for (const [key, replicated] of this.state.buildingPieces) {
-        this.store.saveBuildingPieceHealth(key, replicated.health);
+        this.store.saveBuildingPieceHealth(key, replicated.health, this.lastActivityTick.get(key) ?? 0);
+      }
+      for (const [id, replicated] of this.state.deployables) {
+        this.store.saveDeployableHealth(id, replicated.health, this.lastActivityTick.get(id) ?? 0);
       }
       for (const [key, replicated] of this.state.doors) {
         this.store.saveDoorHealth(key, replicated.health);
@@ -1391,6 +1402,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         axis: site.axis,
         health: definition.placedHp,
         placedAtTick: this.state.tick,
+        lastActivityTick: this.state.tick,
       });
     });
     return { ...base, accepted: true, reasonCode: 'ok' };
@@ -1864,6 +1876,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       health: this.state.deployables.get(deployableId)?.health ?? 0,
       placedAtTick: deployable.placedAtTick,
       anchorReadyAtTick: this.anchorReadyAtTick.get(deployableId) ?? 0,
+      lastActivityTick: this.lastActivityTick.get(deployableId) ?? this.state.tick,
       slots: deployable.slots,
     });
   }

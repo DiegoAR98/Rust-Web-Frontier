@@ -124,6 +124,8 @@ export interface DeployableRecord {
    * every bedroll in the world instantly ready.
    */
   anchorReadyAtTick: number;
+  /** When an owner was last standing near it; GDD section 10's decay clock. */
+  lastActivityTick: number;
   slots: Slot[];
 }
 
@@ -137,6 +139,7 @@ interface DeployableRow {
   health: number;
   placed_at_tick: number;
   anchor_ready_at_tick: number;
+  last_activity_tick: number;
 }
 
 interface DeployableSlotRow {
@@ -156,6 +159,8 @@ export interface BuildingPieceRecord {
   axis: string | null;
   health: number;
   placedAtTick: number;
+  /** When an owner was last standing near it; GDD section 10's decay clock. */
+  lastActivityTick: number;
 }
 
 interface BuildingPieceRow {
@@ -169,6 +174,7 @@ interface BuildingPieceRow {
   axis: string | null;
   health: number;
   placed_at_tick: number;
+  last_activity_tick: number;
 }
 
 export interface DoorRecord {
@@ -421,7 +427,8 @@ export class WorldStore {
         z REAL NOT NULL,
         health REAL NOT NULL,
         placed_at_tick INTEGER NOT NULL,
-        anchor_ready_at_tick INTEGER NOT NULL DEFAULT 0
+        anchor_ready_at_tick INTEGER NOT NULL DEFAULT 0,
+        last_activity_tick INTEGER NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS building_pieces (
         site_key TEXT PRIMARY KEY,
@@ -433,7 +440,8 @@ export class WorldStore {
         k INTEGER NOT NULL,
         axis TEXT,
         health REAL NOT NULL,
-        placed_at_tick INTEGER NOT NULL
+        placed_at_tick INTEGER NOT NULL,
+        last_activity_tick INTEGER NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS doors (
         site_key TEXT PRIMARY KEY,
@@ -1009,13 +1017,14 @@ export class WorldStore {
         .prepare(
           `INSERT INTO deployables
              (deployable_id, definition_id, owner_account_id, x, y, z, health, placed_at_tick,
-              anchor_ready_at_tick)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              anchor_ready_at_tick, last_activity_tick)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(deployable_id) DO UPDATE SET
              definition_id = excluded.definition_id, owner_account_id = excluded.owner_account_id,
              x = excluded.x, y = excluded.y, z = excluded.z, health = excluded.health,
              placed_at_tick = excluded.placed_at_tick,
-             anchor_ready_at_tick = excluded.anchor_ready_at_tick`,
+             anchor_ready_at_tick = excluded.anchor_ready_at_tick,
+             last_activity_tick = excluded.last_activity_tick`,
         )
         .run(
           deployableId,
@@ -1027,6 +1036,7 @@ export class WorldStore {
           record.health,
           record.placedAtTick,
           record.anchorReadyAtTick,
+          record.lastActivityTick,
         );
       this.db.prepare('DELETE FROM deployable_slots WHERE deployable_id = ?').run(deployableId);
       const insert = this.db.prepare(
@@ -1051,7 +1061,7 @@ export class WorldStore {
     const rows = this.db
       .prepare(
         `SELECT deployable_id, definition_id, owner_account_id, x, y, z, health, placed_at_tick,
-                anchor_ready_at_tick
+                anchor_ready_at_tick, last_activity_tick
          FROM deployables`,
       )
       .all() as DeployableRow[];
@@ -1068,6 +1078,7 @@ export class WorldStore {
         health: row.health,
         placedAtTick: row.placed_at_tick,
         anchorReadyAtTick: row.anchor_ready_at_tick,
+        lastActivityTick: row.last_activity_tick,
         // Sparse on purpose: only occupied slots are stored, so the room pads
         // back out to the definition's slot count when it restores.
         slots: [],
@@ -1090,12 +1101,14 @@ export class WorldStore {
     this.db
       .prepare(
         `INSERT INTO building_pieces
-           (site_key, definition_id, owner_account_id, form, storey, i, k, axis, health, placed_at_tick)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           (site_key, definition_id, owner_account_id, form, storey, i, k, axis, health, placed_at_tick,
+            last_activity_tick)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(site_key) DO UPDATE SET
            definition_id = excluded.definition_id, owner_account_id = excluded.owner_account_id,
            form = excluded.form, storey = excluded.storey, i = excluded.i, k = excluded.k,
-           axis = excluded.axis, health = excluded.health, placed_at_tick = excluded.placed_at_tick`,
+           axis = excluded.axis, health = excluded.health, placed_at_tick = excluded.placed_at_tick,
+           last_activity_tick = excluded.last_activity_tick`,
       )
       .run(
         siteKey,
@@ -1108,12 +1121,26 @@ export class WorldStore {
         piece.axis,
         piece.health,
         piece.placedAtTick,
+        piece.lastActivityTick,
       );
   }
 
-  /** Class-2 half only: what a raid has knocked off it since the last checkpoint. */
-  saveBuildingPieceHealth(siteKey: string, health: number): void {
-    this.db.prepare('UPDATE building_pieces SET health = ? WHERE site_key = ?').run(health, siteKey);
+  /**
+   * Class-2 half only: what a raid has knocked off it, and when someone was
+   * last standing near it. Both are continuous state -- losing five seconds of
+   * either is the rollback T04 allows, and a lost activity stamp costs only a
+   * few more seconds of grace.
+   */
+  saveBuildingPieceHealth(siteKey: string, health: number, lastActivityTick: number): void {
+    this.db
+      .prepare('UPDATE building_pieces SET health = ?, last_activity_tick = ? WHERE site_key = ?')
+      .run(health, lastActivityTick, siteKey);
+  }
+
+  saveDeployableHealth(deployableId: string, health: number, lastActivityTick: number): void {
+    this.db
+      .prepare('UPDATE deployables SET health = ?, last_activity_tick = ? WHERE deployable_id = ?')
+      .run(health, lastActivityTick, deployableId);
   }
 
   saveDoorHealth(siteKey: string, health: number): void {
@@ -1127,7 +1154,8 @@ export class WorldStore {
   loadBuildingPieces(): Map<string, BuildingPieceRecord> {
     const rows = this.db
       .prepare(
-        `SELECT site_key, definition_id, owner_account_id, form, storey, i, k, axis, health, placed_at_tick
+        `SELECT site_key, definition_id, owner_account_id, form, storey, i, k, axis, health, placed_at_tick,
+                last_activity_tick
          FROM building_pieces`,
       )
       .all() as BuildingPieceRow[];
@@ -1143,6 +1171,7 @@ export class WorldStore {
         axis: row.axis,
         health: row.health,
         placedAtTick: row.placed_at_tick,
+        lastActivityTick: row.last_activity_tick,
       });
     }
     return result;

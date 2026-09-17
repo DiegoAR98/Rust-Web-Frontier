@@ -5,7 +5,7 @@ import { boot, type ColyseusTestServer } from '@colyseus/testing';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import appConfig from '@rwf/server/app.config';
 import { PROTOCOL_VERSION } from '@rwf/protocol';
-import { CELL_SIZE_M } from '@rwf/sim';
+import { CELL_SIZE_M, WOOD_DECAY } from '@rwf/sim';
 import type { WorldRoom } from '@rwf/server/world-room';
 
 let colyseus: ColyseusTestServer;
@@ -69,6 +69,36 @@ describe('WorldRoom buildings across a restart (T04, GDD section 10)', () => {
     expect(pieces.map((p) => p.form).sort()).toEqual(['foundation', 'pillar']);
     expect(pieces.every((p) => p.ownerAccountId === 'acct_mason')).toBe(true);
     expect(pieces.find((p) => p.form === 'foundation')!.health).toBe(2000);
+  });
+
+  it('keeps counting down the decay clock across the restart', async () => {
+    // GDD section 10's grace is measured from the last activity. Held in
+    // memory only, a host that restarts nightly would reset every base's
+    // clock and nothing in the world would ever rot.
+    const first = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const client = await colyseus.connectTo(first, { accountId: 'acct_rot' });
+    await client.waitForMessage('session');
+    first.clearInventoryForTest('acct_rot');
+    first.teleportForTest('acct_rot', CENTRE);
+    first.grantForTest('acct_rot', 'wood_foundation', 1);
+    client.send('command', placePiece('wood_foundation', 'foundation', CELL.i, CELL.k));
+    expect((await client.waitForMessage('commandResult')).accepted).toBe(true);
+    // Walk away and run out the grace period, then stop the host.
+    first.teleportForTest('acct_rot', { x: 1000, y: 0, z: 1000 });
+    first.setTickForTest(first.tickForTest() + WOOD_DECAY.graceHours * 3600 * 20 + 20);
+    first.checkpoint();
+
+    await colyseus.cleanup();
+
+    const second = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const key = [...second.state.buildingPieces.keys()][0]!;
+    expect(second.state.buildingPieces.get(key)!.health).toBe(2000);
+
+    // One decay minute is now owed, not another day and a half of grace.
+    second.setTickForTest(second.tickForTest() + 60 * 20);
+    second.decayTickForTest();
+
+    expect(second.state.buildingPieces.get(key)!.health).toBeLessThan(2000);
   });
 
   it('still knows whose building it is, so a stranger still cannot attach to it', async () => {
