@@ -59,22 +59,43 @@ describe('WorldRoom station across a restart (T17)', () => {
 
     // Two whole quanta plus three seconds into the third.
     first.advanceStationsForTest(13);
+    // Snuffed before the reading is taken. The room's own 20Hz loop keeps
+    // stepping a lit station, so anything measured while it burns drifts by
+    // however long the assertions take; an unlit station banks no time.
+    client.send('command', command({ type: 'stationLight', stationId: 'furnace_r', lit: false }));
+    await client.waitForMessage('commandResult');
     first.checkpoint();
     const before = first.stationForTest('furnace_r')!;
-    expect(before.progressS).toBeCloseTo(3, 5);
+    expect(before.progressS).toBeGreaterThan(2.5); // two quanta burned, part-way through a third
 
     await colyseus.cleanup(); // the host stops
 
     const second = (await colyseus.createRoom('world', {})) as WorldRoom;
     const restored = second.stationForTest('furnace_r')!;
 
-    expect(restored.lit).toBe(true);
     expect(restored.inputs).toEqual(before.inputs);
     expect(restored.fuel).toEqual(before.fuel);
     expect(restored.outputs).toEqual(before.outputs);
     // Discarding this would quietly refund the player three seconds of fuel
     // every time the host restarted.
-    expect(restored.progressS).toBeCloseTo(3, 5);
+    expect(restored.progressS).toBeCloseTo(before.progressS, 5);
+  });
+
+  it('comes back still alight', async () => {
+    // Separate from the reading above because a lit station cannot be measured
+    // without it moving: this one has no fuel, so nothing can advance.
+    const first = (await colyseus.createRoom('world', {})) as WorldRoom;
+    first.spawnStation('furnace_l', 'furnace', { x: 1, y: 0, z: 0 });
+    const client = await colyseus.connectTo(first, { accountId: 'acct_l' });
+    await client.waitForMessage('session');
+
+    client.send('command', command({ type: 'stationLight', stationId: 'furnace_l', lit: true }));
+    await client.waitForMessage('commandResult');
+
+    await colyseus.cleanup();
+
+    const second = (await colyseus.createRoom('world', {})) as WorldRoom;
+    expect(second.stationForTest('furnace_l')!.lit).toBe(true);
   });
 
   it('does not re-seed the world stations over restored ones', async () => {

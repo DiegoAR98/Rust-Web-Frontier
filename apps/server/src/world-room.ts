@@ -3,7 +3,16 @@ import { CommandSchema, type Command, type CommandResult } from '@rwf/protocol';
 import { getItem, getRecipe } from '@rwf/content';
 import {
   addToInventory,
+  applyBleedWound,
   CALORIE_SPAWN,
+  CREATURE_SPECS,
+  spawnCreature as simSpawnCreature,
+  stepCreature,
+  tickBleed,
+  type BleedWound,
+  type CreatureKind,
+  type CreatureState as SimCreatureState,
+  type Point3,
   computeExposureDamage,
   computeExposureIntake,
   computeColdCalorieDrainPerS,
@@ -39,7 +48,7 @@ import {
   type WorldItem,
 } from '@rwf/sim';
 import { WorldStore, type Vec3 } from './persistence.js';
-import { PlayerState, WorldItemState, WorldState } from './world-state.js';
+import { CreatureState, PlayerState, WorldItemState, WorldState } from './world-state.js';
 
 /** Matches TECHNICAL section 3's simulation budget: 20 fixed ticks/s. */
 export const TICK_RATE_HZ = 20;
@@ -96,6 +105,14 @@ const SWING_INTERVAL_TICKS = TICK_RATE_HZ;
  * per-action cooldowns above are what bound the gameplay effect.
  */
 const MAX_MESSAGES_PER_SECOND = 60;
+/**
+ * GDD section 6: "Melee and animal bites have 20% for 0.5 HP/s for 10
+ * seconds." Arrows and bullets roll 25% for 1 HP/s over the same duration;
+ * they arrive with M3's weapons.
+ */
+const BITE_BLEED_CHANCE = 0.2;
+const BITE_BLEED_RATE_PER_S = 0.5;
+const BLEED_DURATION_S = 10;
 
 interface ClientUserData {
   accountId: string;
@@ -186,6 +203,14 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private readonly stationConfigs = new Map<string, StationConfig>();
   /** Who was last within reach of each station, so arrivals can be detected. */
   private readonly stationViewers = new Map<string, Set<string>>();
+  private readonly creatures = new Map<string, SimCreatureState>();
+  private readonly woundsByAccount = new Map<string, BleedWound>();
+  /**
+   * GDD section 6 makes the bleed chance a server roll. Injectable so a test
+   * can assert the wound rules rather than the coin flip; production uses
+   * Math.random.
+   */
+  private bleedRoll: () => number = Math.random;
 
   onCreate(): void {
     // TECHNICAL section 17: the world keeps running even when nobody is
@@ -353,6 +378,28 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     });
   }
 
+  /** Test-only accessors for the wildlife and bleeding verticals. */
+  creatureForTest(creatureId: string): SimCreatureState | undefined {
+    return this.creatures.get(creatureId);
+  }
+
+  woundForTest(accountId: string): BleedWound | null {
+    return this.woundsByAccount.get(accountId) ?? null;
+  }
+
+  /** Test-only: replaces GDD section 6's server bleed roll with a fixed one. */
+  setBleedRollForTest(roll: () => number): void {
+    this.bleedRoll = roll;
+  }
+
+  advanceCreaturesForTest(dt: number): void {
+    this.tickCreatures(dt);
+  }
+
+  advanceBleedForTest(dt: number): void {
+    this.tickBleeding(dt);
+  }
+
   /** Test-only read/write accessors for the station vertical. */
   stationForTest(stationId: string): StationState | undefined {
     return this.stations.get(stationId);
@@ -391,6 +438,107 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.resourceNodes.set(nodeId, { nodeId, remaining: totalBudget });
     this.nodeConfigs.set(nodeId, { definitionId, yieldPerHit, position });
     this.store.saveNodeState(nodeId, definitionId, totalBudget, yieldPerHit, position);
+  }
+
+  /**
+   * Seeds a creature. Live animals are public world state, so unlike a
+   * station's contents they ride the replicated schema: everyone can see where
+   * a wolf is. Nothing persists them yet -- a restart repopulates the world
+   * from the spawn table rather than restoring where each animal stood, which
+   * needs CONTENT section 4's respawn rules (15 minutes and no player within
+   * 30 m) to mean anything.
+   */
+  spawnCreature(creatureId: string, kind: CreatureKind, anchor: Point3): void {
+    this.creatures.set(creatureId, simSpawnCreature(kind, anchor));
+    const replicated = new CreatureState();
+    replicated.kind = kind;
+    replicated.x = anchor.x;
+    replicated.y = anchor.y;
+    replicated.z = anchor.z;
+    replicated.health = CREATURE_SPECS[kind].health;
+    this.state.creatures.set(creatureId, replicated);
+  }
+
+  /**
+   * The body a creature will go for: the nearest one, connected or not. GDD
+   * section 12 is explicit that a sleeper can still be killed by wildlife.
+   */
+  private nearestBody(position: Point3): { accountId: string; position: Point3 } | null {
+    let nearest: { accountId: string; position: Point3 } | null = null;
+    let nearestDistance = Infinity;
+    for (const [accountId, movement] of this.movementByAccount) {
+      const distance = Math.hypot(
+        movement.position.x - position.x,
+        movement.position.y - position.y,
+        movement.position.z - position.z,
+      );
+      if (distance >= nearestDistance) continue;
+      nearest = { accountId, position: movement.position };
+      nearestDistance = distance;
+    }
+    return nearest;
+  }
+
+  /** Advances every living creature and applies whatever they bite. */
+  private tickCreatures(dt: number): void {
+    for (const [creatureId, creature] of this.creatures) {
+      const spec = CREATURE_SPECS[creature.kind];
+      const target = this.nearestBody(creature.position);
+      const { state, attackDamage } = stepCreature(creature, spec, target?.position ?? null, dt);
+      this.creatures.set(creatureId, state);
+
+      const replicated = this.state.creatures.get(creatureId);
+      if (replicated) {
+        replicated.x = state.position.x;
+        replicated.y = state.position.y;
+        replicated.z = state.position.z;
+        replicated.health = state.health;
+        replicated.mode = state.mode;
+      }
+
+      if (attackDamage <= 0 || !target) continue;
+      this.damagePlayer(target.accountId, attackDamage, 'bite');
+    }
+  }
+
+  /**
+   * Applies damage from an external source, with GDD section 6's bleed roll
+   * where the source can open a wound: "melee and animal bites have 20% for
+   * 0.5 HP/s for 10 seconds".
+   */
+  private damagePlayer(accountId: string, damage: number, source: 'bite'): void {
+    const vitals = this.playerVitals.get(accountId);
+    if (!vitals) return;
+    this.playerVitals.set(accountId, { ...vitals, health: Math.max(0, vitals.health - damage) });
+
+    if (source === 'bite' && this.bleedRoll() < BITE_BLEED_CHANCE) {
+      // applyBleedWound takes the higher rate and later expiry rather than
+      // summing, so a second bite cannot double the bleed (GDD section 6).
+      this.woundsByAccount.set(
+        accountId,
+        applyBleedWound(this.woundsByAccount.get(accountId) ?? null, BITE_BLEED_RATE_PER_S, BLEED_DURATION_S),
+      );
+    }
+  }
+
+  /**
+   * Bleeds every wounded body. Separate from tickSurvival because GDD section
+   * 12 keeps bleeding running on a disconnected sleeper while calorie drain,
+   * regeneration and cold damage stop.
+   */
+  private tickBleeding(dt: number): void {
+    for (const [accountId, wound] of this.woundsByAccount) {
+      const { wound: next, damage } = tickBleed(wound, dt);
+      if (next) {
+        this.woundsByAccount.set(accountId, next);
+      } else {
+        this.woundsByAccount.delete(accountId);
+      }
+
+      const vitals = this.playerVitals.get(accountId);
+      if (!vitals || damage <= 0) continue;
+      this.playerVitals.set(accountId, { ...vitals, health: Math.max(0, vitals.health - damage) });
+    }
   }
 
   /** Seeds a furnace or campfire; not a player-facing command until M2 building. */
@@ -1054,6 +1202,12 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       player.yaw = action.yaw;
       player.grounded = next.grounded;
     }
+
+    this.tickCreatures(dt);
+
+    // Before tickSurvival, so a bite landing this tick is reflected in the
+    // vitals message that goes out at the end of it.
+    this.tickBleeding(dt);
 
     this.tickSurvival(dt);
 
