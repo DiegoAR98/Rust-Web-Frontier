@@ -132,6 +132,13 @@ export const AttackStructureIntentSchema = z.object({
 });
 export type AttackStructureIntent = z.infer<typeof AttackStructureIntentSchema>;
 
+/** A swing at a placed deployable (GDD section 11: "Destroying a box produces its loot"). */
+export const AttackDeployableIntentSchema = z.object({
+  type: z.literal('attackDeployable'),
+  deployableId: z.string().min(1).max(64),
+});
+export type AttackDeployableIntent = z.infer<typeof AttackDeployableIntentSchema>;
+
 /** The doorway site a door command acts on; the same lattice as a piece. */
 const doorwaySite = {
   storey: z.number().int().min(0).max(16),
@@ -244,6 +251,7 @@ export const ActionPayloadSchema = z.discriminatedUnion('type', [
   PlaceDeployableIntentSchema,
   PlaceBuildingPieceIntentSchema,
   AttackStructureIntentSchema,
+  AttackDeployableIntentSchema,
   InstallDoorIntentSchema,
   OperateDoorIntentSchema,
   SetDoorAccessIntentSchema,

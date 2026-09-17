@@ -192,6 +192,8 @@ const CARCASS_LIFETIME_TICKS = 10 * 60 * TICK_RATE_HZ;
  * host (T17) rather than running down against a wall clock.
  */
 const CORPSE_LIFETIME_TICKS = 30 * 60 * TICK_RATE_HZ;
+/** GDD section 8: "Player-dropped bags have a 10-minute lifetime". */
+const BAG_LIFETIME_TICKS = 10 * 60 * TICK_RATE_HZ;
 /**
  * GDD section 12's "valid Coyote Wash or Juniper perimeter anchor". The real
  * map authors 16 arrival anchors (GDD section 13); until the map exists these
@@ -356,7 +358,19 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
    */
   private readonly corpses = new Map<
     string,
-    { ownerAccountId: string; position: Point3; inventory: CorpseInventory; diedAtTick: number }
+    {
+      ownerAccountId: string;
+      position: Point3;
+      inventory: CorpseInventory;
+      diedAtTick: number;
+      /**
+       * GDD section 8 gives death bags 30 minutes and dropped bags 10, and
+       * says drop containers "use the same 40-visible-slot plus paged overflow
+       * representation as corpses" -- so they are the same thing here with
+       * different clocks.
+       */
+      lifetimeTicks: number;
+    }
   >();
   /**
    * Accounts with no live character until they respawn (GDD section 12:
@@ -481,6 +495,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         // Only occupied slots are stored, so pad back out to the full 40.
         inventory: { slots: padSlots(record.slots, CORPSE_SLOTS), overflow: record.overflow },
         diedAtTick: record.diedAtTick,
+        lifetimeTicks: record.lifetimeTicks,
       });
       const replicated = new CorpseState();
       replicated.ownerAccountId = record.ownerAccountId;
@@ -986,6 +1001,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       position: { ...position },
       inventory,
       diedAtTick: this.state.tick,
+      lifetimeTicks: CORPSE_LIFETIME_TICKS,
     });
 
     const replicated = new CorpseState();
@@ -1025,6 +1041,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       ownerAccountId: corpse.ownerAccountId,
       position: corpse.position,
       diedAtTick: corpse.diedAtTick,
+      lifetimeTicks: corpse.lifetimeTicks,
       slots: corpse.inventory.slots,
       overflow: corpse.inventory.overflow,
     };
@@ -1568,6 +1585,81 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.pieceLinks.get(b)!.add(a);
   }
 
+  /**
+   * A swing at a crate (GDD section 11: "Destroying a box produces its
+   * loot"). Reach and rate are the same as any other swing.
+   */
+  private resolveAttackDeployable(accountId: string, deployableId: string, sequence: number): CommandResult {
+    const base = { sequence, serverTick: this.state.tick };
+    const deployable = this.deployables.get(deployableId);
+    const replicated = this.state.deployables.get(deployableId);
+    if (!deployable || !replicated) return { ...base, accepted: false, reasonCode: 'not_found' };
+    if (!this.isWithinReach(accountId, { ...deployable.position })) {
+      return { ...base, accepted: false, reasonCode: 'out_of_range' };
+    }
+    if (this.isSwingOnCooldown(accountId)) return { ...base, accepted: false, reasonCode: 'rate_limited' };
+    this.lastSwingTick.set(accountId, this.state.tick);
+    this.chargeSwingCalorie(accountId);
+
+    const health = replicated.health - MELEE_DAMAGE;
+    if (health > 0) {
+      // Class-2 like a wall's, and checkpointed with it.
+      replicated.health = health;
+      return { ...base, accepted: true, reasonCode: 'ok' };
+    }
+
+    this.breakDeployable(deployableId);
+    return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  /**
+   * Removes a crate and spills what was inside it into one bag (GDD section 8:
+   * "Destroyed containers spill one bounded bag holding the actual remaining
+   * items"). The bag is a corpse with a shorter clock -- section 8 says drop
+   * containers "use the same 40-visible-slot plus paged overflow
+   * representation as corpses", so it is literally the same thing here.
+   *
+   * Spills once, because the crate is gone in the same step.
+   */
+  private breakDeployable(deployableId: string): void {
+    const deployable = this.deployables.get(deployableId);
+    if (!deployable) return;
+
+    const spilled: ItemStack[] = [];
+    for (const slot of deployable.slots) {
+      if (slot) spilled.push({ ...slot });
+    }
+
+    this.deployables.delete(deployableId);
+    this.state.deployables.delete(deployableId);
+    this.deployableViewers.delete(deployableId);
+
+    const bagId = spilled.length > 0 ? `bag_${deployableId}_${this.state.tick}` : null;
+    if (bagId) {
+      this.corpses.set(bagId, {
+        ownerAccountId: deployable.ownerAccountId,
+        position: { ...deployable.position },
+        inventory: buildCorpse(spilled, (id) => getItem(id)?.stack ?? 1),
+        diedAtTick: this.state.tick,
+        lifetimeTicks: BAG_LIFETIME_TICKS,
+      });
+      const replicated = new CorpseState();
+      replicated.ownerAccountId = deployable.ownerAccountId;
+      replicated.x = deployable.position.x;
+      replicated.y = deployable.position.y;
+      replicated.z = deployable.position.z;
+      this.state.corpses.set(bagId, replicated);
+    }
+    // An empty crate leaves nothing behind: a bag with nothing in it is a prop
+    // that invites a pointless interaction, the same reasoning as D49.
+
+    this.store.runInTransaction(() => {
+      this.store.deleteDeployable(deployableId);
+      if (bagId) this.persistCorpse(bagId);
+    });
+    this.sendDeployable(deployableId);
+  }
+
   private persistDeployable(deployableId: string): void {
     const deployable = this.deployables.get(deployableId);
     if (!deployable) return;
@@ -1750,7 +1842,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   /** GDD section 8's 30-minute death bag, counted in ticks so it freezes with the host. */
   private expireCorpses(): void {
     for (const [corpseId, corpse] of this.corpses) {
-      if (this.state.tick - corpse.diedAtTick < CORPSE_LIFETIME_TICKS) continue;
+      if (this.state.tick - corpse.diedAtTick < corpse.lifetimeTicks) continue;
       this.removeCorpse(corpseId);
     }
   }
@@ -2412,6 +2504,15 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       return;
     }
 
+    if (command.action.type === 'attackDeployable') {
+      const deployableId = command.action.deployableId;
+      const encoded = this.store.commitOutcome(key, () =>
+        JSON.stringify(this.resolveAttackDeployable(accountId, deployableId, command.sequence)),
+      );
+      client.send('commandResult', JSON.parse(encoded) as CommandResult);
+      return;
+    }
+
     if (command.action.type === 'attackStructure') {
       const { form, door, storey, i, k, axis } = command.action;
       const encoded = this.store.commitOutcome(key, () =>
@@ -3053,6 +3154,11 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
 
   doorForTest(site: PieceSite): { ownerAccountId: string; open: boolean } | undefined {
     return this.doors.get(siteKey(site));
+  }
+
+  setDeployableHealthForTest(deployableId: string, health: number): void {
+    const replicated = this.state.deployables.get(deployableId);
+    if (replicated) replicated.health = health;
   }
 
   /** Test-only: drops a piece to one swing from destruction instead of a hundred. */

@@ -72,6 +72,11 @@ export interface CorpseRecord {
   ownerAccountId: string;
   position: Vec3;
   diedAtTick: number;
+  /**
+   * GDD section 8 gives death bags 30 minutes and dropped bags 10. Stored
+   * rather than inferred, so a bag keeps its own clock across a restart.
+   */
+  lifetimeTicks: number;
   /** The 40 interactive slots; sparse on disk, only occupied ones are stored. */
   slots: Slot[];
   /** GDD section 12's noninteractive manifest, in order. */
@@ -85,6 +90,7 @@ interface CorpseRow {
   y: number;
   z: number;
   died_at_tick: number;
+  lifetime_ticks: number;
 }
 
 interface CorpseSlotRow {
@@ -384,7 +390,8 @@ export class WorldStore {
         x REAL NOT NULL,
         y REAL NOT NULL,
         z REAL NOT NULL,
-        died_at_tick INTEGER NOT NULL
+        died_at_tick INTEGER NOT NULL,
+        lifetime_ticks INTEGER NOT NULL DEFAULT 36000
       );
       CREATE TABLE IF NOT EXISTS corpse_slots (
         corpse_id TEXT NOT NULL,
@@ -889,10 +896,12 @@ export class WorldStore {
     const replace = this.db.transaction((record: CorpseRecord) => {
       this.db
         .prepare(
-          `INSERT INTO corpses (corpse_id, owner_account_id, x, y, z, died_at_tick) VALUES (?, ?, ?, ?, ?, ?)
+          `INSERT INTO corpses (corpse_id, owner_account_id, x, y, z, died_at_tick, lifetime_ticks)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(corpse_id) DO UPDATE SET
              owner_account_id = excluded.owner_account_id, x = excluded.x, y = excluded.y,
-             z = excluded.z, died_at_tick = excluded.died_at_tick`,
+             z = excluded.z, died_at_tick = excluded.died_at_tick,
+             lifetime_ticks = excluded.lifetime_ticks`,
         )
         .run(
           corpseId,
@@ -901,6 +910,7 @@ export class WorldStore {
           record.position.y,
           record.position.z,
           record.diedAtTick,
+          record.lifetimeTicks,
         );
       this.db.prepare('DELETE FROM corpse_slots WHERE corpse_id = ?').run(corpseId);
       const insert = this.db.prepare(
@@ -926,7 +936,7 @@ export class WorldStore {
 
   loadCorpses(): Map<string, CorpseRecord> {
     const rows = this.db
-      .prepare('SELECT corpse_id, owner_account_id, x, y, z, died_at_tick FROM corpses')
+      .prepare('SELECT corpse_id, owner_account_id, x, y, z, died_at_tick, lifetime_ticks FROM corpses')
       .all() as CorpseRow[];
     const slotRows = this.db
       .prepare('SELECT corpse_id, compartment, slot_index, definition_id, quantity FROM corpse_slots')
@@ -938,6 +948,7 @@ export class WorldStore {
         ownerAccountId: row.owner_account_id,
         position: { x: row.x, y: row.y, z: row.z },
         diedAtTick: row.died_at_tick,
+        lifetimeTicks: row.lifetime_ticks,
         slots: [],
         overflow: [],
       });
