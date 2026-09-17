@@ -60,6 +60,9 @@ export function tickQueueEntry(
 export function cancelQueueEntry(entry: QueueEntry): Record<string, number> {
   const remainingUnits = entry.totalUnits - entry.completedUnits;
   const refund: Record<string, number> = {};
+  if (remainingUnits <= 0) {
+    return refund;
+  }
   for (const [id, qty] of Object.entries(entry.recipe.inputs)) {
     refund[id] = qty * remainingUnits;
   }

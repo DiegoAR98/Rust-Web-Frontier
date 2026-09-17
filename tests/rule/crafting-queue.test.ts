@@ -66,9 +66,9 @@ describe('cancelQueueEntry (refunds unstarted + incomplete unit in full, never c
     expect(cancelQueueEntry(entry)).toEqual({ wood: 30, stone: 20 }); // 2 remaining units
   });
 
-  it('refunds nothing once every unit has completed', () => {
+  it('refunds nothing (an empty map, not zero-quantity entries) once every unit has completed', () => {
     let entry = startQueueEntry(hatchetRecipe, 1);
     entry = tickQueueEntry(entry, 10, Infinity).entry;
-    expect(cancelQueueEntry(entry)).toEqual({ wood: 0, stone: 0 });
+    expect(cancelQueueEntry(entry)).toEqual({});
   });
 });
