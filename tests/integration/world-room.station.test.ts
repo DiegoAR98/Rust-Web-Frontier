@@ -142,6 +142,28 @@ describe('WorldRoom furnace (T09, CONTENT section 3)', () => {
     client.leave();
   });
 
+  it('says the station is full, not that the player is short', async () => {
+    // Two different refusals that the HUD must not confuse: one is "you do not
+    // have these", the other is "there is nowhere to put them".
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    room.spawnStation('furnace_t', 'furnace', AT_ARMS_LENGTH);
+    room.grantForTest('acct_fullfuel', 'wood', 260); // wood stacks to 250
+    const client = await colyseus.connectTo(room, { accountId: 'acct_fullfuel' });
+    await client.waitForMessage('session');
+
+    client.send('command', command({ type: 'stationInsert', stationId: 'furnace_t', definitionId: 'wood', quantity: 250 }));
+    expect((await client.waitForMessage('commandResult')).accepted).toBe(true);
+
+    client.send('command', command({ type: 'stationInsert', stationId: 'furnace_t', definitionId: 'wood', quantity: 10 }));
+    const result = await client.waitForMessage('commandResult');
+
+    expect(result.accepted).toBe(false);
+    expect(result.reasonCode).toBe('no_space');
+    expect(room.countForTest('acct_fullfuel', 'wood')).toBe(10); // still theirs
+
+    client.leave();
+  });
+
   it('refuses to insert more than the player actually has', async () => {
     const room = (await colyseus.createRoom('world', {})) as WorldRoom;
     room.spawnStation('furnace_t', 'furnace', AT_ARMS_LENGTH);

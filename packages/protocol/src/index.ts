@@ -96,6 +96,9 @@ export const REASON_CODES = [
   'already_taken',
   'depleted',
   'insufficient_resources',
+  // The actor has the items; the destination has nowhere to put them.
+  // Distinct from insufficient_resources so a UI can say which it is.
+  'no_space',
   'busy',
 ] as const;
 export type ReasonCode = (typeof REASON_CODES)[number];

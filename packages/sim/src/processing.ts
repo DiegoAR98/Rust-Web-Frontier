@@ -41,6 +41,15 @@ export const STATION_SPECS: Record<StationKind, StationSpec> = {
   },
 };
 
+/**
+ * Not modeled yet: CONTENT section 3's overcook rule -- "cooked food left in a
+ * lit campfire output for 60 consecutive processing seconds becomes burnt one
+ * unit at a time, oldest first", with removal resetting a stack's exposure and
+ * merging retaining the older timestamp so stack juggling cannot erase it.
+ * That needs a per-stack age this slot model does not carry, and T09 does not
+ * gate it. Cooked meat currently sits in a campfire indefinitely.
+ */
+
 /** The only fuel in this baseline; CONTENT section 3 excludes rendered fuel. */
 export const FUEL_DEFINITION_ID = 'wood';
 export const FUEL_OUTPUT_ID = 'charcoal';

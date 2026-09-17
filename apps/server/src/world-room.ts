@@ -584,7 +584,12 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.sendStation(stationId);
   }
 
-  /** A station command's common preamble: it must exist and be within arm's reach. */
+  /**
+   * A station command's common preamble: it must exist and be within arm's
+   * reach. Reach is the *only* gate -- anyone standing at a furnace can empty
+   * it. GDD section 11's ownership and door permissions are M2 scope, so until
+   * they land a station is public to whoever walks up to it.
+   */
   private resolveStationAccess(
     accountId: string,
     stationId: string,
@@ -635,7 +640,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       ? addToInventory([station.fuel], definitionId, quantity, stackLimit)
       : spreadAcrossSlots(station.inputs, definitionId, quantity, stackLimit);
     if (destination.overflow > 0) {
-      return { ...base, accepted: false, reasonCode: 'insufficient_resources' };
+      // All-or-nothing, unlike a take: half-filling a furnace slot silently
+      // would leave the player wondering where the rest went.
+      return { ...base, accepted: false, reasonCode: 'no_space' };
     }
 
     if (isFuel) {
@@ -676,7 +683,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       return {
         ...base,
         accepted: false,
-        reasonCode: station.outputs.some((slot) => slot) ? 'insufficient_resources' : 'depleted',
+        reasonCode: station.outputs.some((slot) => slot) ? 'no_space' : 'depleted',
       };
     }
 
