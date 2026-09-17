@@ -95,7 +95,6 @@ window.addEventListener('keydown', (e) => {
 
 document.addEventListener('pointerlockchange', () => {
   entered = document.pointerLockElement === canvas;
-  overlayEl.style.display = entered ? 'none' : 'flex';
 });
 
 window.addEventListener('mousemove', (e) => {
@@ -104,9 +103,22 @@ window.addEventListener('mousemove', (e) => {
   camera.rotation.y += e.movementX * sensitivity;
 });
 
+// Mouse-look needs pointer lock, but a lock rejection/delay must never block
+// the connection or WASD movement: those are gated on `room`, not `entered`.
 enterButton.addEventListener('click', async () => {
-  await canvas.requestPointerLock();
+  overlayEl.style.display = 'none';
   if (!room) await connect();
+  try {
+    await canvas.requestPointerLock();
+  } catch {
+    // Mouse-look is unavailable until the user clicks the canvas below;
+    // movement and everything else still works.
+  }
+});
+
+// Re-acquire pointer lock after it's lost (Escape, alt-tab, devtools focus).
+canvas.addEventListener('click', () => {
+  if (!entered) canvas.requestPointerLock().catch(() => {});
 });
 
 async function connect(): Promise<void> {
@@ -159,7 +171,7 @@ async function connect(): Promise<void> {
 }
 
 function sendMoveCommand(): void {
-  if (!room || !entered) return;
+  if (!room) return;
   const intent = computeMoveIntent(keys);
   sequence += 1;
   room.send('command', {
@@ -200,7 +212,7 @@ engine.runRenderLoop(() => {
   itemMesh.setEnabled(!item || item.claimedBy === '');
 
   statusEl.textContent = room
-    ? `account ${accountId.slice(0, 8)} epoch ${sessionEpoch} players ${room.state.players.size} last:${statusEl.dataset.lastResult ?? '-'}`
+    ? `account ${accountId.slice(0, 8)} epoch ${sessionEpoch} players ${room.state.players.size} last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : ' (click canvas to look)'}`
     : 'not connected';
 
   scene.render();
