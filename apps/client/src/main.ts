@@ -76,7 +76,7 @@ let sendTimer: number | undefined;
 let disconnectReason: string | undefined;
 let lookError: string | undefined;
 let crafting: { recipeId: string | null; completedUnits: number; totalUnits: number; progressS: number } | undefined;
-let vitals = { calories: 0, health: 0, exposure: 0 };
+let vitals = { calories: 0, health: 0, exposure: 0, coldDeficit: 0, phase: 'day' };
 let yaw = 0;
 let pitch = 0;
 
@@ -349,7 +349,7 @@ engine.runRenderLoop(() => {
   statusEl.textContent = room
     ? [
         `account ${accountId.slice(0, 8)}  epoch ${sessionEpoch}  players ${room.state.players.size}`,
-        `hp ${vitals.health.toFixed(0)}  cal ${vitals.calories.toFixed(0)}  exposure ${vitals.exposure.toFixed(0)}`,
+        `hp ${vitals.health.toFixed(0)}  cal ${vitals.calories.toFixed(0)}  exposure ${vitals.exposure.toFixed(0)}  ${vitals.phase}${vitals.coldDeficit > 0 ? `  COLD ${vitals.coldDeficit.toFixed(0)}` : ''}`,
         `pack: ${describeInventory()}`,
         `craft: ${describeCrafting()}`,
         `last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : `  (${lookError ?? 'click canvas to look'})`}`,

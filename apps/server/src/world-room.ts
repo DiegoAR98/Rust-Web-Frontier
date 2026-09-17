@@ -6,8 +6,13 @@ import {
   CALORIE_SPAWN,
   computeExposureDamage,
   computeExposureIntake,
+  computeColdCalorieDrainPerS,
+  computeColdDamagePerS,
+  computeColdDeficit,
   computeStarvationDamage,
   countFreeCapacity,
+  dayPhase,
+  lowlandColdPressure,
   countInInventory,
   decayExposure,
   drainCalories,
@@ -615,6 +620,36 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     }
   }
 
+  /**
+   * Cold deficit for a player right now (GDD section 6): environment pressure
+   * minus worn/fire/shelter warmth. Warmth is 0 for everyone until clothing
+   * and fires exist, and the whole map is one lowland plane, so this is
+   * currently uniform -- hence one value per tick rather than per player.
+   */
+  private currentColdDeficit(): number {
+    const pressure = lowlandColdPressure(dayPhase(this.state.tick));
+    return computeColdDeficit(pressure, 0);
+  }
+
+  /** Test-only read accessors for the cold vertical. */
+  coldDeficitForTest(_accountId: string): number {
+    return this.currentColdDeficit();
+  }
+
+  vitalsForTest(accountId: string): { calories: number; health: number; exposure: number } | undefined {
+    return this.playerVitals.get(accountId);
+  }
+
+  /** Test-only: jumps the world clock, e.g. to reach nightfall without waiting 45 minutes. */
+  setTickForTest(tick: number): void {
+    this.state.tick = tick;
+  }
+
+  /** Test-only: runs one survival step of dt seconds without the real tick timer. */
+  advanceSurvivalForTest(dt: number): void {
+    this.tickSurvival(dt);
+  }
+
   /** Test-only: seeds a player's inventory directly, bypassing gather/take. */
   grantForTest(accountId: string, definitionId: string, quantity: number): void {
     const stackLimit = getItem(definitionId)?.stack ?? 1;
@@ -666,13 +701,31 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       player.grounded = next.grounded;
     }
 
+    this.tickSurvival(dt);
+
+    this.tickCrafting(dt);
+
+    if (this.state.tick % CHECKPOINT_INTERVAL_TICKS === 0) {
+      this.checkpoint();
+    }
+  }
+
+  /** Calories, starvation, hot-ore exposure and cold, for every connected player. */
+  private tickSurvival(dt: number): void {
+    const coldDeficit = this.currentColdDeficit();
+
     for (const accountId of this.connectedAccounts) {
       const vitals = this.playerVitals.get(accountId);
       const movement = this.movementByAccount.get(accountId);
       if (!vitals || !movement) continue;
 
       const sprinting = this.pendingMove.get(accountId)?.action.sprint ?? false;
-      const calories = drainCalories(vitals.calories, dt, sprinting);
+      // Cold adds its drain on top of the movement drain (GDD section 6):
+      // deficit 1-19 costs 0.1 cal/s, 20-39 costs 0.25/s, 40+ costs 0.5/s.
+      const calories = Math.max(
+        0,
+        drainCalories(vitals.calories, dt, sprinting) - computeColdCalorieDrainPerS(coldDeficit) * dt,
+      );
 
       const dx = movement.position.x - HAZARD_ZONE_CENTER.x;
       const dz = movement.position.z - HAZARD_ZONE_CENTER.z;
@@ -683,17 +736,19 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
 
       const starvation = computeStarvationDamage(calories, dt);
       const exposureDamage = computeExposureDamage(exposure) * dt;
-      const health = Math.max(0, Math.min(HEALTH_MAX, vitals.health - starvation - exposureDamage));
+      const coldDamage = computeColdDamagePerS(coldDeficit) * dt;
+      const health = Math.max(
+        0,
+        Math.min(HEALTH_MAX, vitals.health - starvation - exposureDamage - coldDamage),
+      );
       const next = { calories, health, exposure };
       this.playerVitals.set(accountId, next);
 
-      this.clientsByAccount.get(accountId)?.send('vitals', next);
-    }
-
-    this.tickCrafting(dt);
-
-    if (this.state.tick % CHECKPOINT_INTERVAL_TICKS === 0) {
-      this.checkpoint();
+      this.clientsByAccount.get(accountId)?.send('vitals', {
+        ...next,
+        coldDeficit,
+        phase: dayPhase(this.state.tick),
+      });
     }
   }
 }
