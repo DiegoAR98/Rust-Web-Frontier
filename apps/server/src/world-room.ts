@@ -4,6 +4,7 @@ import { getConsumable, getItem, getRecipe } from '@rwf/content';
 import {
   addToInventory,
   applyBleedWound,
+  moveAllThatFits,
   buildCorpse,
   cancelQueueEntry,
   CORPSE_SLOTS,
@@ -985,20 +986,11 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       return { ...base, accepted: false, reasonCode: 'out_of_range' };
     }
 
-    let slots = this.playerSlots.get(accountId) ?? new Array(BACKPACK_SLOTS).fill(null);
-    const remaining: Slot[] = [];
-    let moved = 0;
-    for (const slot of corpse.inventory.slots) {
-      if (!slot) {
-        remaining.push(null);
-        continue;
-      }
-      const stackLimit = getItem(slot.definitionId)?.stack ?? 1;
-      const result = addToInventory(slots, slot.definitionId, slot.quantity, stackLimit);
-      slots = result.slots;
-      moved += slot.quantity - result.overflow;
-      remaining.push(result.overflow > 0 ? { definitionId: slot.definitionId, quantity: result.overflow } : null);
-    }
+    const { source: remaining, destination: slots, moved } = moveAllThatFits(
+      corpse.inventory.slots,
+      this.playerSlots.get(accountId) ?? new Array(BACKPACK_SLOTS).fill(null),
+      (id) => getItem(id)?.stack ?? 1,
+    );
 
     if (moved === 0) {
       return {
@@ -1709,21 +1701,12 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     if (typeof access === 'string') return { ...base, accepted: false, reasonCode: access };
     const { station } = access;
 
-    let slots = this.playerSlots.get(accountId) ?? new Array(BACKPACK_SLOTS).fill(null);
-    const remaining: Slot[] = [];
-    let moved = 0;
-    for (const slot of station.outputs) {
-      if (!slot) {
-        remaining.push(null);
-        continue;
-      }
-      const stackLimit = getItem(slot.definitionId)?.stack ?? 1;
-      const result = addToInventory(slots, slot.definitionId, slot.quantity, stackLimit);
-      slots = result.slots;
-      moved += slot.quantity - result.overflow;
-      // Whatever will not fit stays in the station rather than being dropped.
-      remaining.push(result.overflow > 0 ? { definitionId: slot.definitionId, quantity: result.overflow } : null);
-    }
+    // Whatever will not fit stays in the station rather than being dropped.
+    const { source: remaining, destination: slots, moved } = moveAllThatFits(
+      station.outputs,
+      this.playerSlots.get(accountId) ?? new Array(BACKPACK_SLOTS).fill(null),
+      (id) => getItem(id)?.stack ?? 1,
+    );
 
     if (moved === 0) {
       return {

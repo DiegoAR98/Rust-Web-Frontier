@@ -95,6 +95,46 @@ export function countFreeCapacity(slots: Slot[], definitionId: string, stackLimi
   return capacity;
 }
 
+/**
+ * Empties one slot array into another, moving as much as will fit and leaving
+ * the rest exactly where it was (GDD section 8). This is the shared rule
+ * behind every "take what is in that" action -- a furnace's outputs, a
+ * corpse's slots, a crate's contents -- which differ only in what they call
+ * the source.
+ *
+ * The source keeps its length, so its remaining slots stay where they were;
+ * callers that care about slot identity (a station's compartments) depend on
+ * that.
+ */
+export function moveAllThatFits(
+  source: Slot[],
+  destination: Slot[],
+  stackLimitOf: (definitionId: string) => number,
+): { source: Slot[]; destination: Slot[]; moved: number } {
+  const remaining: Slot[] = [];
+  let next = destination;
+  let moved = 0;
+
+  for (const slot of source) {
+    if (!slot) {
+      remaining.push(null);
+      continue;
+    }
+    const result = addToInventory(next, slot.definitionId, slot.quantity, stackLimitOf(slot.definitionId));
+    next = result.slots;
+    moved += slot.quantity - result.overflow;
+    remaining.push(result.overflow > 0 ? { definitionId: slot.definitionId, quantity: result.overflow } : null);
+  }
+
+  // Nothing moved means nothing should have changed: returning the originals
+  // rather than equivalent copies keeps a refused take from looking like a
+  // state change to anything watching.
+  if (moved === 0) {
+    return { source, destination, moved: 0 };
+  }
+  return { source: remaining, destination: next, moved };
+}
+
 /** Sums quantity across every stack of one item. */
 export function countInInventory(slots: Slot[], definitionId: string): number {
   let total = 0;
