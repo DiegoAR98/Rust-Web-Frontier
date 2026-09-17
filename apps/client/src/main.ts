@@ -102,6 +102,7 @@ const corpsePositions = new Map<string, Vector3>();
 const deployableMeshes = new Map<string, ReturnType<typeof MeshBuilder.CreateBox>>();
 const deployablePositions = new Map<string, Vector3>();
 const pieceMeshes = new Map<string, ReturnType<typeof MeshBuilder.CreateBox>>();
+const doorMeshes = new Map<string, ReturnType<typeof MeshBuilder.CreateBox>>();
 
 const deerMaterial = new StandardMaterial('deerMat', scene);
 deerMaterial.diffuseColor = new Color3(0.65, 0.5, 0.3);
@@ -117,6 +118,8 @@ const crateMaterial = new StandardMaterial('crateMat', scene);
 crateMaterial.diffuseColor = new Color3(0.55, 0.38, 0.18);
 const timberMaterial = new StandardMaterial('timberMat', scene);
 timberMaterial.diffuseColor = new Color3(0.48, 0.33, 0.16);
+const doorMaterial = new StandardMaterial('doorMat', scene);
+doorMaterial.diffuseColor = new Color3(0.62, 0.45, 0.2);
 
 /** The box each structural form is drawn as, in metres (GDD section 10's grid). */
 const PIECE_SHAPES: Record<string, { width: number; height: number; depth: number }> = {
@@ -229,6 +232,9 @@ const PLACEABLES: Array<{ key: string; definitionId: string; form: PieceForm | n
   { key: 'Digit4', definitionId: 'wood_wall', form: 'wall' },
   { key: 'Digit5', definitionId: 'wood_doorway', form: 'doorway' },
   { key: 'Digit6', definitionId: 'wood_ceiling', form: 'ceiling' },
+  // A door is not a piece: it goes into a doorway's socket, so X installs it
+  // into whichever doorway is in reach rather than snapping it to the grid.
+  { key: 'Digit7', definitionId: 'wood_door', form: null },
 ];
 let selected = PLACEABLES[0]!;
 /** Set while this account is dead; GDD section 12's death recap and respawn prompt. */
@@ -300,6 +306,10 @@ window.addEventListener('keydown', (e) => {
   if (e.code === 'KeyX') attemptPlace();
   if (e.code === 'KeyZ') attemptContainerInsert();
   if (e.code === 'KeyH') attemptContainerTake();
+  // GDD section 10's doors and its two separate grants.
+  if (e.code === 'KeyO') attemptOperateDoor();
+  if (e.code === 'KeyK') attemptSetDoorAccess(!e.shiftKey);
+  if (e.code === 'KeyJ') attemptSetBuildAccess(!e.shiftKey);
   const placeable = PLACEABLES.find((entry) => entry.key === e.code);
   if (placeable) selected = placeable;
 });
@@ -562,6 +572,27 @@ async function connect(): Promise<void> {
     pieceMeshes.delete(key);
   });
 
+  // A door fills the doorway it hangs in; open is drawn as swung aside rather
+  // than hidden, so an open door is visibly a door and not a missing one.
+  $(joined.state).doors!.onAdd((door: ReplicatedPiece, key: string) => {
+    const shape = pieceShape('wall', door.axis);
+    const mesh = MeshBuilder.CreateBox(`door_${key}`, { ...shape, height: 2.2 }, scene);
+    mesh.material = doorMaterial;
+    const at = worldPositionOf({
+      form: 'doorway',
+      storey: door.storey,
+      i: door.i,
+      k: door.k,
+      axis: door.axis === '' ? null : (door.axis as 'x' | 'z'),
+    });
+    mesh.position.set(at.x, at.y - STOREY_HEIGHT_M / 2 + 1.1, at.z);
+    doorMeshes.set(key, mesh);
+  });
+  $(joined.state).doors!.onRemove((_door: ReplicatedPiece, key: string) => {
+    doorMeshes.get(key)?.dispose();
+    doorMeshes.delete(key);
+  });
+
   joined.onStateChange(() => {
     patchAtMs = performance.now();
     const local = joined.state.players.get(accountId);
@@ -728,7 +759,77 @@ function ghostIsLegal(): boolean {
   return true;
 }
 
+/**
+ * The doorway nearest the player, whether or not it holds a door. Doorways are
+ * sockets, so everything about doors -- installing, opening, granting access --
+ * acts on one rather than on a free position.
+ */
+function nearestDoorway(): { key: string; site: PieceSite } | undefined {
+  if (!room) return undefined;
+  let best: { key: string; site: PieceSite } | undefined;
+  let bestDistance = Infinity;
+  for (const [key, piece] of room.state.buildingPieces.entries()) {
+    if (piece.form !== 'doorway') continue;
+    const site: PieceSite = {
+      form: 'doorway',
+      storey: piece.storey,
+      i: piece.i,
+      k: piece.k,
+      axis: piece.axis === '' ? null : (piece.axis as 'x' | 'z'),
+    };
+    const at = worldPositionOf(site);
+    const distance = Vector3.Distance(camera.position, new Vector3(at.x, at.y, at.z));
+    if (distance >= bestDistance) continue;
+    best = { key, site };
+    bestDistance = distance;
+  }
+  return best;
+}
+
+function attemptOperateDoor(): void {
+  const doorway = nearestDoorway();
+  if (!doorway || !room) return;
+  const door = room.state.doors.get(doorway.key);
+  if (!door) return;
+  send({ type: 'operateDoor', open: !door.open, ...doorway.site });
+}
+
+/**
+ * Grants or revokes door access for the nearest other player. GDD section 10
+ * grants it to "named player IDs", and naming one needs a text field this HUD
+ * does not have; the player standing next to you is the one you were going to
+ * name anyway.
+ */
+function attemptSetDoorAccess(granted: boolean): void {
+  const doorway = nearestDoorway();
+  const target = nearestOtherAccountId();
+  if (!doorway || !target) return;
+  send({ type: 'setDoorAccess', targetAccountId: target, granted, ...doorway.site });
+}
+
+function attemptSetBuildAccess(granted: boolean): void {
+  const target = nearestOtherAccountId();
+  if (target) send({ type: 'setBuildAccess', targetAccountId: target, granted });
+}
+
+function nearestOtherAccountId(): string | undefined {
+  let best: string | undefined;
+  let bestDistance = Infinity;
+  for (const [key, transform] of remoteTargetTransform) {
+    const distance = Vector3.Distance(camera.position, new Vector3(transform.x, transform.y, transform.z));
+    if (distance >= bestDistance) continue;
+    best = key;
+    bestDistance = distance;
+  }
+  return best;
+}
+
 function attemptPlace(): void {
+  if (selected.definitionId === 'wood_door') {
+    const doorway = nearestDoorway();
+    if (doorway) send({ type: 'installDoor', definitionId: 'wood_door', ...doorway.site });
+    return;
+  }
   const site = ghostSite();
   if (site) {
     send({ type: 'placeBuildingPiece', definitionId: selected.definitionId, ...site });
@@ -952,6 +1053,23 @@ function describeBuild(): string {
   return `${slot}:${selected.definitionId} x${held} -- X places at ${where} (${verdict})`;
 }
 
+/** The doorway in front of you, and who the access keys would name. */
+function describeDoor(): string {
+  const doorway = nearestDoorway();
+  if (!doorway || !room) return 'no doorway nearby';
+  const at = worldPositionOf(doorway.site);
+  const distance = Vector3.Distance(camera.position, new Vector3(at.x, at.y, at.z));
+  const door = room.state.doors.get(doorway.key);
+  const neighbour = nearestOtherAccountId();
+  // Who the grant keys would name, because they name whoever is standing
+  // closest and a player has to be able to see which one that is.
+  const grants = neighbour
+    ? `K/shift-K door access, J/shift-J build access for ${neighbour.slice(0, 8)}`
+    : 'nobody nearby to grant access to';
+  if (!door) return `empty doorway ${distance.toFixed(1)}m -- 7 then X hangs a door`;
+  return `${door.open ? 'OPEN' : 'shut'} ${distance.toFixed(1)}m (O) : ${grants}`;
+}
+
 /** The crate you are standing at, as the server last reported it to you. */
 function describeContainer(): string {
   const containerId = nearestContainerId();
@@ -995,6 +1113,14 @@ engine.runRenderLoop(() => {
     mesh.material = stationStates.get(stationId)?.lit ? litMaterial : stationMaterial;
   }
 
+  // An open door swings aside rather than vanishing, so "open" reads as a
+  // door standing open instead of a doorway nobody ever fitted one to.
+  for (const [key, mesh] of doorMeshes) {
+    const door = room?.state.doors.get(key);
+    if (!door) continue;
+    mesh.rotation.y = door.open ? (door.axis === 'x' ? Math.PI / 2 : -Math.PI / 2) : 0;
+  }
+
   // The ghost only appears while the player is holding the selected piece;
   // a permanent translucent box in front of the camera is just clutter.
   const holding = heldQuantity(selected.definitionId) > 0;
@@ -1034,6 +1160,7 @@ engine.runRenderLoop(() => {
           `body: ${describeCorpse()}`,
           `build: ${describeBuild()}`,
           `crate: ${describeContainer()}`,
+          `door: ${describeDoor()}`,
           `using: ${
             channel && channel.definitionId
               ? `${channel.definitionId} ${channel.elapsedS.toFixed(1)}/${channel.durationS.toFixed(0)}s`
@@ -1041,7 +1168,7 @@ engine.runRenderLoop(() => {
           }`,
           `last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : `  (${lookError ?? 'click canvas to look'})`}`,
           'WASD move : shift sprint : space jump : LMB swing at what you face : E take',
-          'C craft hatchet : N craft crate : 1-6 pick what to place : X place it : Q loot a body',
+          'C craft hatchet : N craft crate : 1-7 pick what to place : X place it : Q loot a body : O door',
           'Z store in crate : H take from crate : M craft one of the selected piece',
           'B bandage : V eat : at a station -- F fuel : R input : G light/snuff : T take output',
         ].join('\n')
