@@ -4,3 +4,4 @@ export * from './harvest.js';
 export * from './transactions.js';
 export * from './survival.js';
 export * from './bleed.js';
+export * from './processing.js';
