@@ -13,7 +13,17 @@ import { ColyseusSDK, getStateCallbacks, type Room } from '@colyseus/sdk';
 import { PROTOCOL_VERSION } from '@rwf/protocol';
 // The same constant the server validates with, so the ghost's preview and the
 // server's answer cannot drift apart into two different rules.
-import { PLACEMENT_CLEARANCE_M } from '@rwf/sim';
+import {
+  PLACEMENT_CLEARANCE_M,
+  siteKey,
+  validatePieceSite,
+  worldPositionOf,
+  CELL_SIZE_M,
+  STOREY_HEIGHT_M,
+  type PieceForm,
+  type PieceSite,
+} from '@rwf/sim';
+import { snapToSite } from './build.js';
 import { clampPitch, computeMoveIntent, wrapYaw, type KeyState } from './input.js';
 import { interpolateTransform, type Transform } from './interpolate.js';
 
@@ -91,6 +101,7 @@ const corpseMeshes = new Map<string, ReturnType<typeof MeshBuilder.CreateBox>>()
 const corpsePositions = new Map<string, Vector3>();
 const deployableMeshes = new Map<string, ReturnType<typeof MeshBuilder.CreateBox>>();
 const deployablePositions = new Map<string, Vector3>();
+const pieceMeshes = new Map<string, ReturnType<typeof MeshBuilder.CreateBox>>();
 
 const deerMaterial = new StandardMaterial('deerMat', scene);
 deerMaterial.diffuseColor = new Color3(0.65, 0.5, 0.3);
@@ -104,6 +115,28 @@ const corpseMaterial = new StandardMaterial('corpseMat', scene);
 corpseMaterial.diffuseColor = new Color3(0.2, 0.2, 0.45);
 const crateMaterial = new StandardMaterial('crateMat', scene);
 crateMaterial.diffuseColor = new Color3(0.55, 0.38, 0.18);
+const timberMaterial = new StandardMaterial('timberMat', scene);
+timberMaterial.diffuseColor = new Color3(0.48, 0.33, 0.16);
+
+/** The box each structural form is drawn as, in metres (GDD section 10's grid). */
+const PIECE_SHAPES: Record<string, { width: number; height: number; depth: number }> = {
+  foundation: { width: CELL_SIZE_M, height: 0.3, depth: CELL_SIZE_M },
+  ceiling: { width: CELL_SIZE_M, height: 0.3, depth: CELL_SIZE_M },
+  pillar: { width: 0.3, height: STOREY_HEIGHT_M, depth: 0.3 },
+  wall: { width: CELL_SIZE_M, height: STOREY_HEIGHT_M, depth: 0.2 },
+  // A doorway is a wall with a hole in it; one box cannot show that, so it is
+  // drawn shorter to be visibly the way in until the mesh has a real opening.
+  doorway: { width: CELL_SIZE_M, height: 1, depth: 0.2 },
+};
+
+function pieceShape(form: string, axis: string): { width: number; height: number; depth: number } {
+  const shape = PIECE_SHAPES[form] ?? { width: 1, height: 1, depth: 1 };
+  // A wall on the z edge runs the other way.
+  if ((form === 'wall' || form === 'doorway') && axis === 'z') {
+    return { width: shape.depth, height: shape.height, depth: shape.width };
+  }
+  return shape;
+}
 
 /**
  * GDD section 10's placement ghost. It has to show where the crate would land
@@ -183,6 +216,21 @@ interface ContainerPayload {
   removed: boolean;
 }
 const containerContents = new Map<string, ContainerPayload>();
+
+/**
+ * What the place key would put down. GDD section 10's ghost needs to know
+ * which piece it is previewing, and a hotbar is the smallest thing that can
+ * say so until there is a real build menu.
+ */
+const PLACEABLES: Array<{ key: string; definitionId: string; form: PieceForm | null }> = [
+  { key: 'Digit1', definitionId: 'small_crate', form: null },
+  { key: 'Digit2', definitionId: 'wood_foundation', form: 'foundation' },
+  { key: 'Digit3', definitionId: 'wood_pillar', form: 'pillar' },
+  { key: 'Digit4', definitionId: 'wood_wall', form: 'wall' },
+  { key: 'Digit5', definitionId: 'wood_doorway', form: 'doorway' },
+  { key: 'Digit6', definitionId: 'wood_ceiling', form: 'ceiling' },
+];
+let selected = PLACEABLES[0]!;
 /** Set while this account is dead; GDD section 12's death recap and respawn prompt. */
 let death: { corpseId: string | null } | undefined;
 let respawnNotice: string | undefined;
@@ -227,6 +275,9 @@ window.addEventListener('keydown', (e) => {
   // rest of the catalog.
   if (e.code === 'KeyC') attemptCraft('stone_hatchet', 1);
   if (e.code === 'KeyN') attemptCraft('small_crate', 1);
+  // Every placeable's recipe id is its item id, so the hotbar doubles as the
+  // build menu: pick a piece, press M, place it.
+  if (e.code === 'KeyM') attemptCraft(selected.definitionId, 1);
   // CONTENT section 3's stations. Direct keys for the same reason: a real
   // slot-by-slot station panel arrives with M2's containers.
   if (e.code === 'KeyF') attemptStationInsert('wood');
@@ -246,9 +297,11 @@ window.addEventListener('keydown', (e) => {
   if (e.code === 'Enter' && death) send({ type: 'respawn' });
   if (e.code === 'KeyQ') attemptCorpseTake();
   // GDD section 10's placement, and section 8's storage.
-  if (e.code === 'KeyX') attemptPlaceCrate();
+  if (e.code === 'KeyX') attemptPlace();
   if (e.code === 'KeyZ') attemptContainerInsert();
   if (e.code === 'KeyH') attemptContainerTake();
+  const placeable = PLACEABLES.find((entry) => entry.key === e.code);
+  if (placeable) selected = placeable;
 });
 
 document.addEventListener('pointerlockchange', () => {
@@ -479,6 +532,36 @@ async function connect(): Promise<void> {
     containerContents.delete(key);
   });
 
+  // Structural pieces carry their grid site, so the client draws them from
+  // the same numbers the server validated -- there is no position to round.
+  interface ReplicatedPiece {
+    form: string;
+    storey: number;
+    i: number;
+    k: number;
+    axis: string;
+  }
+  $(joined.state).buildingPieces!.onAdd((piece: ReplicatedPiece, key: string) => {
+    const shape = pieceShape(piece.form, piece.axis);
+    const mesh = MeshBuilder.CreateBox(`piece_${key}`, shape, scene);
+    mesh.material = timberMaterial;
+    const at = worldPositionOf({
+      form: piece.form as PieceForm,
+      storey: piece.storey,
+      i: piece.i,
+      k: piece.k,
+      axis: piece.axis === '' ? null : (piece.axis as 'x' | 'z'),
+    });
+    // Boxes are centred, so raise the ones whose site names their base.
+    const lift = piece.form === 'pillar' ? STOREY_HEIGHT_M / 2 : 0;
+    mesh.position.set(at.x, at.y + lift, at.z);
+    pieceMeshes.set(key, mesh);
+  });
+  $(joined.state).buildingPieces!.onRemove((_piece: ReplicatedPiece, key: string) => {
+    pieceMeshes.get(key)?.dispose();
+    pieceMeshes.delete(key);
+  });
+
   joined.onStateChange(() => {
     patchAtMs = performance.now();
     const local = joined.state.players.get(accountId);
@@ -607,24 +690,58 @@ function ghostPosition(): Vector3 {
   );
 }
 
+/** The grid site the selected piece would snap to, or null for a free-placed deployable. */
+function ghostSite(): PieceSite | null {
+  if (!selected.form) return null;
+  const aim = ghostPosition();
+  return snapToSite(selected.form, aim);
+}
+
 /**
  * Whether the server would take this placement, using the same rules it does.
  * It is a preview, not a gate: the key sends regardless and the HUD reports
  * whatever the server actually said, so a client that got this wrong cannot
- * turn a refusal into a placement or hide one it would have allowed.
+ * turn a refusal into a placement or hide one it would have allowed. It is
+ * also deliberately incomplete -- it does not know the per-owner caps or where
+ * other players are standing, so it can show green on a placement the server
+ * then refuses, which is why the HUD calls it "clear here" and not "allowed".
  */
-function ghostIsLegal(position: Vector3): boolean {
-  const occupied: Vector3[] = [...deployablePositions.values(), ...STATIONS.map((s) => s.position),
-    ...NODES.map((n) => n.position)];
+function ghostIsLegal(): boolean {
+  if (heldQuantity(selected.definitionId) < 1) return false;
+
+  const site = ghostSite();
+  if (site) {
+    const placed = new Set<string>();
+    if (room) for (const key of room.state.buildingPieces.keys()) placed.add(key);
+    return validatePieceSite(site, placed) === null;
+  }
+
+  const position = ghostPosition();
+  const occupied: Vector3[] = [
+    ...deployablePositions.values(),
+    ...STATIONS.map((s) => s.position),
+    ...NODES.map((n) => n.position),
+  ];
   for (const other of occupied) {
     if (Math.hypot(position.x - other.x, position.z - other.z) < PLACEMENT_CLEARANCE_M) return false;
   }
-  return heldQuantity('small_crate') > 0;
+  return true;
 }
 
-function attemptPlaceCrate(): void {
+function attemptPlace(): void {
+  const site = ghostSite();
+  if (site) {
+    send({ type: 'placeBuildingPiece', definitionId: selected.definitionId, ...site });
+    return;
+  }
   const position = ghostPosition();
-  send({ type: 'placeDeployable', definitionId: 'small_crate', x: position.x, y: position.y, z: position.z });
+  send({
+    type: 'placeDeployable',
+    definitionId: selected.definitionId,
+    x: position.x,
+    y: position.y,
+    z: position.z,
+  });
 }
 
 /** The nearest crate; GDD section 8 has no owner-only storage. */
@@ -822,13 +939,21 @@ function describeCorpse(): string {
   return `${corpseId} ${distance.toFixed(1)}m : ${listed}${more}${held} (Q)`;
 }
 
+/** What the place key is holding and where it would go (GDD section 10's ghost). */
+function describeBuild(): string {
+  const held = heldQuantity(selected.definitionId);
+  const slot = PLACEABLES.indexOf(selected) + 1;
+  if (held < 1) return `${slot}:${selected.definitionId} -- none in pack (1-6 to switch)`;
+  const site = ghostSite();
+  // "clear here" rather than "allowed": this preview does not know the caps
+  // or where other players are standing, so the server can still refuse it.
+  const verdict = ghostIsLegal() ? 'clear here' : 'BLOCKED';
+  const where = site ? `cell ${site.i},${site.k}${site.axis ? ` ${site.axis}` : ''}` : 'where you face';
+  return `${slot}:${selected.definitionId} x${held} -- X places at ${where} (${verdict})`;
+}
+
 /** The crate you are standing at, as the server last reported it to you. */
 function describeContainer(): string {
-  if (heldQuantity('small_crate') > 0) {
-    const position = ghostPosition();
-    const verdict = ghostIsLegal(position) ? 'clear' : 'BLOCKED';
-    return `holding one -- X places it here (${verdict})`;
-  }
   const containerId = nearestContainerId();
   if (!containerId) return 'none nearby (craft one with 40 wood)';
   const distance = Vector3.Distance(camera.position, deployablePositions.get(containerId)!);
@@ -870,14 +995,24 @@ engine.runRenderLoop(() => {
     mesh.material = stationStates.get(stationId)?.lit ? litMaterial : stationMaterial;
   }
 
-  // The ghost is only shown while the player is actually holding a crate;
+  // The ghost only appears while the player is holding the selected piece;
   // a permanent translucent box in front of the camera is just clutter.
-  const holdingCrate = heldQuantity('small_crate') > 0;
-  ghostMesh.setEnabled(holdingCrate && !death);
-  if (holdingCrate) {
-    const position = ghostPosition();
-    ghostMesh.position.set(position.x, position.y + 0.35, position.z);
-    ghostMesh.material = ghostIsLegal(position) ? ghostOkMaterial : ghostBadMaterial;
+  const holding = heldQuantity(selected.definitionId) > 0;
+  ghostMesh.setEnabled(holding && !death);
+  if (holding) {
+    const site = ghostSite();
+    if (site) {
+      const shape = pieceShape(site.form, site.axis ?? '');
+      ghostMesh.scaling.set(shape.width / 0.9, shape.height / 0.7, shape.depth / 0.9);
+      const at = worldPositionOf(site);
+      const lift = site.form === 'pillar' ? STOREY_HEIGHT_M / 2 : 0;
+      ghostMesh.position.set(at.x, at.y + lift, at.z);
+    } else {
+      ghostMesh.scaling.set(1, 1, 1);
+      const position = ghostPosition();
+      ghostMesh.position.set(position.x, position.y + 0.35, position.z);
+    }
+    ghostMesh.material = ghostIsLegal() ? ghostOkMaterial : ghostBadMaterial;
   }
 
   const now = performance.now();
@@ -897,6 +1032,7 @@ engine.runRenderLoop(() => {
           `near: ${describeNearest()}`,
           `station: ${describeStation()}`,
           `body: ${describeCorpse()}`,
+          `build: ${describeBuild()}`,
           `crate: ${describeContainer()}`,
           `using: ${
             channel && channel.definitionId
@@ -905,7 +1041,8 @@ engine.runRenderLoop(() => {
           }`,
           `last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : `  (${lookError ?? 'click canvas to look'})`}`,
           'WASD move : shift sprint : space jump : LMB swing at what you face : E take',
-          'C craft hatchet : N craft crate : X place crate : Z store : H take from crate : Q loot a body',
+          'C craft hatchet : N craft crate : 1-6 pick what to place : X place it : Q loot a body',
+          'Z store in crate : H take from crate : M craft one of the selected piece',
           'B bandage : V eat : at a station -- F fuel : R input : G light/snuff : T take output',
         ].join('\n')
       : disconnectReason

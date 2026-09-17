@@ -10,5 +10,5 @@
     "moduleResolution": "bundler"
   },
   "include": ["src"],
-  "references": [{ "path": "../../packages/protocol" }]
+  "references": [{ "path": "../../packages/protocol" }, { "path": "../../packages/sim" }]
 }
