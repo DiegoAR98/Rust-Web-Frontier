@@ -67,6 +67,12 @@ export type UseItemIntent = z.infer<typeof UseItemIntentSchema>;
  */
 export const RespawnIntentSchema = z.object({
   type: z.literal('respawn'),
+  /**
+   * A personal respawn anchor to come back at (GDD section 12). Null asks for
+   * the random arrival anchor. Naming one does not make it legal: the server
+   * still checks that it is the player's, still standing and off cooldown.
+   */
+  anchorId: z.string().min(1).max(64).nullable().optional(),
 });
 export type RespawnIntent = z.infer<typeof RespawnIntentSchema>;
 

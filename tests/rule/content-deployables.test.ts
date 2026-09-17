@@ -8,7 +8,23 @@ import { DEPLOYABLES, getDeployable, getItem, getRecipe } from '@rwf/content';
  */
 describe('deployable catalog (CONTENT section 7)', () => {
   it('resolves the small crate matching CONTENT exactly', () => {
-    expect(getDeployable('small_crate')).toEqual({ id: 'small_crate', slots: 12, placedHp: 250 });
+    expect(getDeployable('small_crate')).toEqual({
+      id: 'small_crate',
+      slots: 12,
+      placedHp: 250,
+      respawnCooldownS: null,
+    });
+  });
+
+  it('makes the bedroll a spawn anchor rather than a container', () => {
+    // CONTENT section 7: "bedroll / cot | 200 / 400 | Owner-only spawn, no
+    // time skipping", and GDD section 12's 300-second bedroll cooldown.
+    expect(getDeployable('bedroll')).toEqual({
+      id: 'bedroll',
+      slots: 0,
+      placedHp: 200,
+      respawnCooldownS: 300,
+    });
   });
 
   it('returns undefined for something that is not a deployable', () => {

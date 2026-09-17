@@ -194,6 +194,13 @@ const CARCASS_LIFETIME_TICKS = 10 * 60 * TICK_RATE_HZ;
 const CORPSE_LIFETIME_TICKS = 30 * 60 * TICK_RATE_HZ;
 /** GDD section 8: "Player-dropped bags have a 10-minute lifetime". */
 const BAG_LIFETIME_TICKS = 10 * 60 * TICK_RATE_HZ;
+/** GDD section 12: "maximum five combined per account". */
+const ANCHORS_PER_ACCOUNT = 5;
+/**
+ * GDD section 12: using an anchor "applies at least that cooldown to the
+ * owner's other anchors within 50 m".
+ */
+const ANCHOR_SHARED_COOLDOWN_RADIUS_M = 50;
 /**
  * GDD section 12's "valid Coyote Wash or Juniper perimeter anchor". The real
  * map authors 16 arrival anchors (GDD section 13); until the map exists these
@@ -431,6 +438,12 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
    * every other timer (T17).
    */
   private readonly raidLockUntilTick = new Map<string, number>();
+  /**
+   * When each personal respawn anchor is next usable (GDD section 12). In
+   * ticks, because the section says "Cooldowns use persisted simulation time"
+   * -- a stopped host must not run them down.
+   */
+  private readonly anchorReadyAtTick = new Map<string, number>();
 
   onCreate(): void {
     // TECHNICAL section 17: the world keeps running even when nobody is
@@ -514,6 +527,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         placedAtTick: record.placedAtTick,
         slots: padSlots(record.slots, definition.slots),
       });
+      if (record.anchorReadyAtTick > 0) this.anchorReadyAtTick.set(deployableId, record.anchorReadyAtTick);
       const replicated = new DeployableState();
       replicated.definitionId = record.definitionId;
       replicated.ownerAccountId = record.ownerAccountId;
@@ -1111,6 +1125,12 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     if (refusal === 'overlap') return { ...base, accepted: false, reasonCode: 'overlap' };
     if (refusal) return { ...base, accepted: false, reasonCode: 'cap_reached' };
 
+    // GDD section 12: "maximum five combined per account". Checked before the
+    // item is spent, like every other cap.
+    if (definition.respawnCooldownS !== null && this.anchorsOf(accountId).length >= ANCHORS_PER_ACCOUNT) {
+      return { ...base, accepted: false, reasonCode: 'cap_reached' };
+    }
+
     const { slots: remaining } = removeFromInventory(slots, definitionId, 1);
     this.playerSlots.set(accountId, remaining);
 
@@ -1132,11 +1152,76 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     replicated.health = definition.placedHp;
     this.state.deployables.set(deployableId, replicated);
 
+    // GDD section 12: "A new anchor starts on its full cooldown" -- laying one
+    // must not be a free trip home the moment you die.
+    if (definition.respawnCooldownS !== null) {
+      this.anchorReadyAtTick.set(deployableId, this.state.tick + definition.respawnCooldownS * TICK_RATE_HZ);
+    }
+
     this.store.runInTransaction(() => {
       this.store.savePlayerSlots(accountId, remaining);
       this.persistDeployable(deployableId);
     });
     return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  /** This account's personal respawn anchors, standing right now. */
+  private anchorsOf(accountId: string): Array<{ id: string; position: Point3; cooldownS: number }> {
+    const anchors: Array<{ id: string; position: Point3; cooldownS: number }> = [];
+    for (const [id, placed] of this.deployables) {
+      if (placed.ownerAccountId !== accountId) continue;
+      const cooldownS = getDeployable(placed.definitionId)?.respawnCooldownS;
+      if (cooldownS === null || cooldownS === undefined) continue;
+      anchors.push({ id, position: placed.position, cooldownS });
+    }
+    return anchors;
+  }
+
+  /** Why this anchor cannot be used, or null when it can. */
+  private checkAnchor(accountId: string, anchorId: string): CommandResult['reasonCode'] | null {
+    const placed = this.deployables.get(anchorId);
+    // T13's "destroyed anchor unavailable" -- and a player whose bedroll
+    // burned down must still be able to take the random anchor instead.
+    if (!placed) return 'not_found';
+    if (getDeployable(placed.definitionId)?.respawnCooldownS == null) return 'not_found';
+    // CONTENT section 7: "Owner-only spawn".
+    if (placed.ownerAccountId !== accountId) return 'forbidden';
+    if ((this.anchorReadyAtTick.get(anchorId) ?? -Infinity) > this.state.tick) return 'busy';
+    return null;
+  }
+
+  /**
+   * GDD section 12: "Using one starts its timer and applies at least that
+   * cooldown to the owner's other anchors within 50 m." Without the second
+   * half, a pile of bedrolls in one room is an unlimited respawn.
+   */
+  private startAnchorCooldown(accountId: string, anchorId: string): void {
+    const used = this.deployables.get(anchorId);
+    if (!used) return;
+    const cooldownS = getDeployable(used.definitionId)?.respawnCooldownS ?? 0;
+    const readyAt = this.state.tick + cooldownS * TICK_RATE_HZ;
+    this.anchorReadyAtTick.set(anchorId, readyAt);
+
+    for (const other of this.anchorsOf(accountId)) {
+      if (other.id === anchorId) continue;
+      const distance = Math.hypot(
+        other.position.x - used.position.x,
+        other.position.y - used.position.y,
+        other.position.z - used.position.z,
+      );
+      if (distance > ANCHOR_SHARED_COOLDOWN_RADIUS_M) continue;
+      // "at least that cooldown": a neighbour already on a longer one keeps
+      // it, rather than having it shortened by someone else's respawn.
+      this.anchorReadyAtTick.set(other.id, Math.max(this.anchorReadyAtTick.get(other.id) ?? -Infinity, readyAt));
+    }
+
+    // GDD section 12: "Cooldowns use persisted simulation time." Written at
+    // the commit that started them, not at the next checkpoint, so a restart
+    // in between cannot hand the player a ready bedroll.
+    this.store.runInTransaction(() => {
+      this.persistDeployable(anchorId);
+      for (const other of this.anchorsOf(accountId)) this.persistDeployable(other.id);
+    });
   }
 
   /**
@@ -1669,6 +1754,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       position: deployable.position,
       health: this.state.deployables.get(deployableId)?.health ?? 0,
       placedAtTick: deployable.placedAtTick,
+      anchorReadyAtTick: this.anchorReadyAtTick.get(deployableId) ?? 0,
       slots: deployable.slots,
     });
   }
@@ -1853,10 +1939,25 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
    * inside commitOutcome, so a duplicated respawn command returns the first
    * outcome rather than handing out a second kit.
    */
-  private resolveRespawn(accountId: string, sequence: number): CommandResult {
+  private resolveRespawn(accountId: string, anchorId: string | null, sequence: number): CommandResult {
     const base = { sequence, serverTick: this.state.tick };
     if (!this.deadAccounts.has(accountId)) {
       return { ...base, accepted: false, reasonCode: 'not_dead' };
+    }
+
+    // GDD section 12's personal respawn anchor. A refusal leaves the player
+    // dead rather than silently dumping them at a random anchor: they asked
+    // for a specific place and need to know they did not get it.
+    if (anchorId) {
+      const refusal = this.checkAnchor(accountId, anchorId);
+      if (refusal) return { ...base, accepted: false, reasonCode: refusal };
+      const position = { ...this.deployables.get(anchorId)!.position };
+      this.startAnchorCooldown(accountId, anchorId);
+      this.reviveAt(accountId, position);
+      // safe is not in question at a bedroll: the player chose where it went,
+      // and section 12's warning is about the random arrival anchor.
+      this.clientsByAccount.get(accountId)?.send('respawn', { ...position, safe: true });
+      return { ...base, accepted: true, reasonCode: 'ok' };
     }
 
     // "Active enemies" is read as things that would attack the new body: other
@@ -1875,6 +1976,18 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     const chosen = chooseRespawnAnchor(RESPAWN_ANCHORS, enemies, this.respawnRoll);
     const position = chosen ? { ...chosen.anchor.position } : { x: 0, y: 0, z: 0 };
 
+    this.reviveAt(accountId, position);
+    // safe: false is section 12's "communicate that the world is dangerous".
+    this.clientsByAccount.get(accountId)?.send('respawn', { ...position, safe: chosen?.safe ?? false });
+    return { ...base, accepted: true, reasonCode: 'ok' };
+  }
+
+  /**
+   * GDD section 12's "Respawn grants the starter kit exactly once and resets
+   * survival stats", shared by the random anchor and a personal one. The
+   * "exactly once" is commitOutcome's, which both paths run inside.
+   */
+  private reviveAt(accountId: string, position: Point3): void {
     this.deadAccounts.delete(accountId);
     this.movementByAccount.set(accountId, { position, velocityY: 0, grounded: true });
     const player = new PlayerState();
@@ -1894,10 +2007,6 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       this.store.savePlayerVitals(accountId, vitals);
       this.store.savePlayerCheckpoint(accountId, { ...position, yaw: 0, grounded: true });
     });
-
-    // safe: false is section 12's "communicate that the world is dangerous".
-    this.clientsByAccount.get(accountId)?.send('respawn', { ...position, safe: chosen?.safe ?? false });
-    return { ...base, accepted: true, reasonCode: 'ok' };
   }
 
   /**
@@ -2480,8 +2589,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     }
 
     if (command.action.type === 'respawn') {
+      const anchorId = command.action.anchorId ?? null;
       const encoded = this.store.commitOutcome(key, () =>
-        JSON.stringify(this.resolveRespawn(accountId, command.sequence)),
+        JSON.stringify(this.resolveRespawn(accountId, anchorId, command.sequence)),
       );
       client.send('commandResult', JSON.parse(encoded) as CommandResult);
       client.send('inventory', { slots: this.playerSlots.get(accountId) });

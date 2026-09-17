@@ -85,6 +85,37 @@ describe('WorldRoom crates across a restart (T04, GDD section 10)', () => {
     rejoined.leave();
   });
 
+  it('still owes a bedroll the rest of its cooldown afterwards', async () => {
+    // GDD section 12: "Cooldowns use persisted simulation time." A restart
+    // that cleared them would make every bedroll in the world instantly ready,
+    // which is a free respawn for every raid victim on the server.
+    const first = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const client = await colyseus.connectTo(first, { accountId: 'acct_sleeper' });
+    await client.waitForMessage('session');
+    first.clearInventoryForTest('acct_sleeper');
+    first.teleportForTest('acct_sleeper', SPOT);
+    first.grantForTest('acct_sleeper', 'bedroll', 1);
+    client.send('command', command({ type: 'placeDeployable', definitionId: 'bedroll', x: 31, y: 0, z: 30 }));
+    expect((await client.waitForMessage('commandResult')).accepted).toBe(true);
+    const anchorId = [...first.state.deployables.keys()][0]!;
+    first.checkpoint(); // the world clock is class-2 and needed for the comparison
+
+    await colyseus.cleanup();
+
+    const second = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const again = await colyseus.connectTo(second, { accountId: 'acct_sleeper' });
+    const { sessionEpoch } = await again.waitForMessage('session');
+    second.damageForTest('acct_sleeper', 100);
+
+    again.send('command', command({ type: 'respawn', anchorId }, sessionEpoch));
+    const result = await again.waitForMessage('commandResult');
+
+    expect(result.accepted).toBe(false);
+    expect(result.reasonCode).toBe('busy');
+
+    again.leave();
+  });
+
   it('does not reuse a restored crate id for the next placement', async () => {
     const first = (await colyseus.createRoom('world', {})) as WorldRoom;
     const client = await colyseus.connectTo(first, { accountId: 'acct_ids' });

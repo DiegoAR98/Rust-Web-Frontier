@@ -33,6 +33,14 @@ export const RECIPES: RecipeDefinition[] = [
   // wood 15 / 5 s", "wall | wood 40 / 10 s", "doorway | wood 40 / 10 s",
   // "ceiling | wood 50 / 15 s", plus section 2's "wood_door | wood 30 | 10".
   // These six sum to CONTENT's 360-wood 1x1 cabin.
+  // CONTENT section 2: "bedroll | cloth 20 | 15 | Hand | Default".
+  {
+    id: 'bedroll',
+    outputId: 'bedroll',
+    outputQuantityPerUnit: 1,
+    inputs: { cloth: 20 },
+    durationS: 15,
+  },
   {
     id: 'wood_foundation',
     outputId: 'wood_foundation',

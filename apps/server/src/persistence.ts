@@ -118,6 +118,12 @@ export interface DeployableRecord {
    * without a migration.
    */
   placedAtTick: number;
+  /**
+   * When a personal respawn anchor is next usable. GDD section 12: "Cooldowns
+   * use persisted simulation time" -- a restart that cleared this would make
+   * every bedroll in the world instantly ready.
+   */
+  anchorReadyAtTick: number;
   slots: Slot[];
 }
 
@@ -130,6 +136,7 @@ interface DeployableRow {
   z: number;
   health: number;
   placed_at_tick: number;
+  anchor_ready_at_tick: number;
 }
 
 interface DeployableSlotRow {
@@ -413,7 +420,8 @@ export class WorldStore {
         y REAL NOT NULL,
         z REAL NOT NULL,
         health REAL NOT NULL,
-        placed_at_tick INTEGER NOT NULL
+        placed_at_tick INTEGER NOT NULL,
+        anchor_ready_at_tick INTEGER NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS building_pieces (
         site_key TEXT PRIMARY KEY,
@@ -1000,12 +1008,14 @@ export class WorldStore {
       this.db
         .prepare(
           `INSERT INTO deployables
-             (deployable_id, definition_id, owner_account_id, x, y, z, health, placed_at_tick)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             (deployable_id, definition_id, owner_account_id, x, y, z, health, placed_at_tick,
+              anchor_ready_at_tick)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(deployable_id) DO UPDATE SET
              definition_id = excluded.definition_id, owner_account_id = excluded.owner_account_id,
              x = excluded.x, y = excluded.y, z = excluded.z, health = excluded.health,
-             placed_at_tick = excluded.placed_at_tick`,
+             placed_at_tick = excluded.placed_at_tick,
+             anchor_ready_at_tick = excluded.anchor_ready_at_tick`,
         )
         .run(
           deployableId,
@@ -1016,6 +1026,7 @@ export class WorldStore {
           record.position.z,
           record.health,
           record.placedAtTick,
+          record.anchorReadyAtTick,
         );
       this.db.prepare('DELETE FROM deployable_slots WHERE deployable_id = ?').run(deployableId);
       const insert = this.db.prepare(
@@ -1039,7 +1050,9 @@ export class WorldStore {
   loadDeployables(): Map<string, DeployableRecord> {
     const rows = this.db
       .prepare(
-        'SELECT deployable_id, definition_id, owner_account_id, x, y, z, health, placed_at_tick FROM deployables',
+        `SELECT deployable_id, definition_id, owner_account_id, x, y, z, health, placed_at_tick,
+                anchor_ready_at_tick
+         FROM deployables`,
       )
       .all() as DeployableRow[];
     const slotRows = this.db
@@ -1054,6 +1067,7 @@ export class WorldStore {
         position: { x: row.x, y: row.y, z: row.z },
         health: row.health,
         placedAtTick: row.placed_at_tick,
+        anchorReadyAtTick: row.anchor_ready_at_tick,
         // Sparse on purpose: only occupied slots are stored, so the room pads
         // back out to the definition's slot count when it restores.
         slots: [],
