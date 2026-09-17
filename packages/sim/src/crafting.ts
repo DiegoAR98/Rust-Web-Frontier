@@ -22,7 +22,7 @@ export function startQueueEntry(recipe: Recipe, totalUnits: number): QueueEntry 
  * Steps one queue entry by dt seconds. Reserves output capacity before
  * completing each unit; a fully blocked output pauses the whole entry
  * (progress does not bank either), matching the same "pause the station"
- * semantics as stepConversion (GDD section 9: "Full inventory pauses
+ * semantics as stepStation (GDD section 9: "Full inventory pauses
  * output completion with a visible reason and retains escrow").
  */
 export function tickQueueEntry(
