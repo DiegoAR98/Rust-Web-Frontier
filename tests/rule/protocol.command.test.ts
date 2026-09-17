@@ -57,6 +57,20 @@ describe('CommandSchema', () => {
     expect(result.success).toBe(false);
   });
 
+  it('rejects a sequence number beyond the float64 safe-integer range', () => {
+    const result = CommandSchema.safeParse(
+      validMoveCommand({ sequence: Number.MAX_SAFE_INTEGER + 2 }),
+    );
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a sessionEpoch number beyond the float64 safe-integer range', () => {
+    const result = CommandSchema.safeParse(
+      validMoveCommand({ sessionEpoch: Number.MAX_SAFE_INTEGER + 2 }),
+    );
+    expect(result.success).toBe(false);
+  });
+
   it('accepts a well-formed take-item command', () => {
     const result = CommandSchema.safeParse(
       validMoveCommand({ action: { type: 'takeItem', itemInstanceId: 'item_123' } }),

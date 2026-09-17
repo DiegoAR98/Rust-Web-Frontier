@@ -28,7 +28,15 @@ export interface TransactionLog<TOutcome> {
 }
 
 function transactionKeyString(key: TransactionKey): string {
-  return `${key.accountId}:${key.sessionEpoch}:${key.sequence}`;
+  // sessionEpoch/sequence must be safe integers: beyond Number.MAX_SAFE_INTEGER,
+  // distinct float64 values can round to the same representation, which would
+  // let a forged large sequence collide with a different one under this key.
+  if (!Number.isSafeInteger(key.sessionEpoch) || !Number.isSafeInteger(key.sequence)) {
+    throw new RangeError('transaction key requires safe-integer sessionEpoch and sequence');
+  }
+  // JSON-encode rather than delimiter-join so an accountId containing the
+  // delimiter itself cannot be crafted to collide with a different tuple.
+  return JSON.stringify([key.accountId, key.sessionEpoch, key.sequence]);
 }
 
 /**
@@ -36,7 +44,9 @@ function transactionKeyString(key: TransactionKey): string {
  * sequence (retry after a client timeout, or a forced-replay after crash
  * recovery) returns the originally stored outcome instead of recomputing
  * or overwriting it (TECHNICAL section 2: "Retries return the stored
- * outcome, not another item").
+ * outcome, not another item"). Uses `has` rather than an `undefined` check
+ * so a legitimately committed `undefined` outcome cannot fail open into a
+ * reprocess.
  */
 export function commitOutcome<TOutcome>(
   log: TransactionLog<TOutcome>,
@@ -44,9 +54,8 @@ export function commitOutcome<TOutcome>(
   outcome: TOutcome,
 ): TOutcome {
   const k = transactionKeyString(key);
-  const existing = log.committed.get(k);
-  if (existing !== undefined) {
-    return existing;
+  if (log.committed.has(k)) {
+    return log.committed.get(k) as TOutcome;
   }
   log.committed.set(k, outcome);
   return outcome;

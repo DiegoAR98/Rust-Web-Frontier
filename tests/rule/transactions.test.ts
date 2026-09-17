@@ -64,4 +64,21 @@ describe('transaction outcome log', () => {
 
     expect(other).toBe('b');
   });
+
+  it('does not fail open when a legitimately committed outcome is the value undefined', () => {
+    const log: TransactionLog<string | undefined> = { committed: new Map() };
+    const key = { accountId: 'acct_1', sessionEpoch: 1, sequence: 1 };
+
+    commitOutcome(log, key, undefined);
+    const replay = commitOutcome(log, key, 'granted-wood');
+
+    expect(replay).toBeUndefined();
+  });
+
+  it('rejects a sessionEpoch or sequence outside the float64 safe-integer range instead of risking a key collision', () => {
+    const log: TransactionLog<string> = { committed: new Map() };
+    const unsafe = { accountId: 'acct_1', sessionEpoch: 1, sequence: Number.MAX_SAFE_INTEGER + 2 };
+
+    expect(() => commitOutcome(log, unsafe, 'a')).toThrow();
+  });
 });
