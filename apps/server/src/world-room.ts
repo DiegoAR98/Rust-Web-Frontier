@@ -13,6 +13,9 @@ import {
   validateDeployablePlacement,
   validatePieceSite,
   cascadeRemoval,
+  stepDecay,
+  DECAY_INTERVAL_S,
+  WOOD_DECAY,
   isReachBlocked,
   wallSegment,
   type GroundSegment,
@@ -201,6 +204,13 @@ const ANCHORS_PER_ACCOUNT = 5;
  * owner's other anchors within 50 m".
  */
 const ANCHOR_SHARED_COOLDOWN_RADIUS_M = 50;
+/**
+ * GDD section 10: "awake connected owners or authorized builders within 50 m
+ * refresh their building cluster's activity timestamp".
+ */
+const DECAY_ACTIVITY_RADIUS_M = 50;
+/** Section 10 runs decay on a one-minute step; DECAY_INTERVAL_S is that minute. */
+const DECAY_INTERVAL_TICKS = DECAY_INTERVAL_S * TICK_RATE_HZ;
 /**
  * GDD section 12's "valid Coyote Wash or Juniper perimeter anchor". The real
  * map authors 16 arrival anchors (GDD section 13); until the map exists these
@@ -444,6 +454,14 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
    * -- a stopped host must not run them down.
    */
   private readonly anchorReadyAtTick = new Map<string, number>();
+  /**
+   * When each placed thing last had an awake owner or authorised builder
+   * within 50 m (GDD section 10's decay). Keyed by site for a structural piece
+   * and by id for a deployable; both decay on the same rule.
+   */
+  private readonly lastActivityTick = new Map<string, number>();
+  /** The tick the last decay minute ran on; see tickDecay. */
+  private lastDecayTick = 0;
 
   onCreate(): void {
     // TECHNICAL section 17: the world keeps running even when nobody is
@@ -1152,6 +1170,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     replicated.health = definition.placedHp;
     this.state.deployables.set(deployableId, replicated);
 
+    this.lastActivityTick.set(deployableId, this.state.tick);
     // GDD section 12: "A new anchor starts on its full cooldown" -- laying one
     // must not be a free trip home the moment you die.
     if (definition.respawnCooldownS !== null) {
@@ -1347,6 +1366,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       if (linkedSiteKeys(other.site).includes(key)) this.linkPieces(key, otherKey);
     }
 
+    this.lastActivityTick.set(key, this.state.tick);
     this.barrierCache = null; // a new wall or doorway changes what blocks a reach
     const replicated = new BuildingPieceState();
     replicated.definitionId = definitionId;
@@ -1661,6 +1681,95 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       }
     });
     this.barrierCache = null;
+  }
+
+  /**
+   * GDD section 10's decay, one minute at a time. Two halves, in order:
+   * "Every 60 seconds, awake connected owners or authorized builders within
+   * 50 m refresh their building cluster's activity timestamp; sleepers do
+   * not", and then "At each minute after grace, subtract the appropriate
+   * fraction of max HP".
+   *
+   * Driven by the tick counter, so a stopped host does not catch up -- section
+   * 10 says so outright, and it is T17's rule for every other timer.
+   */
+  private tickDecay(): void {
+    this.refreshActivity();
+
+    for (const [key, replicated] of [...this.state.buildingPieces]) {
+      const piece = this.buildingPieces.get(key);
+      const maxHealth = piece ? getBuildingPiece(piece.definitionId)?.placedHp : undefined;
+      if (!maxHealth) continue;
+      const health = this.decayOne(key, replicated.health, maxHealth);
+      if (health > 0) {
+        replicated.health = health;
+        continue;
+      }
+      // Combat immunity is to combat; the same CONTENT row says "Combat
+      // immune; decays", so a foundation goes this way and takes its
+      // building with it.
+      this.destroyPiece(key);
+    }
+
+    for (const [id, replicated] of [...this.state.deployables]) {
+      const deployable = this.deployables.get(id);
+      const maxHealth = deployable ? getDeployable(deployable.definitionId)?.placedHp : undefined;
+      if (!maxHealth) continue;
+      const health = this.decayOne(id, replicated.health, maxHealth);
+      if (health > 0) {
+        replicated.health = health;
+        continue;
+      }
+      // "Nonempty containers still decay and spill loot; there is no immortal
+      // full-box exception."
+      this.breakDeployable(id);
+    }
+  }
+
+  private decayOne(key: string, health: number, maxHealth: number): number {
+    const since = (this.state.tick - (this.lastActivityTick.get(key) ?? this.state.tick)) / TICK_RATE_HZ;
+    return stepDecay(health, maxHealth, since, WOOD_DECAY);
+  }
+
+  /**
+   * Stamps every placed thing that has an awake owner or authorised builder
+   * standing near it. Strangers do not count -- section 10 names the owner and
+   * their explicit builders, and a squatter propping up someone else's base is
+   * the opposite of what the rule is for.
+   */
+  private refreshActivity(): void {
+    const awake: Array<{ accountId: string; position: Point3 }> = [];
+    for (const accountId of this.connectedAccounts) {
+      const movement = this.movementByAccount.get(accountId);
+      // A sleeper is disconnected, so it is already absent here; a dead
+      // account has no body at all.
+      if (!movement || this.deadAccounts.has(accountId)) continue;
+      awake.push({ accountId, position: movement.position });
+    }
+    if (awake.length === 0) return;
+
+    const stamp = (key: string, ownerAccountId: string, position: Point3): void => {
+      for (const person of awake) {
+        if (person.accountId !== ownerAccountId && !this.buildAccess.get(ownerAccountId)?.has(person.accountId)) {
+          continue;
+        }
+        const distance = Math.hypot(
+          person.position.x - position.x,
+          person.position.y - position.y,
+          person.position.z - position.z,
+        );
+        if (distance > DECAY_ACTIVITY_RADIUS_M) continue;
+        this.lastActivityTick.set(key, this.state.tick);
+        return;
+      }
+    };
+
+    for (const [key, piece] of this.buildingPieces) {
+      stamp(key, piece.ownerAccountId, worldPositionOf(piece.site));
+    }
+    for (const [id, deployable] of this.deployables) {
+      stamp(id, deployable.ownerAccountId, deployable.position);
+    }
   }
 
   private linkPieces(a: string, b: string): void {
@@ -3286,6 +3395,11 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.destroyPiece(siteKey(site));
   }
 
+  /** Test-only: runs one decay minute without waiting for the real tick timer. */
+  decayTickForTest(): void {
+    this.tickDecay();
+  }
+
   raidLockedForTest(site: PieceSite): boolean {
     return this.isRaidLocked(this.buildingFrom([siteKey(site)]));
   }
@@ -3347,6 +3461,10 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
 
     this.expireCarcasses();
     this.expireCorpses();
+    if (this.state.tick - this.lastDecayTick >= DECAY_INTERVAL_TICKS) {
+      this.lastDecayTick = this.state.tick;
+      this.tickDecay();
+    }
     this.sendCorpsesToArrivals();
     this.sendDeployablesToArrivals();
 
