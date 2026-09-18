@@ -75,6 +75,7 @@ import {
   REGEN_CALORIE_COST_PER_HP,
   harvestNode,
   removeFromInventory,
+  resolveMove,
   startQueueEntry,
   stepMovement,
   stepStation,
@@ -983,7 +984,16 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     for (const [creatureId, creature] of this.creatures) {
       const spec = CREATURE_SPECS[creature.kind];
       const target = this.nearestBody(creature.position);
-      const { state, attackDamage } = stepCreature(creature, spec, target?.position ?? null, dt);
+      const stepped = stepCreature(creature, spec, target?.position ?? null, dt);
+      // The same walls that stop a player. Without this, collision would make
+      // a base worse than no base at all: it would hold the raider out and
+      // wave the wolf in. T20: "no wall attacks/teleports".
+      const ground = resolveMove(creature.position, stepped.state.position, this.barriers());
+      const state = {
+        ...stepped.state,
+        position: { x: ground.x, y: stepped.state.position.y, z: ground.z },
+      };
+      const { attackDamage } = stepped;
       this.creatures.set(creatureId, state);
 
       const replicated = this.state.creatures.get(creatureId);
@@ -996,6 +1006,10 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       }
 
       if (attackDamage <= 0 || !target) continue;
+      // A wall is 0.2 m thick and a bite reaches 1.8 m, so stopping the
+      // animal's feet at one still leaves whoever is on the far side inside
+      // its range. The swing is spent either way: it gnaws at the wall.
+      if (isReachBlocked(state.position, target.position, this.barriers())) continue;
       this.damagePlayer(target.accountId, attackDamage, 'bite');
     }
   }
@@ -3684,17 +3698,32 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     return this.craftingByAccount.get(accountId);
   }
 
-  private tick(dt: number): void {
-    this.state.tick += 1;
+  advanceMovementForTest(dt: number): void {
+    this.tickMovement(dt);
+  }
 
-    this.expireStaleMoveIntents();
-
+  /**
+   * Walks every player one step, and stops the ones who walked into a wall.
+   *
+   * Collision is resolved here rather than inside stepMovement because a
+   * barrier is world state, not a property of the mover: the same step is
+   * legal or not depending on whether somebody has since shut a door. GDD
+   * section 10's "a door left open lets anyone walk through" is the whole
+   * rule, and it is the barrier list -- shared with reach and with blast
+   * occlusion -- that says which of the two a doorway currently is.
+   */
+  private tickMovement(dt: number): void {
     for (const [accountId, { action }] of this.pendingMove) {
       const movement = this.movementByAccount.get(accountId);
       const player = this.state.players.get(accountId);
       if (!movement || !player) continue;
 
-      const next = stepMovement(movement, action, dt);
+      const stepped = stepMovement(movement, action, dt);
+      const ground = resolveMove(movement.position, stepped.position, this.barriers());
+      const next: MovementState = {
+        ...stepped,
+        position: { x: ground.x, y: stepped.position.y, z: ground.z },
+      };
       this.movementByAccount.set(accountId, next);
 
       player.x = next.position.x;
@@ -3703,6 +3732,14 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       player.yaw = action.yaw;
       player.grounded = next.grounded;
     }
+  }
+
+  private tick(dt: number): void {
+    this.state.tick += 1;
+
+    this.expireStaleMoveIntents();
+
+    this.tickMovement(dt);
 
     this.tickCreatures(dt);
 

@@ -11,6 +11,7 @@ export * from './respawn.js';
 export * from './placement.js';
 export * from './building.js';
 export * from './occlusion.js';
+export * from './collision.js';
 export * from './decay.js';
 export * from './explosion.js';
 export * from './repair.js';
