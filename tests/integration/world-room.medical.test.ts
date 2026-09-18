@@ -219,3 +219,39 @@ describe('WorldRoom bandage channel (T08, GDD section 6)', () => {
     client.leave();
   });
 });
+
+/**
+ * GDD section 6 gives bleeding a dedicated cure, and the HUD advertises the
+ * key for it. The server computed the wound, persisted it and let it block
+ * regeneration, but never told the player it existed -- so they lost 0.5 HP/s
+ * with their healing switched off and nothing on screen said why.
+ */
+describe('WorldRoom reporting what is wrong with you (GDD section 6)', () => {
+  it('tells a bleeding player they are bleeding, and for how long', async () => {
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const client = await colyseus.connectTo(room, { accountId: 'acct_wounded' });
+    await client.waitForMessage('session');
+    room.woundForTestSet('acct_wounded', { ratePerS: 0.5, remainingS: 10 });
+
+    room.advanceSurvivalForTest(0.05);
+    const vitals = await client.waitForMessage('vitals');
+
+    expect(vitals.bleedingS).toBeGreaterThan(0);
+    expect(vitals.poisonedS).toBe(0);
+
+    client.leave();
+  });
+
+  it('says what killed you, rather than only that you died', async () => {
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const client = await colyseus.connectTo(room, { accountId: 'acct_recap' });
+    await client.waitForMessage('session');
+    room.damageForTest('acct_recap', 1000);
+
+    const recap = await client.waitForMessage('death');
+
+    expect(recap.cause).toBe('struck down');
+
+    client.leave();
+  });
+});

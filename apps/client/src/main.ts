@@ -368,9 +368,9 @@ const PLACEABLES: Array<{ key: string; definitionId: string; form: PieceForm | n
 ];
 let selected = PLACEABLES[0]!;
 /** Set while this account is dead; GDD section 12's death recap and respawn prompt. */
-let death: { corpseId: string | null } | undefined;
+let death: { corpseId: string | null; cause?: string } | undefined;
 let respawnNotice: string | undefined;
-let vitals = { calories: 0, health: 0, exposure: 0, coldDeficit: 0, phase: 'day' };
+let vitals = { calories: 0, health: 0, exposure: 0, coldDeficit: 0, phase: 'day', bleedingS: 0, poisonedS: 0 };
 let channel: { definitionId: string | null; elapsedS: number; durationS: number } | undefined;
 let yaw = 0;
 let pitch = 0;
@@ -624,7 +624,7 @@ async function connect(): Promise<void> {
   // the station.
   // GDD section 12's death recap. Arrives on the death itself and again on a
   // reconnect that finds the account still dead.
-  joined.onMessage('death', (payload: { corpseId: string | null }) => {
+  joined.onMessage('death', (payload: { corpseId: string | null; cause?: string }) => {
     death = payload;
     respawnNotice = undefined;
   });
@@ -1263,12 +1263,18 @@ function aimedTarget(): SwingTarget | undefined {
   return pickAimed(camera.position, yaw, swingCandidates(), AIM_CONE_RAD);
 }
 
+/** CONTENT section 6: "Rock swing interval 1 s". The only tool anyone has yet. */
+const SWING_INTERVAL_MS = 1000;
+let lastSwingAtMs = -Infinity;
+
 function attemptSwing(): void {
   const target = aimedTarget();
   // A swing at empty air is not sent. The HUD's `aim:` line says what is under
   // the crosshair before the click, so this is not the silent nothing an
   // unexplained early return used to be.
-  if (target) send(target.action);
+  if (!target) return;
+  lastSwingAtMs = performance.now();
+  send(target.action);
 }
 
 /** Sums one item across the pack, so a keypress can move everything you carry. */
@@ -1333,7 +1339,12 @@ function describeAim(): string {
   if (!target) return 'nothing in front of you';
   const aimed = candidates.find((candidate) => candidate.value === target)!;
   const distance = Vector3.Distance(camera.position, new Vector3(aimed.position.x, aimed.position.y, aimed.position.z));
-  return `${target.label} ${distance.toFixed(1)}m ${target.condition} (LMB)`.replace('  ', ' ');
+  // The cooldown is the server's, not this timer's -- this only says when
+  // the next click is worth making, because otherwise a fight is mostly
+  // clicks that do nothing and never say why.
+  const readyIn = Math.max(0, SWING_INTERVAL_MS - (performance.now() - lastSwingAtMs)) / 1000;
+  const when = readyIn > 0 ? `LMB in ${readyIn.toFixed(1)}s` : 'LMB';
+  return `${target.label} ${distance.toFixed(1)}m ${target.condition} (${when})`.replace('  ', ' ');
 }
 
 /**
@@ -1568,13 +1579,18 @@ engine.runRenderLoop(() => {
           // showing nothing else the player presses will be accepted.
           ...(death
             ? [
-                `YOU DIED -- ENTER to respawn${myAnchorId() ? ', SHIFT+ENTER for your bedroll' : ''}  (your body: ${death.corpseId ?? 'gone'})`,
+                `YOU DIED -- ${death.cause ?? 'killed'} -- ENTER to respawn${myAnchorId() ? ', SHIFT+ENTER for your bedroll' : ''}  (your body: ${death.corpseId ?? 'gone'})`,
               ]
             : []),
           ...(respawnNotice ? [respawnNotice] : []),
           `account ${accountId.slice(0, 8)}  epoch ${sessionEpoch}  players ${room.state.players.size}`,
           `${engine.getFps().toFixed(0)} fps render : ${MOVE_SEND_HZ} Hz sim`,
-          `hp ${vitals.health.toFixed(0)}  cal ${vitals.calories.toFixed(0)}  exposure ${vitals.exposure.toFixed(0)}  ${vitals.phase}${vitals.coldDeficit > 0 ? `  COLD ${vitals.coldDeficit.toFixed(0)}` : ''}`,
+          `hp ${vitals.health.toFixed(0)}  cal ${vitals.calories.toFixed(0)}  exposure ${vitals.exposure.toFixed(0)}  ${vitals.phase}`
+            + `${vitals.coldDeficit > 0 ? `  COLD ${vitals.coldDeficit.toFixed(0)}` : ''}`
+            // The cure is a keypress away (B) and there was no way to know
+            // to press it: bleeding also switches regeneration off.
+            + `${vitals.bleedingS > 0 ? `  BLEEDING ${vitals.bleedingS.toFixed(0)}s (B)` : ''}`
+            + `${vitals.poisonedS > 0 ? `  POISONED ${vitals.poisonedS.toFixed(0)}s` : ''}`,
           `pack: ${describeInventory()}`,
           `craft: ${describeCrafting()}`,
           `aim: ${describeAim()}`,

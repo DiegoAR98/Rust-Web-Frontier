@@ -359,6 +359,12 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private readonly clientsByAccount = new Map<string, RoomClient>();
   private readonly craftingByAccount = new Map<string, QueueEntry>();
   private readonly lastSwingTick = new Map<string, number>();
+  /**
+   * What last took health off each player, for the death recap. Six things can
+   * kill you -- a bite, a blast, bleeding, poison, starving, the hot-ore zone
+   * and the cold -- and the recap named none of them.
+   */
+  private readonly lastDamageCause = new Map<string, string>();
   private readonly stations = new Map<string, StationState>();
   private readonly stationConfigs = new Map<string, StationConfig>();
   /** Who was last within reach of each station, so arrivals can be detected. */
@@ -772,7 +778,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       if (!accountId || this.clientsByAccount.get(accountId) !== client) return;
       client.send('session', { sessionEpoch: client.userData.sessionEpoch });
       client.send('inventory', { slots: this.playerSlots.get(accountId) });
-      client.send('vitals', this.playerVitals.get(accountId));
+      client.send('vitals', this.vitalsPayload(accountId));
       this.sendCrafting(accountId);
       this.sendChannel(accountId);
       for (const viewers of [this.stationViewers, this.corpseViewers, this.deployableViewers]) {
@@ -780,7 +786,11 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       }
       if (this.deadAccounts.has(accountId)) {
         const own = [...this.corpses].find(([, corpse]) => corpse.ownerAccountId === accountId);
-        client.send('death', { corpseId: own?.[0] ?? null, tick: this.deadAccounts.get(accountId) });
+        client.send('death', {
+          corpseId: own?.[0] ?? null,
+          tick: this.deadAccounts.get(accountId),
+          cause: this.lastDamageCause.get(accountId) ?? 'killed',
+        });
       }
     });
 
@@ -1077,6 +1087,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private damagePlayer(accountId: string, damage: number, source: 'bite' | 'melee'): void {
     const vitals = this.playerVitals.get(accountId);
     if (!vitals) return;
+    this.lastDamageCause.set(accountId, source === 'bite' ? 'mauled by an animal' : 'struck down');
     this.playerVitals.set(accountId, { ...vitals, health: Math.max(0, vitals.health - damage) });
     this.lastDamagedTick.set(accountId, this.state.tick);
     this.cancelChannel(accountId);
@@ -1174,7 +1185,12 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       this.store.setAccountDead(accountId, this.state.tick);
     });
 
-    this.clientsByAccount.get(accountId)?.send('death', { corpseId, tick: this.state.tick });
+    this.clientsByAccount.get(accountId)?.send('death', {
+      corpseId,
+      tick: this.state.tick,
+      // Six things can kill a player and the recap named none of them.
+      cause: this.lastDamageCause.get(accountId) ?? 'killed',
+    });
   }
 
   private persistCorpse(corpseId: string): void {
@@ -2506,6 +2522,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
 
         const vitals = this.playerVitals.get(accountId);
         if (!vitals || damage <= 0) continue;
+        this.lastDamageCause.set(accountId, effects === this.poisonByAccount ? 'poisoned' : 'bled out');
         this.playerVitals.set(accountId, { ...vitals, health: Math.max(0, vitals.health - damage) });
         // Bleeding counts as damage for the regeneration delay, but it does
         // not cancel a use channel; see damagePlayer and D36.
@@ -2513,6 +2530,25 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         this.killIfDead(accountId);
       }
     }
+  }
+
+  /**
+   * What the owner of this body is told about it. Bleeding and poison were
+   * computed, persisted and allowed to block regeneration without ever being
+   * sent, so a player lost 0.5 HP/s with their healing switched off and had
+   * nothing on screen to say why -- while the HUD advertised the cure.
+   */
+  private vitalsPayload(accountId: string): Record<string, unknown> {
+    const effects = this.statusEffectsOf(accountId);
+    const remaining = (kind: string): number =>
+      effects.find((effect) => effect.kind === kind)?.remainingS ?? 0;
+    return {
+      ...(this.playerVitals.get(accountId) ?? { calories: 0, health: 0, exposure: 0 }),
+      coldDeficit: this.coldDeficitFor(accountId),
+      phase: dayPhase(this.state.tick),
+      bleedingS: remaining('bleed'),
+      poisonedS: remaining('poison'),
+    };
   }
 
   private statusEffectsOf(accountId: string): StatusEffectRecord[] {
@@ -2980,7 +3016,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       // client that is already gone.
       if (this.clientsByAccount.get(accountId) !== client) return;
       client.send('inventory', { slots: this.playerSlots.get(accountId) });
-      client.send('vitals', this.playerVitals.get(accountId));
+      client.send('vitals', this.vitalsPayload(accountId));
       // A reconnect mid-craft must not present an empty queue while escrow
       // is still held.
       this.sendCrafting(accountId);
@@ -2989,7 +3025,11 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       // to a world they cannot act in and no explanation.
       if (this.deadAccounts.has(accountId)) {
         const own = [...this.corpses].find(([, corpse]) => corpse.ownerAccountId === accountId);
-        client.send('death', { corpseId: own?.[0] ?? null, tick: this.deadAccounts.get(accountId) });
+        client.send('death', {
+          corpseId: own?.[0] ?? null,
+          tick: this.deadAccounts.get(accountId),
+          cause: this.lastDamageCause.get(accountId) ?? 'killed',
+        });
       }
     }, 0);
   }
@@ -3067,7 +3107,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       );
       client.send('commandResult', JSON.parse(encoded) as CommandResult);
       client.send('inventory', { slots: this.playerSlots.get(accountId) });
-      client.send('vitals', this.playerVitals.get(accountId));
+      client.send('vitals', this.vitalsPayload(accountId));
       return;
     }
 
@@ -3983,7 +4023,16 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       const exposureDamage = computeExposureDamage(exposure) * dt;
       const coldDamage = computeColdDamagePerS(coldDeficit) * dt;
       const damage = starvation + exposureDamage + coldDamage;
-      if (damage > 0) this.lastDamagedTick.set(accountId, this.state.tick);
+      if (damage > 0) {
+        this.lastDamagedTick.set(accountId, this.state.tick);
+        // Whichever of the three is doing the most, since that is the one the
+        // player would have had to act on.
+        const worst = Math.max(starvation, exposureDamage, coldDamage);
+        this.lastDamageCause.set(
+          accountId,
+          worst === starvation ? 'starved' : worst === exposureDamage ? 'hot-ore sickness' : 'frozen',
+        );
+      }
 
       // GDD section 6's passive recovery. Without it health only ever falls:
       // the wolf outside is a one-way trip to 0 HP, which is not a state the
@@ -4007,11 +4056,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       const next = { calories: Math.max(0, calories - healed * REGEN_CALORIE_COST_PER_HP), health, exposure };
       this.playerVitals.set(accountId, next);
 
-      this.clientsByAccount.get(accountId)?.send('vitals', {
-        ...next,
-        coldDeficit,
-        phase: dayPhase(this.state.tick),
-      });
+      this.clientsByAccount.get(accountId)?.send('vitals', this.vitalsPayload(accountId));
 
       // Starvation, exposure and cold can all finish a player off, not only a
       // wolf (GDD section 11: "zero HP is death").
