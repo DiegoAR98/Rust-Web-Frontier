@@ -36,11 +36,20 @@
       }
       #crosshair::before { left: 50%; top: 0; width: 2px; height: 18px; margin-left: -1px; }
       #crosshair::after { top: 50%; left: 0; height: 2px; width: 18px; margin-top: -1px; }
+      /* Being bitten was reported only as a falling number inside a seventeen
+         line block of text, so a wolf could chew you to death while you looked
+         the other way and nothing on screen said so. Edges rather than a full
+         tint: it must not obscure what you are trying to look at. */
+      #hurt {
+        position: fixed; inset: 0; z-index: 3; pointer-events: none; opacity: 0;
+        background: radial-gradient(ellipse at center, rgba(120, 0, 0, 0) 45%, rgba(140, 10, 10, 0.85) 100%);
+      }
     </style>
   </head>
   <body>
     <canvas id="renderCanvas"></canvas>
     <div id="crosshair"></div>
+    <div id="hurt"></div>
     <div id="status"></div>
     <div id="enterOverlay">
       <button id="enterButton">Enter world</button>

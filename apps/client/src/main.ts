@@ -16,6 +16,7 @@ import { PROTOCOL_VERSION } from '@rwf/protocol';
 // The same constant the server validates with, so the ghost's preview and the
 // server's answer cannot drift apart into two different rules.
 import {
+  CREATURE_SPECS,
   PLACEMENT_CLEARANCE_M,
   HAZARD_ZONE_CENTER,
   HAZARD_ZONE_RADIUS_M,
@@ -24,6 +25,7 @@ import {
   worldPositionOf,
   CELL_SIZE_M,
   STOREY_HEIGHT_M,
+  type CreatureKind,
   type PieceForm,
   type PieceSite,
 } from '@rwf/sim';
@@ -83,6 +85,7 @@ const STATIONS = [
 ];
 
 const statusEl = document.getElementById('status')!;
+const hurtEl = document.getElementById('hurt')!;
 const overlayEl = document.getElementById('enterOverlay')!;
 const enterButton = document.getElementById('enterButton')!;
 const canvas = document.getElementById('renderCanvas') as HTMLCanvasElement;
@@ -223,6 +226,8 @@ const PIECE_MAX_HP: Record<string, number> = {
   ceiling: 1000,
 };
 const DOOR_MAX_HP: Record<string, number> = { wood_door: 500, metal_door: 1000 };
+/** CONTENT section 7's placed HP for deployables, on the same footing. */
+const DEPLOYABLE_MAX_HP: Record<string, number> = { small_crate: 250, bedroll: 200 };
 
 /** The box each structural form is drawn as, in metres (GDD section 10's grid). */
 const PIECE_SHAPES: Record<string, { width: number; height: number; depth: number }> = {
@@ -371,6 +376,9 @@ let localLastTransform: Transform | undefined;
 let localTargetTransform: Transform | undefined;
 let patchAtMs = 0;
 let hudAtMs = 0;
+/** When the player last lost health; drives the hurt overlay's fade. */
+let hurtAtMs = -Infinity;
+const HURT_FADE_MS = 700;
 
 const keys: KeyState = {
   forward: false,
@@ -599,6 +607,9 @@ async function connect(): Promise<void> {
   // message rather than on the shared state. They were already being sent
   // every tick and simply thrown away by the client.
   joined.onMessage('vitals', (payload: typeof vitals) => {
+    // Any drop at all, from any source: a bite, starvation, the hot-ore zone
+    // and the cold all arrive here, and none of them announced themselves.
+    if (payload.health < vitals.health) hurtAtMs = performance.now();
     vitals = payload;
   });
 
@@ -1080,7 +1091,20 @@ function attemptContainerInsert(): void {
 
 interface SwingTarget {
   label: string;
+  /**
+   * How much fight is left in it. Every one of these numbers was already on the
+   * wire and thrown away, so a player swinging at a wolf could not tell a first
+   * hit from a ninth, and a carcass gave no sign it was spent.
+   */
+  condition: string;
   action: Record<string, unknown>;
+}
+
+/** GDD section 7: a carcass pays its pool out over exactly four hits. */
+const CARCASS_HITS = 4;
+
+function conditionOf(health: number, max: number): string {
+  return max > 0 ? `${health.toFixed(0)}/${max}hp` : '';
 }
 
 /**
@@ -1092,19 +1116,41 @@ interface SwingTarget {
 function swingCandidates(): Array<Aimed<SwingTarget>> {
   const candidates: Array<Aimed<SwingTarget>> = [];
   for (const [id, position] of creaturePositions) {
-    candidates.push({ position, value: { label: id, action: { type: 'attackCreature', creatureId: id } } });
-  }
-  for (const [id, position] of carcassPositions) {
+    const creature = room?.state.creatures.get(id);
+    const max = creature ? (CREATURE_SPECS[creature.kind as CreatureKind]?.health ?? 0) : 0;
+    // The mode too: a wolf that has noticed you is a different problem from one
+    // that has not, and it is the only warning the game gives.
+    const mode = creature && creature.mode !== 'wander' ? ` ${creature.mode}` : '';
     candidates.push({
       position,
-      value: { label: `${id} carcass`, action: { type: 'harvestCarcass', carcassId: id } },
+      value: {
+        label: creature?.kind ?? id,
+        condition: `${conditionOf(creature?.health ?? 0, max)}${mode}`,
+        action: { type: 'attackCreature', creatureId: id },
+      },
+    });
+  }
+  for (const [id, position] of carcassPositions) {
+    const carcass = room?.state.carcasses.get(id);
+    const left = CARCASS_HITS - (carcass?.hitsUsed ?? 0);
+    candidates.push({
+      position,
+      value: {
+        label: `${carcass?.kind ?? id} carcass`,
+        condition: left > 0 ? `${left} cuts left` : 'stripped',
+        action: { type: 'harvestCarcass', carcassId: id },
+      },
     });
   }
   for (const [id, position] of deployablePositions) {
-    const definitionId = room?.state.deployables.get(id)?.definitionId ?? 'deployable';
+    const deployable = room?.state.deployables.get(id);
     candidates.push({
       position,
-      value: { label: definitionId, action: { type: 'attackDeployable', deployableId: id } },
+      value: {
+        label: deployable?.definitionId ?? 'deployable',
+        condition: conditionOf(deployable?.health ?? 0, DEPLOYABLE_MAX_HP[deployable?.definitionId ?? ''] ?? 0),
+        action: { type: 'attackDeployable', deployableId: id },
+      },
     });
   }
   // Structural pieces, so a raider can actually get through a wall. Combat
@@ -1123,12 +1169,15 @@ function swingCandidates(): Array<Aimed<SwingTarget>> {
       };
       // A door hangs at the same site as its frame; hitting the frame while
       // a door is in it would leave the door floating.
-      const door = room.state.doors.has(siteKey(site));
+      const hung = room.state.doors.get(siteKey(site));
       candidates.push({
         position: worldPositionOf(site),
         value: {
-          label: door ? 'door' : piece.form,
-          action: { type: 'attackStructure', door, ...site },
+          label: hung ? 'door' : piece.form,
+          condition: hung
+            ? conditionOf(hung.health, DOOR_MAX_HP[hung.definitionId] ?? 0)
+            : conditionOf(piece.health, PIECE_MAX_HP[piece.form] ?? 0),
+          action: { type: 'attackStructure', door: Boolean(hung), ...site },
         },
       });
     }
@@ -1136,7 +1185,7 @@ function swingCandidates(): Array<Aimed<SwingTarget>> {
   for (const node of NODES) {
     candidates.push({
       position: node.position,
-      value: { label: node.label, action: { type: 'hitNode', nodeId: node.id } },
+      value: { label: node.label, condition: '', action: { type: 'hitNode', nodeId: node.id } },
     });
   }
   return candidates;
@@ -1217,7 +1266,7 @@ function describeAim(): string {
   if (!target) return 'nothing in front of you';
   const aimed = candidates.find((candidate) => candidate.value === target)!;
   const distance = Vector3.Distance(camera.position, new Vector3(aimed.position.x, aimed.position.y, aimed.position.z));
-  return `${target.label} ${distance.toFixed(1)}m (LMB)`;
+  return `${target.label} ${distance.toFixed(1)}m ${target.condition} (LMB)`.replace('  ', ' ');
 }
 
 /**
@@ -1425,6 +1474,13 @@ engine.runRenderLoop(() => {
   }
 
   const now = performance.now();
+
+  // A dead player stays red: GDD section 12's death is a state, not a moment,
+  // and the respawn prompt has to look like more than another HUD line.
+  const sinceHurt = now - hurtAtMs;
+  const hurt = death ? 0.75 : Math.max(0, 1 - sinceHurt / HURT_FADE_MS) * 0.8;
+  hurtEl.style.opacity = hurt.toFixed(3);
+
   if (now - hudAtMs >= HUD_INTERVAL_MS) {
     hudAtMs = now;
     statusEl.textContent = room
