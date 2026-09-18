@@ -302,3 +302,39 @@ describe('WorldStore player vitals checkpoints (survival continuous state)', () 
     expect(vitals.size).toBe(0);
   });
 });
+
+/**
+ * TECHNICAL section 7 keeps a committed outcome so a duplicate command replays
+ * it (T02, T04). Nothing ever removed one, so the table grew for the life of
+ * the world -- every command from every session that ever connected, including
+ * the refused ones, each of them an fsync on the game loop and a row kept
+ * forever.
+ */
+describe('pruning the replay log', () => {
+  it('drops outcomes from sessions that can no longer act, and keeps the live one', () => {
+    const store = new WorldStore(':memory:');
+    const epochOne = store.beginSession('acct_prune');
+    store.commitOutcome({ accountId: 'acct_prune', sessionEpoch: epochOne, sequence: 1 }, () => 'old');
+    expect(store.loadOutcome({ accountId: 'acct_prune', sessionEpoch: epochOne, sequence: 1 })).toBe('old');
+
+    // A reconnect. A command carrying the old epoch is refused as stale before
+    // it can ever reach its outcome, so that row is unreachable from here on.
+    const epochTwo = store.beginSession('acct_prune');
+    store.commitOutcome({ accountId: 'acct_prune', sessionEpoch: epochTwo, sequence: 1 }, () => 'new');
+
+    expect(store.loadOutcome({ accountId: 'acct_prune', sessionEpoch: epochOne, sequence: 1 })).toBeUndefined();
+    expect(store.loadOutcome({ accountId: 'acct_prune', sessionEpoch: epochTwo, sequence: 1 })).toBe('new');
+  });
+
+  it('leaves another account rows alone', () => {
+    const store = new WorldStore(':memory:');
+    const mine = store.beginSession('acct_mine');
+    store.commitOutcome({ accountId: 'acct_mine', sessionEpoch: mine, sequence: 1 }, () => 'mine');
+    const theirs = store.beginSession('acct_theirs');
+    store.commitOutcome({ accountId: 'acct_theirs', sessionEpoch: theirs, sequence: 1 }, () => 'theirs');
+
+    store.beginSession('acct_theirs');
+
+    expect(store.loadOutcome({ accountId: 'acct_mine', sessionEpoch: mine, sequence: 1 })).toBe('mine');
+  });
+});

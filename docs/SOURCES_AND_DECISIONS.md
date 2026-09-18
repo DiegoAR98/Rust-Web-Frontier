@@ -367,3 +367,29 @@ A review of the whole client and room across five dimensions, with every finding
 **Player-visible consequence.** Crouch no longer ends the session; a wall is cover from a swing as well as from a bite; the first tool can be crafted; a raider cannot plant a respawn inside a base they cannot enter; the red flash means a hit again rather than sitting on permanently; and the HUD says when you are bleeding, what is under the crosshair, how hurt it is, and what killed you.
 
 **Modified acceptance cases.** T11 now covers placement as well as looting. T20's "no wall attacks" is met on both sides rather than only against animals. GDD section 5's opening five minutes are reachable for the first time. T24's rebinding is unaffected and remains M5's.
+
+### 2026-09-17 - Clearing the rest of the review, and two corrections to my own work
+
+The remaining confirmed findings. Two of them were only half right, and finding that out changed what got written.
+
+**A ceiling counted as overlapping the person standing under it.** GDD section 10's "reject overlap with players" is measured on the ground plane, and a ceiling's ground position is the cell it roofs, so a teammate anywhere in a 4 m room made the roof above them un-placeable. Only the forms that stand in a player's own space can overlap one.
+
+**An upper-floor wall was an invisible barrier at ground level.** This is the cost D78 recorded, now contained. The first attempt refused the placement outright, which was both redundant in the reachable path and too blunt -- it would have blocked upper pillars and ceilings, which cause no such problem. The barrier list is filtered instead.
+
+**The finding about a disconnected sleeper never falling was wrong.** Gravity does not depend on the move intent: tickMovement walks every body and supplies a neutral action where there is no intent. The change made to onLeave on the strength of that finding was pure redundancy and was reverted. The test survived, repointed at the mechanism that does carry the fall.
+
+**Both raid locks were erased by a restart rather than surviving one.** T17 requires that no cooldown advance while the host is stopped; held only in memory these did worse, and a restart inside the window handed a defender back a building the raider had spent a satchel to lock.
+
+**The replay log was never pruned.** Every command from every session that ever connected, refusals included, kept a row for the life of the world. A command carrying a stale epoch is refused before it reaches its transaction key, so nothing can ask to replay an older session's outcome.
+
+| ID | Decision | Status and reason |
+|---|---|---|
+| D89 | A player standing in a cell does not block its floor or its ceiling | Required correction. Section 10's overlap rule does not distinguish forms, but it is measured on the ground plane, where a roof slab three metres up is indistinguishable from something at head height. A floor and a roof are what you stand on and under |
+| D90 | The barrier list is ground floor only | Proposed, and it contains D78's recorded cost rather than closing it. `wallSegment` ignores storey, so an upper wall would be a barrier across open ground outside the building. Filtering the list beats refusing the placement: refusing would also block upper pillars and ceilings, which flatten into nothing. An upper wall is decoration until the list carries height, which is consistent with there being no floor up there to stand on |
+| D91 | The raid lock and the broken-socket lockout are persisted at the commit that starts them | Required by T17. Written at the commit rather than the next checkpoint for the same reason as the bedroll cooldown (section 12's "cooldowns use persisted simulation time"): a force-kill in between would lift a lock already paid for. Expired rows are dropped on load so the table cannot grow without bound |
+| D92 | The replay log is pruned when a session starts | Proposed, and safe by the epoch rule rather than by a timer: `isSessionActive` only ever accepts the current epoch, so every older row is already unreachable. It bounds a table that otherwise grew for the life of the world, and it is recorded against **D27** with the other write-rate work |
+| D93 | Fall damage stays implemented and uncalled | Deliberate, and now stated where it would otherwise be rediscovered as a mystery. Nothing in the world can reach the -10 m/s threshold: the ground is one flat plane, a jump leaves at 6 m/s and lands at -6, and there is no vertical collision to stand on top of anything with. It arrives with terrain |
+
+**Player-visible consequence.** A friend standing in your hut no longer stops you roofing it; the ghost stops promising placements the server refuses; the build-access key is visible when it is wanted rather than only when a door happens to be nearby; a bedroll previews as a bedroll; the dangerous-spawn warning goes away; and a host restart no longer hands a raided base back to its owner.
+
+**Modified acceptance cases.** T17 gains the two raid locks, which previously did not survive a stop at all. T10's placement rules are unchanged in intent and now actually reachable with another player present. Nothing here touches T11, T12 or T13.

@@ -517,6 +517,13 @@ export class WorldStore {
          ON CONFLICT(account_id) DO UPDATE SET epoch = excluded.epoch`,
       )
       .run(accountId, next);
+    // Nothing can ever ask to replay an older session's outcome: a command
+    // carrying a stale epoch is refused before it reaches its transaction key.
+    // Without this the table kept every command from every session that ever
+    // connected -- refusals included -- for the life of the world.
+    this.db
+      .prepare('DELETE FROM transactions WHERE account_id = ? AND session_epoch < ?')
+      .run(accountId, next);
     return next;
   }
 

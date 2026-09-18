@@ -73,7 +73,14 @@ export function stepMovement(state: MovementState, input: MovementInput, dt: num
   return { position, velocityY, grounded };
 }
 
-/** Fall damage begins below a vertical impact velocity of -10 m/s (GDD section 5). */
+/**
+ * Fall damage begins below a vertical impact velocity of -10 m/s (GDD section
+ * 5). Deliberately not wired into the room yet, and that is not an oversight:
+ * nothing in the world can reach -10 m/s. The ground is one flat plane, a jump
+ * leaves at JUMP_SPEED 6 m/s and so lands at -6, and there is no vertical
+ * collision to stand on top of anything with. It arrives with terrain, and the
+ * rule is kept here so the number does not have to be rediscovered then. D93.
+ */
 export function computeFallDamage(impactVelocityY: number): number {
   if (impactVelocityY >= -10) return 0;
   return Math.min(100, 8 * (Math.abs(impactVelocityY) - 10));
