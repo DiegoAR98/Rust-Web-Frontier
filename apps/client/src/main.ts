@@ -5,10 +5,12 @@ import { HemisphericLight } from '@babylonjs/core/Lights/hemisphericLight';
 import { Vector3 } from '@babylonjs/core/Maths/math.vector';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial';
-import { Color3 } from '@babylonjs/core/Maths/math.color';
+import { DynamicTexture } from '@babylonjs/core/Materials/Textures/dynamicTexture';
+import { Color3, Color4 } from '@babylonjs/core/Maths/math.color';
 import '@babylonjs/core/Meshes/Builders/groundBuilder';
 import '@babylonjs/core/Meshes/Builders/capsuleBuilder';
 import '@babylonjs/core/Meshes/Builders/boxBuilder';
+import '@babylonjs/core/Meshes/Builders/discBuilder';
 import { ColyseusSDK, getStateCallbacks, type Room } from '@colyseus/sdk';
 import { PROTOCOL_VERSION } from '@rwf/protocol';
 // The same constant the server validates with, so the ghost's preview and the
@@ -88,8 +90,60 @@ const camera = new UniversalCamera('player', new Vector3(0, 1.7, 0), scene);
 camera.minZ = 0.05;
 camera.inputs.clear(); // movement is server-authoritative; no built-in WASD/mouse-look
 
-new HemisphericLight('sun', new Vector3(0, 1, 0), scene);
-MeshBuilder.CreateGround('ground', { width: 40, height: 40 }, scene);
+const sun = new HemisphericLight('sun', new Vector3(0, 1, 0), scene);
+
+/**
+ * Big enough to hold the world that already exists. It used to be 40 m
+ * square, centred on the origin -- so half the hot-ore zone hung off the edge,
+ * and every respawn anchor (80-95 m out) dropped the player into visible void
+ * standing on invisible floor, because stepMovement's ground plane has no
+ * extent at all. The number is the anchors plus room to walk past them.
+ */
+const GROUND_EXTENT_M = 400;
+/** One checker square, in metres. Roughly a stride, so walking reads as motion. */
+const GROUND_CHECKER_M = 2;
+
+/**
+ * A flat single-colour plane gives no optical flow: walking across it changes
+ * nothing on screen, which reads as movement being broken rather than as
+ * movement being smooth. A checker is the cheapest thing that disagrees.
+ * Drawn into a texture rather than pulled from @babylonjs/materials' GridMaterial,
+ * which is a dependency this client does not otherwise need.
+ */
+function checkerTexture(): DynamicTexture {
+  const size = 64;
+  const texture = new DynamicTexture('groundChecker', { width: size, height: size }, scene, false);
+  const context = texture.getContext();
+  context.fillStyle = '#9c8663';
+  context.fillRect(0, 0, size, size);
+  context.fillStyle = '#8a7554';
+  context.fillRect(0, 0, size / 2, size / 2);
+  context.fillRect(size / 2, size / 2, size / 2, size / 2);
+  texture.update();
+  // One repeat covers two checker squares on each axis.
+  texture.uScale = texture.vScale = GROUND_EXTENT_M / (GROUND_CHECKER_M * 2);
+  return texture;
+}
+
+const groundMaterial = new StandardMaterial('groundMat', scene);
+groundMaterial.diffuseTexture = checkerTexture();
+groundMaterial.specularColor = new Color3(0, 0, 0); // dry dirt, not polished stone
+const ground = MeshBuilder.CreateGround(
+  'ground',
+  { width: GROUND_EXTENT_M, height: GROUND_EXTENT_M },
+  scene,
+);
+ground.material = groundMaterial;
+ground.isPickable = false;
+
+/**
+ * GDD section 6's day/night, which until now existed only as a word in the
+ * HUD. Nightfall is what makes cold and a campfire matter, so it has to be
+ * visible from inside the world rather than read about in the corner of it.
+ */
+const DAY_SKY = new Color4(0.55, 0.68, 0.82, 1);
+const NIGHT_SKY = new Color4(0.06, 0.07, 0.12, 1);
+scene.clearColor = DAY_SKY;
 
 const remoteMeshes = new Map<string, ReturnType<typeof MeshBuilder.CreateCapsule>>();
 const remoteLastTransform = new Map<string, Transform>();
@@ -196,11 +250,12 @@ itemMesh.material = itemMaterial;
 const hazardMaterial = new StandardMaterial('hazardMat', scene);
 hazardMaterial.diffuseColor = new Color3(0.8, 0.45, 0.15);
 hazardMaterial.alpha = 0.35;
-const hazardMesh = MeshBuilder.CreateGround(
-  'hazardZone',
-  { width: HAZARD_ZONE_RADIUS_M * 2, height: HAZARD_ZONE_RADIUS_M * 2 },
-  scene,
-);
+// A disc, not the square it used to be drawn as: the server's rule is a
+// radius, so the corners of a square are ground that looks dangerous and is
+// not -- and the HUD's warning, which is on the same radius, stays silent
+// there and makes the drawing look broken.
+const hazardMesh = MeshBuilder.CreateDisc('hazardZone', { radius: HAZARD_ZONE_RADIUS_M, tessellation: 48 }, scene);
+hazardMesh.rotation.x = Math.PI / 2;
 hazardMesh.position.set(HAZARD_ZONE_CENTER.x, 0.02, HAZARD_ZONE_CENTER.z);
 hazardMesh.material = hazardMaterial;
 hazardMesh.isPickable = false;
@@ -1241,6 +1296,12 @@ engine.runRenderLoop(() => {
     // the camera here would make looking around lag by a patch.
     camera.position.set(blended.x, blended.y + EYE_HEIGHT_M, blended.z);
   }
+
+  // Night is dim rather than black: GDD section 6 makes the dark a cold and
+  // navigational problem, not a blindfold.
+  const night = vitals.phase === 'night';
+  scene.clearColor = night ? NIGHT_SKY : DAY_SKY;
+  sun.intensity = night ? 0.35 : 1;
 
   const item = room?.state.items?.get('item_1');
   itemMesh.setEnabled(!item || item.claimedBy === '');
