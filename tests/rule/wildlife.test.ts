@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CREATURE_SPECS, spawnCreature, stepCreature, type CreatureState } from '@rwf/sim';
+import { CREATURE_SPECS, PATHING_GIVE_UP_S, spawnCreature, stepCreature, type CreatureState } from '@rwf/sim';
 
 const ORIGIN = { x: 0, y: 0, z: 0 };
 
@@ -138,5 +138,61 @@ describe('stepCreature: prey (GDD section 7)', () => {
 
     expect(state.mode).toBe('return');
     expect(state.position.x).toBeCloseTo(3.5, 5); // 10 - one second at 6.5 m/s
+  });
+});
+
+/**
+ * GDD section 7: "if pathfinding fails for 5 seconds, retreat rather than
+ * teleport or hit through geometry." Before walls existed there was nothing
+ * for a path to fail against, so this went unwritten. Now a wall stops an
+ * animal, and without the rule a base collects a permanent collar of wolves
+ * pressed against it -- unable to reach you and unwilling to leave.
+ */
+describe('stepCreature: an animal that cannot get at its target (GDD section 7)', () => {
+  const blocked = (state: CreatureState, target: { x: number; y: number; z: number }, dt: number) =>
+    stepCreature(state, CREATURE_SPECS.wolf, target, dt, false);
+
+  it('keeps trying for the first few seconds', () => {
+    const wolf = creature('wolf', { position: at(0, 0) });
+    const step = blocked(wolf, at(0, 10), PATHING_GIVE_UP_S - 1);
+    expect(step.state.mode).toBe('chase');
+    expect(step.state.position.z).toBeGreaterThan(0);
+  });
+
+  it('gives up and heads home once the path has failed for five seconds', () => {
+    const wolf = creature('wolf', { position: at(0, 10), anchor: at(0, 0) });
+    const step = blocked(wolf, at(0, 12), PATHING_GIVE_UP_S);
+    expect(step.state.mode).toBe('return');
+    expect(step.state.position.z).toBeLessThan(10);
+  });
+
+  it('stays given up while the wall is still there', () => {
+    // Otherwise it flips back to chase on the very next tick and the collar
+    // of frozen wolves comes straight back.
+    let wolf = creature('wolf', { position: at(0, 10), anchor: at(0, 0) });
+    for (let i = 0; i < 200; i += 1) wolf = blocked(wolf, at(0, 12), 1 / 20).state;
+    expect(wolf.mode).toBe('return');
+  });
+
+  it('takes up the chase again the moment the way is clear', () => {
+    let wolf = creature('wolf', { position: at(0, 10), anchor: at(0, 0) });
+    for (let i = 0; i < 200; i += 1) wolf = blocked(wolf, at(0, 12), 1 / 20).state;
+    const step = stepCreature(wolf, CREATURE_SPECS.wolf, at(0, 12), 1 / 20, true);
+    expect(step.state.mode).toBe('chase');
+  });
+
+  it('does not bite through the wall it is standing against', () => {
+    // "rather than ... hit through geometry". The swing is spent either way:
+    // CONTENT section 4's interval is a rate of attacking, not of connecting.
+    const wolf = creature('wolf', { position: at(0, 0) });
+    const step = blocked(wolf, at(0, 1), 1 / 20);
+    expect(step.state.mode).toBe('attack');
+    expect(step.attackDamage).toBe(0);
+    expect(step.state.attackCooldownS).toBe(CREATURE_SPECS.wolf.attack!.intervalS);
+  });
+
+  it('still bites when nothing is in the way', () => {
+    const wolf = creature('wolf', { position: at(0, 0) });
+    expect(stepCreature(wolf, CREATURE_SPECS.wolf, at(0, 1), 1 / 20, true).attackDamage).toBe(15);
   });
 });

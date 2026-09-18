@@ -27,7 +27,7 @@ import {
   type PieceForm,
   type PieceSite,
 } from '@rwf/sim';
-import { AIM_CONE_RAD, pickAimed, type Aimed } from './aim.js';
+import { AIM_CONE_RAD, bearingLabel, pickAimed, type Aimed } from './aim.js';
 import { snapToSite } from './build.js';
 import {
   NO_JUMP,
@@ -122,7 +122,15 @@ const GROUND_CHECKER_M = 2;
  */
 function checkerTexture(): DynamicTexture {
   const size = 64;
-  const texture = new DynamicTexture('groundChecker', { width: size, height: size }, scene, false);
+  // Mipmapped, and that is not optional: one 64px tile repeated a hundred
+  // times across a 400 m plane, viewed at grazing angles, moires badly without
+  // them -- which reads as an unstable frame rate rather than as a texture
+  // problem, and would make the checker worse than the flat plane it replaces.
+  const texture = new DynamicTexture('groundChecker', { width: size, height: size }, scene, true);
+  // Mipmaps alone blur a ground plane to mush a few metres out; anisotropy is
+  // what keeps the distance readable. The engine clamps this to what the GPU
+  // actually supports.
+  texture.anisotropicFilteringLevel = 8;
   const context = texture.getContext();
   context.fillStyle = '#9c8663';
   context.fillRect(0, 0, size, size);
@@ -1213,14 +1221,34 @@ function describeAim(): string {
 }
 
 /**
- * The placeholder boxes are brown and unlabelled, so which key applies to
- * which is pure guesswork without this. The distances make an out-of-reach
- * press self-explanatory.
+ * What is around the player, which is a different question from what the
+ * crosshair is on. The `aim:` line says what a click would hit; this says
+ * which way to turn to find anything at all -- in a world of identically
+ * brown boxes with no map, "nothing in front of you" is otherwise a dead end.
+ *
+ * The placeholder boxes are also brown and unlabelled, so which key applies to
+ * which is guesswork without this. The distances make an out-of-reach press
+ * self-explanatory.
  */
 function describeNearest(): string {
   const parts: string[] = [];
   if (itemMesh.isEnabled()) {
     parts.push(`wood ${Vector3.Distance(camera.position, ITEM_WORLD_POSITION).toFixed(1)}m (E)`);
+  }
+
+  // The three closest living things and nodes, with a bearing, because knowing
+  // a wolf is 18 m away is only useful with which way to look.
+  const around: Array<{ label: string; distance: number; bearing: string }> = [];
+  const note = (label: string, position: { x: number; y: number; z: number }): void => {
+    const dx = position.x - camera.position.x;
+    const dz = position.z - camera.position.z;
+    around.push({ label, distance: Math.hypot(dx, dz), bearing: bearingLabel(yaw, dx, dz) });
+  };
+  for (const node of NODES) note(node.label, node.position);
+  for (const [id, position] of creaturePositions) note(id, position);
+  for (const [id, position] of carcassPositions) note(`${id} carcass`, position);
+  for (const entry of around.sort((a, b) => a.distance - b.distance).slice(0, 3)) {
+    parts.push(`${entry.label} ${entry.distance.toFixed(0)}m ${entry.bearing}`);
   }
 
   const station = nearestStation();

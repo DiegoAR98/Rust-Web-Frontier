@@ -984,7 +984,14 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     for (const [creatureId, creature] of this.creatures) {
       const spec = CREATURE_SPECS[creature.kind];
       const target = this.nearestBody(creature.position);
-      const stepped = stepCreature(creature, spec, target?.position ?? null, dt);
+      // Whether it has a clear line to its target, which decides both whether
+      // it can bite and -- after GDD section 7's five seconds -- whether it
+      // gives up and goes home. A wall is 0.2 m thick and a bite reaches
+      // 1.8 m, so stopping its feet alone would still leave whoever is on the
+      // far side inside its range.
+      const reachable =
+        target !== null && !isReachBlocked(creature.position, target.position, this.barriers());
+      const stepped = stepCreature(creature, spec, target?.position ?? null, dt, reachable);
       // The same walls that stop a player. Without this, collision would make
       // a base worse than no base at all: it would hold the raider out and
       // wave the wolf in. T20: "no wall attacks/teleports".
@@ -1006,10 +1013,6 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       }
 
       if (attackDamage <= 0 || !target) continue;
-      // A wall is 0.2 m thick and a bite reaches 1.8 m, so stopping the
-      // animal's feet at one still leaves whoever is on the far side inside
-      // its range. The swing is spent either way: it gnaws at the wall.
-      if (isReachBlocked(state.position, target.position, this.barriers())) continue;
       this.damagePlayer(target.accountId, attackDamage, 'bite');
     }
   }

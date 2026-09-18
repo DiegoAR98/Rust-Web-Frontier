@@ -59,7 +59,22 @@ export interface CreatureState {
    * runs instead of grazing.
    */
   alarmS: number;
+  /**
+   * How long it has been aware of a target it has no clear line to. See
+   * PATHING_GIVE_UP_S.
+   */
+  blockedS: number;
 }
+
+/**
+ * GDD section 7: "if pathfinding fails for 5 seconds, retreat rather than
+ * teleport or hit through geometry." Before walls existed there was nothing
+ * for a path to fail against. Now that one stops an animal, a base without
+ * this rule collects a permanent collar of wolves pressed against it -- unable
+ * to reach anyone inside and unwilling to leave, which is worse to play
+ * against than the wall they used to walk through.
+ */
+export const PATHING_GIVE_UP_S = 5;
 
 export function spawnCreature(kind: CreatureKind, anchor: Point3): CreatureState {
   return {
@@ -70,6 +85,7 @@ export function spawnCreature(kind: CreatureKind, anchor: Point3): CreatureState
     health: CREATURE_SPECS[kind].health,
     attackCooldownS: 0,
     alarmS: 0,
+    blockedS: 0,
   };
 }
 
@@ -134,6 +150,13 @@ export function stepCreature(
   spec: CreatureSpec,
   target: Point3 | null,
   dt: number,
+  /**
+   * Whether there is a clear line to the target. The caller owns the geometry;
+   * this only has to know whether the straight line it walks and bites along
+   * is open, which for a creature that does not path is the same question as
+   * "can it get there".
+   */
+  targetReachable = true,
 ): CreatureStep {
   const alarmS = Math.max(0, state.alarmS - dt);
   const attackCooldownS = Math.max(0, state.attackCooldownS - dt);
@@ -151,7 +174,18 @@ export function stepCreature(
 
   const aware = target !== null && (toTarget <= spec.noticeRange || alarmS > 0);
 
+  // Only counted while it is actually trying to get at something: the clock
+  // has to keep running once it has given up, or it flips straight back to
+  // chasing on the very next step and never goes anywhere.
+  next.blockedS = aware && !targetReachable ? state.blockedS + dt : 0;
+
   if (aware && target) {
+    if (next.blockedS >= PATHING_GIVE_UP_S) {
+      next.mode = 'return';
+      next.position = moveToward(state.position, state.anchor, spec.speed, dt);
+      return { state: next, attackDamage: 0 };
+    }
+
     if (spec.attack === null) {
       next.mode = 'flee';
       next.position = moveAwayFrom(state.position, target, spec.speed, dt);
@@ -162,7 +196,10 @@ export function stepCreature(
       next.mode = 'attack';
       if (attackCooldownS > 0) return { state: next, attackDamage: 0 };
       next.attackCooldownS = spec.attack.intervalS;
-      return { state: next, attackDamage: spec.attack.damage };
+      // "rather than teleport or hit through geometry". The swing is spent
+      // either way: CONTENT section 4's interval is a rate of attacking, not
+      // a rate of connecting, so a wall absorbs the bite rather than banking it.
+      return { state: next, attackDamage: targetReachable ? spec.attack.damage : 0 };
     }
 
     next.mode = 'chase';

@@ -12,6 +12,25 @@ export interface Aimed<T> {
 export const AIM_CONE_RAD = Math.PI / 4;
 
 /**
+ * Which way to turn to face something. A distance on its own does not help a
+ * player find anything: "wolf 18 m" in a world of identically brown boxes with
+ * no map is a number, not a direction.
+ *
+ * "Ahead" is exactly the swing's arc, so a target the HUD calls ahead is one a
+ * click would land on.
+ */
+export function bearingLabel(yaw: number, dx: number, dz: number): 'ahead' | 'right' | 'left' | 'behind' {
+  const TAU = 2 * Math.PI;
+  // Signed, folded into [-PI, PI]: which side it is on is the whole answer.
+  const relative = ((Math.atan2(dx, dz) - yaw + Math.PI) % TAU + TAU) % TAU - Math.PI;
+  if (Math.abs(relative) <= AIM_CONE_RAD) return 'ahead';
+  if (Math.abs(relative) >= Math.PI - AIM_CONE_RAD) return 'behind';
+  // Mouse-right increases yaw, and forward is (sin yaw, cos yaw), so a
+  // positive relative bearing is a turn to the right.
+  return relative > 0 ? 'right' : 'left';
+}
+
+/**
  * What one swing lands on: the nearest candidate the player is actually
  * facing. GDD section 5 puts use and aim on the mouse, and the previous rule
  * -- nearest of everything, in any direction -- meant clicking at a wolf

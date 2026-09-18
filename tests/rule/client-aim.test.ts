@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { AIM_CONE_RAD, pickAimed } from '@rwf/client/aim';
+import { AIM_CONE_RAD, bearingLabel, pickAimed } from '@rwf/client/aim';
 
 const EYE = { x: 0, y: 1.7, z: 0 };
 /** Yaw 0 faces +z, the same convention stepMovement integrates with. */
@@ -38,5 +38,27 @@ describe('picking what a swing lands on', () => {
     expect(pickAimed(EYE, 0, targets, AIM_CONE_RAD)).toBe('north');
     expect(pickAimed(EYE, Math.PI / 2, targets, AIM_CONE_RAD)).toBe('east');
     expect(pickAimed(EYE, Math.PI, targets, AIM_CONE_RAD)).toBeUndefined();
+  });
+});
+
+describe('telling the player which way to turn', () => {
+  it('calls the swing arc ahead, so what the HUD calls ahead is what a click hits', () => {
+    expect(bearingLabel(0, 0, 5)).toBe('ahead');
+    expect(bearingLabel(0, 1, 1.01)).toBe('ahead'); // just inside the 45 degree edge
+  });
+
+  it('separates left from right', () => {
+    expect(bearingLabel(0, 5, 0)).toBe('right');
+    expect(bearingLabel(0, -5, 0)).toBe('left');
+  });
+
+  it('calls the arc directly behind behind', () => {
+    expect(bearingLabel(0, 0, -5)).toBe('behind');
+  });
+
+  it('turns with the player', () => {
+    // Facing east, the thing to the north is now on the left.
+    expect(bearingLabel(Math.PI / 2, 0, 5)).toBe('left');
+    expect(bearingLabel(Math.PI / 2, 5, 0)).toBe('ahead');
   });
 });

@@ -147,10 +147,31 @@ describe('WorldRoom walking into a structure (GDD section 5)', () => {
     const before = room.vitalsForTest('acct_bitten')!.health;
     room.spawnCreature('wolf_through_wall', 'wolf', { x: 162, y: 0, z: WALL_Z - 3 });
 
-    for (let i = 0; i < 100; i += 1) room.advanceCreaturesForTest(1 / 20);
+    // Two seconds: long enough for more than one bite interval, short of the
+    // five seconds at which it gives up.
+    for (let i = 0; i < 40; i += 1) room.advanceCreaturesForTest(1 / 20);
 
     expect(room.creatureForTest('wolf_through_wall')!.mode, 'the wolf never got into biting range').toBe('attack');
     expect(room.vitalsForTest('acct_bitten')!.health).toBe(before);
+
+    client.leave();
+  });
+
+  it('sends a wolf home once it has spent five seconds unable to get at anyone', async () => {
+    // GDD section 7: "if pathfinding fails for 5 seconds, retreat rather than
+    // teleport or hit through geometry." Otherwise every base collects a
+    // permanent collar of wolves pressed against its walls.
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const { client } = await builderAt(room, 'acct_besieged', 'wall');
+    room.teleportForTest('acct_besieged', NORTH_OF_WALL);
+    room.spawnCreature('wolf_gives_up', 'wolf', { x: 162, y: 0, z: WALL_Z - 20 });
+
+    for (let i = 0; i < 20 * 8; i += 1) room.advanceCreaturesForTest(1 / 20);
+
+    const wolf = room.creatureForTest('wolf_gives_up')!;
+    expect(wolf.mode).toBe('return');
+    // Back at the anchor it came from, not parked against the wall.
+    expect(wolf.position.z).toBeLessThan(WALL_Z - 15);
 
     client.leave();
   });
