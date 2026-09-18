@@ -370,6 +370,9 @@ let selected = PLACEABLES[0]!;
 /** Set while this account is dead; GDD section 12's death recap and respawn prompt. */
 let death: { corpseId: string | null; cause?: string } | undefined;
 let respawnNotice: string | undefined;
+/** When it was set: the notice is about the arrival, not about the whole life. */
+let respawnNoticeAtMs = 0;
+const RESPAWN_NOTICE_MS = 12000;
 let vitals = { calories: 0, health: 0, exposure: 0, coldDeficit: 0, phase: 'day', bleedingS: 0, poisonedS: 0 };
 let channel: { definitionId: string | null; elapsedS: number; durationS: number } | undefined;
 let yaw = 0;
@@ -633,6 +636,7 @@ async function connect(): Promise<void> {
     // safe: false is the server saying it could not find an anchor clear of
     // trouble, which section 12 requires be communicated rather than hidden.
     respawnNotice = payload.safe ? undefined : 'respawned in a dangerous spot';
+    respawnNoticeAtMs = performance.now();
   });
   joined.onMessage('container', (payload: ContainerPayload) => {
     if (payload.removed) {
@@ -958,20 +962,24 @@ function ghostIsLegal(): boolean {
   if (heldQuantity(selected.definitionId) < 1) return false;
 
   const site = ghostSite();
+  // "Reject overlap with players, sleepers, containers, resource anchors or
+  // world geometry" applies to structural pieces too, not only to a crate put
+  // down in the open -- so this runs for both, or the ghost shows green over
+  // the wood pile and the server refuses every press.
+  const at = site ? worldPositionOf(site) : ghostPosition();
+  const occupied: Array<{ x: number; z: number }> = [
+    ...deployablePositions.values(),
+    ...STATIONS.map((station) => station.position),
+    ...NODES.map((node) => node.position),
+  ];
+  for (const other of occupied) {
+    if (Math.hypot(at.x - other.x, at.z - other.z) < PLACEMENT_CLEARANCE_M) return false;
+  }
+
   if (site) {
     const placed = new Set<string>();
     if (room) for (const key of room.state.buildingPieces.keys()) placed.add(key);
     return validatePieceSite(site, placed) === null;
-  }
-
-  const position = ghostPosition();
-  const occupied: Vector3[] = [
-    ...deployablePositions.values(),
-    ...STATIONS.map((s) => s.position),
-    ...NODES.map((n) => n.position),
-  ];
-  for (const other of occupied) {
-    if (Math.hypot(position.x - other.x, position.z - other.z) < PLACEMENT_CLEARANCE_M) return false;
   }
   return true;
 }
@@ -1456,17 +1464,21 @@ function describeBuild(): string {
 /** The doorway in front of you, and who the access keys would name. */
 function describeDoor(): string {
   const doorway = nearestDoorway();
-  if (!doorway || !room) return 'no doorway nearby';
+  const neighbour = nearestOtherAccountId();
+  // Who the grant keys would name: they name whoever is standing closest, and
+  // a player has to be able to see which one that is. Build access is granted
+  // per owner rather than per door, so it is reported whether or not a doorway
+  // is nearby -- the moment it is wanted is when a friend arrives at a bare
+  // foundation, before anything has a door in it.
+  const build = neighbour
+    ? `J/shift-J build access for ${neighbour.slice(0, 8)}`
+    : 'nobody nearby to grant build access to';
+  if (!doorway || !room) return `no doorway nearby : ${build}`;
   const at = worldPositionOf(doorway.site);
   const distance = Vector3.Distance(camera.position, new Vector3(at.x, at.y, at.z));
   const door = room.state.doors.get(doorway.key);
-  const neighbour = nearestOtherAccountId();
-  // Who the grant keys would name, because they name whoever is standing
-  // closest and a player has to be able to see which one that is.
-  const grants = neighbour
-    ? `K/shift-K door access, J/shift-J build access for ${neighbour.slice(0, 8)}`
-    : 'nobody nearby to grant access to';
-  if (!door) return `empty doorway ${distance.toFixed(1)}m -- 7 then X hangs a door`;
+  const grants = neighbour ? `K/shift-K door access, ${build}` : build;
+  if (!door) return `empty doorway ${distance.toFixed(1)}m -- 7 then X hangs a door : ${build}`;
   const max = DOOR_MAX_HP[door.definitionId] ?? 0;
   const condition = door.health < max ? ` ${door.health.toFixed(0)}/${max} hp` : '';
   return `${door.open ? 'OPEN' : 'shut'}${condition} ${distance.toFixed(1)}m (O) : ${grants}`;
@@ -1556,9 +1568,10 @@ engine.runRenderLoop(() => {
       const lift = site.form === 'pillar' ? STOREY_HEIGHT_M / 2 : 0;
       ghostMesh.position.set(at.x, at.y + lift, at.z);
     } else {
-      ghostMesh.scaling.set(1, 1, 1);
+      const shape = DEPLOYABLE_SHAPES[selected.definitionId] ?? DEPLOYABLE_SHAPES.small_crate!;
+      ghostMesh.scaling.set(shape.width / 0.9, shape.height / 0.7, shape.depth / 0.9);
       const position = ghostPosition();
-      ghostMesh.position.set(position.x, position.y + 0.35, position.z);
+      ghostMesh.position.set(position.x, position.y + shape.height / 2, position.z);
     }
     ghostMesh.material = ghostIsLegal() ? ghostOkMaterial : ghostBadMaterial;
   }
@@ -1582,7 +1595,7 @@ engine.runRenderLoop(() => {
                 `YOU DIED -- ${death.cause ?? 'killed'} -- ENTER to respawn${myAnchorId() ? ', SHIFT+ENTER for your bedroll' : ''}  (your body: ${death.corpseId ?? 'gone'})`,
               ]
             : []),
-          ...(respawnNotice ? [respawnNotice] : []),
+          ...(respawnNotice && now - respawnNoticeAtMs < RESPAWN_NOTICE_MS ? [respawnNotice] : []),
           `account ${accountId.slice(0, 8)}  epoch ${sessionEpoch}  players ${room.state.players.size}`,
           `${engine.getFps().toFixed(0)} fps render : ${MOVE_SEND_HZ} Hz sim`,
           `hp ${vitals.health.toFixed(0)}  cal ${vitals.calories.toFixed(0)}  exposure ${vitals.exposure.toFixed(0)}  ${vitals.phase}`
