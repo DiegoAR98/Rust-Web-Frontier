@@ -6,7 +6,8 @@
   "exports": {
     "./input": "./src/input.ts",
     "./interpolate": "./src/interpolate.ts",
-    "./build": "./src/build.ts"
+    "./build": "./src/build.ts",
+    "./aim": "./src/aim.ts"
   },
   "scripts": {
     "dev": "vite",

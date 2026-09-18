@@ -27,6 +27,7 @@ import {
   type PieceForm,
   type PieceSite,
 } from '@rwf/sim';
+import { AIM_CONE_RAD, pickAimed, type Aimed } from './aim.js';
 import { snapToSite } from './build.js';
 import { clampPitch, computeMoveIntent, wrapYaw, type KeyState } from './input.js';
 import { interpolateTransform, type Transform } from './interpolate.js';
@@ -1040,30 +1041,33 @@ function attemptContainerInsert(): void {
   });
 }
 
+interface SwingTarget {
+  label: string;
+  action: Record<string, unknown>;
+}
+
 /**
- * One swing key for everything you swing at. Picks whatever is closest --
- * animal, carcass or node -- rather than making the player remember a
- * different key per target type. The server still decides whether it was in
- * reach, and says so in the HUD's `last:` line when it was not.
+ * Everything one swing could land on -- animal, carcass, crate, wall or node --
+ * rather than making the player remember a different key per target type. The
+ * server still decides whether it was in reach, and says so in the HUD's
+ * `last:` line when it was not.
  */
-function attemptSwing(): void {
-  const candidates: Array<{ distance: number; action: Record<string, unknown> }> = [];
+function swingCandidates(): Array<Aimed<SwingTarget>> {
+  const candidates: Array<Aimed<SwingTarget>> = [];
   for (const [id, position] of creaturePositions) {
-    candidates.push({
-      distance: Vector3.Distance(camera.position, position),
-      action: { type: 'attackCreature', creatureId: id },
-    });
+    candidates.push({ position, value: { label: id, action: { type: 'attackCreature', creatureId: id } } });
   }
   for (const [id, position] of carcassPositions) {
     candidates.push({
-      distance: Vector3.Distance(camera.position, position),
-      action: { type: 'harvestCarcass', carcassId: id },
+      position,
+      value: { label: `${id} carcass`, action: { type: 'harvestCarcass', carcassId: id } },
     });
   }
   for (const [id, position] of deployablePositions) {
+    const definitionId = room?.state.deployables.get(id)?.definitionId ?? 'deployable';
     candidates.push({
-      distance: Vector3.Distance(camera.position, position),
-      action: { type: 'attackDeployable', deployableId: id },
+      position,
+      value: { label: definitionId, action: { type: 'attackDeployable', deployableId: id } },
     });
   }
   // Structural pieces, so a raider can actually get through a wall. Combat
@@ -1080,24 +1084,38 @@ function attemptSwing(): void {
         k: piece.k,
         axis: piece.axis === '' ? null : (piece.axis as 'x' | 'z'),
       };
-      const at = worldPositionOf(site);
+      // A door hangs at the same site as its frame; hitting the frame while
+      // a door is in it would leave the door floating.
+      const door = room.state.doors.has(siteKey(site));
       candidates.push({
-        distance: Vector3.Distance(camera.position, new Vector3(at.x, at.y, at.z)),
-        // A door hangs at the same site as its frame; hitting the frame while
-        // a door is in it would leave the door floating.
-        action: { type: 'attackStructure', door: room.state.doors.has(siteKey(site)), ...site },
+        position: worldPositionOf(site),
+        value: {
+          label: door ? 'door' : piece.form,
+          action: { type: 'attackStructure', door, ...site },
+        },
       });
     }
   }
   for (const node of NODES) {
     candidates.push({
-      distance: Vector3.Distance(camera.position, node.position),
-      action: { type: 'hitNode', nodeId: node.id },
+      position: node.position,
+      value: { label: node.label, action: { type: 'hitNode', nodeId: node.id } },
     });
   }
+  return candidates;
+}
 
-  const nearest = candidates.sort((a, b) => a.distance - b.distance)[0];
-  if (nearest) send(nearest.action);
+/** What LMB would hit right now: the nearest thing the player is facing. */
+function aimedTarget(): SwingTarget | undefined {
+  return pickAimed(camera.position, yaw, swingCandidates(), AIM_CONE_RAD);
+}
+
+function attemptSwing(): void {
+  const target = aimedTarget();
+  // A swing at empty air is not sent. The HUD's `aim:` line says what is under
+  // the crosshair before the click, so this is not the silent nothing an
+  // unexplained early return used to be.
+  if (target) send(target.action);
 }
 
 /** Sums one item across the pack, so a keypress can move everything you carry. */
@@ -1151,32 +1169,29 @@ function describeCrafting(): string {
 }
 
 /**
- * The two placeholder boxes are both brown and neither is labelled, so which
- * key applies to which is pure guesswork. Both are listed rather than just the
- * closer one -- with only two objects there is room, and naming one would
- * still leave you guessing when you are stood at the other. The distances make
- * an out-of-reach press self-explanatory.
+ * What the crosshair is on, which is what LMB will hit. Named rather than
+ * listed by distance: the swing picks one target, so the HUD naming three of
+ * them would have it point at a wood pile while the click went to the deer
+ * standing next to it.
+ */
+function describeAim(): string {
+  const candidates = swingCandidates();
+  const target = pickAimed(camera.position, yaw, candidates, AIM_CONE_RAD);
+  if (!target) return 'nothing in front of you';
+  const aimed = candidates.find((candidate) => candidate.value === target)!;
+  const distance = Vector3.Distance(camera.position, new Vector3(aimed.position.x, aimed.position.y, aimed.position.z));
+  return `${target.label} ${distance.toFixed(1)}m (LMB)`;
+}
+
+/**
+ * The placeholder boxes are brown and unlabelled, so which key applies to
+ * which is pure guesswork without this. The distances make an out-of-reach
+ * press self-explanatory.
  */
 function describeNearest(): string {
   const parts: string[] = [];
   if (itemMesh.isEnabled()) {
     parts.push(`wood ${Vector3.Distance(camera.position, ITEM_WORLD_POSITION).toFixed(1)}m (E)`);
-  }
-  // Everything LMB can hit, closest first, because LMB picks the nearest of
-  // them: naming only the nodes would have the HUD point at a wood pile while
-  // the click went to the deer standing next to it.
-  const swingable: Array<{ label: string; distance: number }> = [];
-  for (const node of NODES) {
-    swingable.push({ label: node.label, distance: Vector3.Distance(camera.position, node.position) });
-  }
-  for (const [id, position] of creaturePositions) {
-    swingable.push({ label: id, distance: Vector3.Distance(camera.position, position) });
-  }
-  for (const [id, position] of carcassPositions) {
-    swingable.push({ label: `${id} carcass`, distance: Vector3.Distance(camera.position, position) });
-  }
-  for (const target of swingable.sort((a, b) => a.distance - b.distance).slice(0, 3)) {
-    parts.push(`${target.label} ${target.distance.toFixed(1)}m (LMB)`);
   }
 
   const station = nearestStation();
@@ -1356,6 +1371,7 @@ engine.runRenderLoop(() => {
           `hp ${vitals.health.toFixed(0)}  cal ${vitals.calories.toFixed(0)}  exposure ${vitals.exposure.toFixed(0)}  ${vitals.phase}${vitals.coldDeficit > 0 ? `  COLD ${vitals.coldDeficit.toFixed(0)}` : ''}`,
           `pack: ${describeInventory()}`,
           `craft: ${describeCrafting()}`,
+          `aim: ${describeAim()}`,
           `near: ${describeNearest()}`,
           `station: ${describeStation()}`,
           `body: ${describeCorpse()}`,
