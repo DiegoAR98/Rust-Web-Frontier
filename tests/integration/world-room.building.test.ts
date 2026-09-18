@@ -350,3 +350,131 @@ describe('WorldRoom building ownership (GDD section 10)', () => {
     raider.leave();
   });
 });
+
+
+/**
+ * Three corrections found by review, all of them in the placement path.
+ */
+describe('WorldRoom placement corrections', () => {
+  it('lets a builder roof a cell somebody else is standing in', async () => {
+    // "Reject overlap with players" is measured on the ground plane, and a
+    // ceiling's ground position is the cell it roofs -- so a teammate standing
+    // anywhere in a 4 m room made the ceiling over their head un-placeable,
+    // with the ghost previewing green right up until the refusal.
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const builder = await colyseus.connectTo(room, { accountId: 'acct_roofer' });
+    await builder.waitForMessage('session');
+    const guest = await colyseus.connectTo(room, { accountId: 'acct_guest' });
+    await guest.waitForMessage('session');
+    room.clearInventoryForTest('acct_roofer');
+    room.teleportForTest('acct_roofer', CENTRE);
+    for (const piece of CABIN) {
+      room.grantForTest('acct_roofer', piece.definitionId, 1);
+      builder.send('command', command({ type: 'placeBuildingPiece', definitionId: piece.definitionId, ...piece.site }));
+      const placed = await builder.waitForMessage('commandResult');
+      if (piece.site.form === 'ceiling') continue;
+      expect(placed.accepted, `${piece.definitionId}: ${placed.reasonCode}`).toBe(true);
+    }
+    // Stand the guest squarely under the roof and try again.
+    room.removePieceForTest(site('ceiling', CELL.i, CELL.k) as PieceSite);
+    room.teleportForTest('acct_guest', CENTRE);
+    room.grantForTest('acct_roofer', 'wood_ceiling', 1);
+
+    builder.send('command', command({
+      type: 'placeBuildingPiece',
+      definitionId: 'wood_ceiling',
+      ...site('ceiling', CELL.i, CELL.k),
+    }));
+    const result = await builder.waitForMessage('commandResult');
+
+    expect(result.accepted, result.reasonCode).toBe(true);
+
+    builder.leave();
+    guest.leave();
+  });
+
+  it('does not let an upper-floor wall block the ground below it', async () => {
+    // wallSegment ignores storey (D78's recorded cost), so a storey-1 wall used
+    // to flatten into a barrier at ground level -- an invisible wall across
+    // open ground, on a floor nobody can even stand on. The barrier list is
+    // ground floor only until it carries height.
+    //
+    // Deliberately no ground-floor wall on that edge: with one there, the
+    // refusal would be the real wall and the test would prove nothing.
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const client = await colyseus.connectTo(room, { accountId: 'acct_upstairs' });
+    await client.waitForMessage('session');
+    room.clearInventoryForTest('acct_upstairs');
+    room.teleportForTest('acct_upstairs', CENTRE);
+
+    const frame: Array<{ definitionId: string; site: PieceSite }> = [
+      { definitionId: 'wood_foundation', site: site('foundation', CELL.i, CELL.k) as PieceSite },
+      { definitionId: 'wood_pillar', site: site('pillar', CELL.i, CELL.k) as PieceSite },
+      { definitionId: 'wood_pillar', site: site('pillar', CELL.i + 1, CELL.k) as PieceSite },
+      { definitionId: 'wood_pillar', site: site('pillar', CELL.i, CELL.k + 1) as PieceSite },
+      { definitionId: 'wood_pillar', site: site('pillar', CELL.i + 1, CELL.k + 1) as PieceSite },
+      { definitionId: 'wood_ceiling', site: site('ceiling', CELL.i, CELL.k) as PieceSite },
+      { definitionId: 'wood_pillar', site: site('pillar', CELL.i, CELL.k, null, 1) as PieceSite },
+      { definitionId: 'wood_pillar', site: site('pillar', CELL.i + 1, CELL.k, null, 1) as PieceSite },
+      { definitionId: 'wood_wall', site: site('wall', CELL.i, CELL.k, 'x', 1) as PieceSite },
+    ];
+    for (const piece of frame) {
+      room.grantForTest('acct_upstairs', piece.definitionId, 1);
+      client.send('command', command({ type: 'placeBuildingPiece', definitionId: piece.definitionId, ...piece.site }));
+      const placed = await client.waitForMessage('commandResult');
+      expect(placed.accepted, `${piece.definitionId} storey ${piece.site.storey}: ${placed.reasonCode}`).toBe(true);
+    }
+
+    const edgeZ = CELL.k * CELL_SIZE_M;
+    room.teleportForTest('acct_upstairs', { x: CENTRE.x, y: 0, z: edgeZ + 1 });
+    client.send('command', command({
+      type: 'move', axisX: 0, axisY: 1, yaw: Math.PI, sprint: true, crouch: false, jump: false,
+    }));
+    for (let i = 0; i < 40 && !room.isSprintingForTest('acct_upstairs'); i += 1) {
+      await room.waitForNextTimestep();
+    }
+    for (let i = 0; i < 40; i += 1) room.advanceMovementForTest(1 / 20);
+
+    expect(room.state.players.get('acct_upstairs')!.z, 'an upper-floor wall blocked the ground')
+      .toBeLessThan(edgeZ);
+
+    client.leave();
+  });
+
+  it('lets a sleeper who disconnected in mid-air finish falling', async () => {
+    // GDD section 12 stops a sleeper's motion but still has it "fall under
+    // authoritative collision" -- both halves. What carries the fall is that
+    // tickMovement walks every body and supplies a neutral action where there
+    // is no intent; a disconnect drops the intent, so an integrator keyed on
+    // the intent map would leave the body hanging in the air instead.
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const client = await colyseus.connectTo(room, { accountId: 'acct_hanging' });
+    await client.waitForMessage('session');
+    client.send('command', command({
+      type: 'move', axisX: 0, axisY: 1, yaw: 0, sprint: true, crouch: false, jump: false,
+    }));
+    for (let i = 0; i < 40 && !room.isSprintingForTest('acct_hanging'); i += 1) {
+      await room.waitForNextTimestep();
+    }
+    expect(room.isSprintingForTest('acct_hanging')).toBe(true);
+
+    client.leave();
+    for (let i = 0; i < 40 && room.isConnectedForTest('acct_hanging'); i += 1) {
+      await room.waitForNextTimestep();
+    }
+    expect(room.isConnectedForTest('acct_hanging'), 'never actually disconnected').toBe(false);
+
+    // Lifted only AFTER the disconnect, so the fall can only be carried by an
+    // intent that survived it. Doing this before leaving proves nothing: the
+    // room's own loop lands them while the test is still waiting.
+    room.teleportForTest('acct_hanging', { x: 300, y: 8, z: 300 });
+    expect(room.positionForTest('acct_hanging')!.y, 'the lift did not take').toBe(8);
+
+    for (let i = 0; i < 60; i += 1) room.advanceMovementForTest(1 / 20);
+
+    // Read off the simulation, not the replicated schema: the schema is only
+    // written by a movement tick, so with no intent at all it would keep its
+    // stale zero and the assertion would pass without anything having fallen.
+    expect(room.positionForTest('acct_hanging')!.y).toBe(0);
+  });
+});

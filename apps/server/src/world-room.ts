@@ -523,6 +523,11 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     // Crash recovery (TECHNICAL section 7): resume from the last
     // checkpoint rather than starting a fresh world.
     this.state.tick = this.store.loadWorldTick();
+    // Or the first decay pass after a restart fires immediately, however
+    // recently the last one ran: the tick is restored and this was not, so
+    // every restart charged a spare minute of decay. T17 wants no timer to
+    // advance across a stop, and this one advanced by the whole world clock.
+    this.lastDecayTick = this.state.tick;
     for (const [accountId, transform] of this.store.loadPlayerCheckpoints()) {
       const player = new PlayerState();
       player.x = transform.x;
@@ -1444,9 +1449,14 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     }
 
     // "Reject overlap with players, sleepers, containers, resource anchors or
-    // world geometry."
+    // world geometry." Measured on the ground plane, which for a ceiling means
+    // the cell it roofs: a teammate standing anywhere in a 4 m room made the
+    // ceiling over their head un-placeable. Only the forms that stand in a
+    // player's own space can overlap one; a floor slab and a roof slab are
+    // things you stand on and under.
+    const standsInPlayerSpace = site.form === 'wall' || site.form === 'doorway' || site.form === 'pillar';
     for (const [otherId, other] of this.movementByAccount) {
-      if (otherId === accountId) continue;
+      if (otherId === accountId || !standsInPlayerSpace) continue;
       if (Math.hypot(position.x - other.position.x, position.z - other.position.z) < PLACEMENT_CLEARANCE_M) {
         return { ...base, accepted: false, reasonCode: 'overlap' };
       }
@@ -2915,6 +2925,12 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     if (this.barrierCache) return this.barrierCache;
     const segments: GroundSegment[] = [];
     for (const [key, piece] of this.buildingPieces) {
+      // D78's recorded cost, contained: wallSegment ignores storey, so an
+      // upper-floor wall would flatten into a barrier at ground level and stop
+      // anyone walking past the building outside. Ground floor only until the
+      // barrier list carries height; an upper wall is decoration for now,
+      // which is consistent with there being no floor to stand on up there.
+      if (piece.site.storey !== 0) continue;
       if (piece.site.form === 'wall') {
         segments.push(wallSegment(piece.site));
         continue;
@@ -3048,6 +3064,10 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       // remove the live client, and the reconnected player would stop being
       // simulated while still appearing connected.
       if (this.clientsByAccount.get(accountId) !== client) return;
+      // Dropped, not neutralised: tickMovement walks every body and falls back
+      // to a neutral action, so a sleeper with no intent still falls under
+      // gravity (GDD section 12) while its motion stops, which is both halves
+      // of the rule.
       this.pendingMove.delete(accountId);
       // GDD section 6: a disconnect cancels an open use channel, without
       // consuming what it would have spent.
@@ -3738,6 +3758,16 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   /** Test-only read accessor for the cold vertical. */
   coldDeficitForTest(accountId: string): number {
     return this.coldDeficitFor(accountId);
+  }
+
+  /**
+   * Test-only: where the simulation thinks a body is, which is not always what
+   * the replicated schema says -- teleportForTest moves the former and only a
+   * movement tick copies it into the latter.
+   */
+  positionForTest(accountId: string): Point3 | undefined {
+    const movement = this.movementByAccount.get(accountId);
+    return movement ? { ...movement.position } : undefined;
   }
 
   /** Test-only: moves a body without driving it there. */
