@@ -7,6 +7,13 @@ import type { Point3 } from './wildlife.js';
  * foundation edge." Reusing it rather than inventing a second number.
  */
 export const PLACEMENT_CLEARANCE_M = 1;
+/**
+ * GDD section 5: how far a player can reach to take or hit something. Lives
+ * here rather than in the room because the client has to aim at the same
+ * figure -- when it aimed further, it would pick a target the server was
+ * always going to refuse, and the key looked broken.
+ */
+export const INTERACT_REACH_M = 2.5;
 /** GDD section 10: "max 400 structural pieces and 100 deployables per owner". */
 export const DEPLOYABLES_PER_OWNER = 100;
 /** GDD section 10: "a 6000-world-entity build/deployable cap bound growth". */

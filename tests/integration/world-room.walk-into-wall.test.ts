@@ -243,3 +243,42 @@ describe('WorldRoom walking into a structure (GDD section 5)', () => {
     client.leave();
   });
 });
+
+/**
+ * T11's "through-wall loot denied" is about reaching in. Putting something in
+ * is the same question and was never asked: placement checked distance only,
+ * so a raider standing outside a sealed cabin could plant a bedroll through
+ * its wall and then respawn inside it whenever they liked.
+ */
+describe('WorldRoom placing through a wall (T11)', () => {
+  it('refuses a deployable dropped through a wall, and keeps the item', async () => {
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const { client } = await builderAt(room, 'acct_planter', 'wall');
+    room.teleportForTest('acct_planter', NORTH_OF_WALL);
+    room.grantForTest('acct_planter', 'bedroll', 1);
+
+    // A metre past the wall: inside the server's reach, behind the barrier.
+    client.send('command', command({ type: 'placeDeployable', definitionId: 'bedroll', x: 162, y: 0, z: WALL_Z - 1 }));
+    const result = await client.waitForMessage('commandResult');
+
+    expect(result.accepted).toBe(false);
+    expect(result.reasonCode).toBe('out_of_range');
+    expect(room.countForTest('acct_planter', 'bedroll'), 'the bedroll was spent anyway').toBe(1);
+
+    client.leave();
+  });
+
+  it('still allows a placement on the builder own side of the wall', async () => {
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const { client } = await builderAt(room, 'acct_tidy', 'wall');
+    room.teleportForTest('acct_tidy', NORTH_OF_WALL);
+    room.grantForTest('acct_tidy', 'bedroll', 1);
+
+    client.send('command', command({ type: 'placeDeployable', definitionId: 'bedroll', x: 162, y: 0, z: WALL_Z + 2 }));
+    const result = await client.waitForMessage('commandResult');
+
+    expect(result.accepted, result.reasonCode).toBe(true);
+
+    client.leave();
+  });
+});

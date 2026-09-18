@@ -17,6 +17,7 @@ import { PROTOCOL_VERSION } from '@rwf/protocol';
 // server's answer cannot drift apart into two different rules.
 import {
   CREATURE_SPECS,
+  INTERACT_REACH_M,
   PLACEMENT_CLEARANCE_M,
   HAZARD_ZONE_CENTER,
   HAZARD_ZONE_RADIUS_M,
@@ -77,6 +78,7 @@ const HUD_INTERVAL_MS = 100; // the HUD is read by a human; no reason to rebuild
 const NODES = [
   { id: 'node_1', label: 'wood pile', position: new Vector3(-2, 0.5, 2) },
   { id: 'rock_1', label: 'ore rock', position: new Vector3(0, 0.5, -6) },
+  { id: 'stone_1', label: 'stone rock', position: new Vector3(4, 0.5, -5) },
 ];
 const STATIONS = [
   { id: 'furnace_1', label: 'furnace', input: 'metal_ore', position: new Vector3(6, 0.5, 0) },
@@ -400,7 +402,12 @@ function setKey(code: string, pressed: boolean): void {
     case 'KeyA': keys.left = pressed; break;
     case 'KeyD': keys.right = pressed; break;
     case 'ShiftLeft': case 'ShiftRight': keys.sprint = pressed; break;
-    case 'ControlLeft': case 'ControlRight': keys.crouch = pressed; break;
+    // GDD section 5's control table says Ctrl, and a browser will not have
+    // it: Ctrl+W closes the tab, and Ctrl+W is crouch-walking forward -- the
+    // most natural way to use crouch and the only way it does anything.
+    // Ctrl+A, Ctrl+S and Ctrl+D are taken by the browser too, so the whole
+    // Ctrl+WASD quadrant is unusable. See D84.
+    case 'KeyC': keys.crouch = pressed; break;
     case 'Space': jumpLatch = pressed ? pressJump(jumpLatch) : releaseJump(jumpLatch); break;
   }
 }
@@ -416,7 +423,7 @@ window.addEventListener('keydown', (e) => {
   // GDD section 9's crafting queue. One recipe exists so far, so this is a
   // direct keybind rather than a recipe browser; the browser arrives with the
   // rest of the catalog.
-  if (e.code === 'KeyC') attemptCraft('stone_hatchet', 1);
+  if (e.code === 'KeyU') attemptCraft('stone_hatchet', 1);
   if (e.code === 'KeyN') attemptCraft('small_crate', 1);
   // Every placeable's recipe id is its item id, so the hotbar doubles as the
   // build menu: pick a piece, press M, place it.
@@ -658,7 +665,13 @@ async function connect(): Promise<void> {
   joined.onMessage('vitals', (payload: typeof vitals) => {
     // Any drop at all, from any source: a bite, starvation, the hot-ore zone
     // and the cold all arrive here, and none of them announced themselves.
-    if (payload.health < vitals.health) hurtAtMs = performance.now();
+    // A drop worth flashing for. Vitals arrive every tick, and one tick of
+    // a continuous drain is 0.0125-0.25 HP: triggering on any decrease at
+    // all pinned the overlay on permanently while starving, bleeding or
+    // standing in the hot-ore zone -- and a pinned overlay cannot flash, so
+    // a bite landing during any of those showed nothing at all. The smallest
+    // bite is 15 HP, so one whole point is comfortably clear of a tick.
+    if (vitals.health - payload.health >= 1) hurtAtMs = performance.now();
     vitals = payload;
   });
 
@@ -1007,7 +1020,10 @@ function attemptRepair(): void {
       axis: piece.axis === '' ? null : (piece.axis as 'x' | 'z'),
     };
     const at = worldPositionOf(site);
-    if (Vector3.Distance(camera.position, new Vector3(at.x, at.y, at.z)) > 4) continue;
+    // The server's own reach, not a rounder number: aiming past it made P a
+    // dead key wherever a more damaged wall sat just out of range, since the
+    // client picked that one and the server refused it every time.
+    if (Vector3.Distance(camera.position, new Vector3(at.x, at.y, at.z)) > INTERACT_REACH_M) continue;
 
     const door = room.state.doors.get(key);
     const candidates: Array<{ health: number; max: number; door: boolean }> = [
@@ -1405,7 +1421,19 @@ function describeCorpse(): string {
 function describeBuild(): string {
   const held = heldQuantity(selected.definitionId);
   const slot = PLACEABLES.indexOf(selected) + 1;
-  if (held < 1) return `${slot}:${selected.definitionId} -- none in pack (1-6 to switch)`;
+  if (held < 1) {
+    return `${slot}:${selected.definitionId} -- none in pack (1-${PLACEABLES.length} to switch)`;
+  }
+  // A door goes into a doorway's socket, not onto the ground, so saying it
+  // lands "where you face" pointed the player at a patch of dirt and left
+  // them pressing X at it.
+  if (selected.definitionId === 'wood_door') {
+    const doorway = nearestDoorway();
+    if (!doorway) return `${slot}:wood_door x${held} -- no doorway in reach (build a 5:wood_doorway first)`;
+    const at = worldPositionOf(doorway.site);
+    const away = Vector3.Distance(camera.position, new Vector3(at.x, at.y, at.z));
+    return `${slot}:wood_door x${held} -- X hangs it in the doorway ${away.toFixed(1)}m away`;
+  }
   const site = ghostSite();
   // "clear here" rather than "allowed": this preview does not know the caps
   // or where other players are standing, so the server can still refuse it.
@@ -1562,8 +1590,8 @@ engine.runRenderLoop(() => {
               : 'nothing'
           }`,
           `last:${statusEl.dataset.lastResult ?? '-'}${entered ? '' : `  (${lookError ?? 'click canvas to look'})`}`,
-          'WASD move : shift sprint : space jump : LMB swing at what you face : E take',
-          'C craft hatchet : N craft crate : 1-8 pick what to place : X place it : Q loot a body : O door',
+          'WASD move : shift sprint : C crouch : space jump : LMB swing at the crosshair : E take',
+          'U craft hatchet : N craft crate : 1-8 pick what to place : X place it : Q loot a body : O door',
           'Z store in crate : H take from crate : M craft one of the selected piece : P repair',
           'B bandage : V eat : at a station -- F fuel : R input : G light/snuff : T take output',
         ].join('\n')

@@ -79,6 +79,7 @@ import {
   resolveMove,
   footprintSegments,
   DEPLOYABLE_FOOTPRINT_M,
+  INTERACT_REACH_M,
   startQueueEntry,
   stepMovement,
   stepStation,
@@ -129,8 +130,7 @@ export const MOVE_INTENT_GRACE_TICKS = 5;
  */
 const DEFAULT_YIELD_PER_HIT: Record<string, number> = { wood: 10 };
 // The placeholder hot-ore zone lives in @rwf/sim; see HAZARD_ZONE_CENTER there.
-/** GDD section 5: how far a player can reach to take or hit something. */
-const INTERACT_REACH_M = 2.5;
+// INTERACT_REACH_M now lives in @rwf/sim, so the client aims at the same figure.
 /**
  * Slack on the server's reach check. The client decides it is in range from
  * the position it has, which is always a little behind the server's; at
@@ -734,6 +734,16 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       // without any ore at all a furnace can only ever make charcoal.
       this.spawnNode('rock_1', 'metal_ore', 60, 3, { x: 0, y: 0.5, z: -6 });
     }
+    // CONTENT section 6's mixed rock pays "stone 100 ... stone 5" per hit
+    // alongside its ore. A node still carries one resource (D35), so its stone
+    // is seeded as a second rock rather than left out -- which is what it was,
+    // and it made every recipe that needs stone unreachable: the stone hatchet
+    // GDD section 5 has a player craft in their first five minutes, the
+    // campfire, the furnace and arrows. Within a short walk of spawn, as
+    // section 5's opening minutes require.
+    if (!this.resourceNodes.has('stone_1')) {
+      this.spawnNode('stone_1', 'stone', 100, 5, { x: 4, y: 0.5, z: -5 });
+    }
     // Placed outside HAZARD_ZONE_RADIUS_M so tending a fire is not also a
     // stint in the hot-ore zone. Built stations arrive with M2's building
     // system; until then the world starts with one of each.
@@ -1241,6 +1251,14 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       worldEntityCount: this.deployables.size + this.buildingPieces.size,
     });
     if (refusal === 'out_of_range') return { ...base, accepted: false, reasonCode: 'out_of_range' };
+    // T11's "through-wall loot denied" is about reaching in; putting something
+    // in is the same question and was never asked. Without this a raider
+    // outside a sealed cabin plants a bedroll through its wall and respawns
+    // inside it at will. Reported as out_of_range because that is what it is:
+    // the spot is not somewhere this player can reach.
+    if (isReachBlocked(movement.position, position, this.barriers())) {
+      return { ...base, accepted: false, reasonCode: 'out_of_range' };
+    }
     if (refusal === 'overlap') return { ...base, accepted: false, reasonCode: 'overlap' };
     if (refusal) return { ...base, accepted: false, reasonCode: 'cap_reached' };
 
@@ -3795,6 +3813,18 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
 
   nodeRemainingForTest(nodeId: string): number | undefined {
     return this.resourceNodes.get(nodeId)?.remaining;
+  }
+
+  /** The first seeded node paying out this resource, or undefined if none does. */
+  nodeYieldingForTest(definitionId: string): string | undefined {
+    for (const [nodeId, config] of this.nodeConfigs) {
+      if (config.definitionId === definitionId) return nodeId;
+    }
+    return undefined;
+  }
+
+  nodePositionForTest(nodeId: string): Vec3 | undefined {
+    return this.nodeConfigs.get(nodeId)?.position;
   }
 
   countForTest(accountId: string, definitionId: string): number {
