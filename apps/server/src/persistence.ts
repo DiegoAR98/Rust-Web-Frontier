@@ -1,4 +1,5 @@
 import { mkdirSync } from 'node:fs';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { dirname } from 'node:path';
 import Database from 'better-sqlite3';
 import type { Slot, StationKind, TransactionKey } from '@rwf/sim';
@@ -313,6 +314,10 @@ export class WorldStore {
 
   private migrate(): void {
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS account_credentials (
+        account_id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS sessions (
         account_id TEXT PRIMARY KEY,
         epoch INTEGER NOT NULL
@@ -507,6 +512,18 @@ export class WorldStore {
       )
       .run(accountId, next);
     return next;
+  }
+
+  authenticateAccount(accountId: string, token: string): boolean {
+    const hash = createHash('sha256').update(token).digest('hex');
+    const row = this.db.prepare('SELECT token_hash FROM account_credentials WHERE account_id = ?')
+      .get(accountId) as { token_hash: string } | undefined;
+    if (row) return timingSafeEqual(Buffer.from(hash), Buffer.from(row.token_hash));
+    // Existing saves have no proof of ownership. Never let an arbitrary visitor
+    // claim an old identity; its credential must be provisioned by the host.
+    if (this.db.prepare('SELECT 1 FROM sessions WHERE account_id = ?').get(accountId)) return false;
+    this.db.prepare('INSERT INTO account_credentials (account_id, token_hash) VALUES (?, ?)').run(accountId, hash);
+    return true;
   }
 
   isSessionActive(accountId: string, sessionEpoch: number): boolean {

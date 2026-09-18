@@ -18,7 +18,7 @@ export function applyBleedWound(current: BleedWound | null, ratePerS: number, du
 
 export function tickBleed(wound: BleedWound | null, dt: number): { wound: BleedWound | null; damage: number } {
   if (!wound) return { wound: null, damage: 0 };
-  const damage = wound.ratePerS * dt;
+  const damage = wound.ratePerS * Math.min(Math.max(0, dt), wound.remainingS);
   const remainingS = wound.remainingS - dt;
   return { wound: remainingS > 0 ? { ratePerS: wound.ratePerS, remainingS } : null, damage };
 }

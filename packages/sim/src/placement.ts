@@ -12,6 +12,21 @@ export const DEPLOYABLES_PER_OWNER = 100;
 /** GDD section 10: "a 6000-world-entity build/deployable cap bound growth". */
 export const WORLD_ENTITY_CAP = 6000;
 
+/**
+ * How much ground a placed deployable occupies, in metres. No document gives
+ * these: GDD section 10 asks for "minimum non-overlapping spacing" and never
+ * sizes a crate, so the number is the one the crate was already being drawn at,
+ * kept here so that the box you can see and the box you walk into are one value
+ * rather than two that can drift.
+ *
+ * Zero means you walk over it: a bedroll is a mat you lie on (GDD section 12),
+ * not an obstacle.
+ */
+export const DEPLOYABLE_FOOTPRINT_M: Record<string, number> = {
+  small_crate: 0.9,
+  bedroll: 0,
+};
+
 export type PlacementRefusal = 'out_of_range' | 'overlap' | 'owner_cap' | 'world_cap';
 
 export interface PlacementRequest {

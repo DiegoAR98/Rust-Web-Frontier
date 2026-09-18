@@ -50,6 +50,10 @@ export function tickQueueEntry(
     progressS -= entry.recipe.durationS;
   }
 
+  // Once output blocks, the rest of this step is paused time, not credit
+  // toward a later unit. Keep only progress earned while capacity existed.
+  if (capacity < entry.recipe.outputQuantityPerUnit || completedUnits >= entry.totalUnits) progressS = 0;
+
   return { entry: { ...entry, completedUnits, progressS }, producedUnits };
 }
 

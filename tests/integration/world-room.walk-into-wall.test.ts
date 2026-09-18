@@ -115,6 +115,56 @@ describe('WorldRoom walking into a structure (GDD section 5)', () => {
     client.leave();
   });
 
+  it('stops a player at a placed crate', async () => {
+    // A crate you walk through is the same wrongness as a wall you walk
+    // through, and it is what stops a crate being usable as cover or as
+    // something to stand in a doorway.
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const client = await colyseus.connectTo(room, { accountId: 'acct_crated' });
+    await client.waitForMessage('session');
+    room.clearInventoryForTest('acct_crated');
+    room.teleportForTest('acct_crated', { x: 100, y: 0, z: 100 });
+    room.grantForTest('acct_crated', 'small_crate', 1);
+    client.send('command', command({ type: 'placeDeployable', definitionId: 'small_crate', x: 100, y: 0, z: 98 }));
+    const placed = await client.waitForMessage('commandResult');
+    expect(placed.accepted, placed.reasonCode).toBe(true);
+
+    client.send('command', WALK_SOUTH);
+    for (let i = 0; i < 40 && !room.isSprintingForTest('acct_crated'); i += 1) {
+      await room.waitForNextTimestep();
+    }
+    for (let i = 0; i < 60; i += 1) room.advanceMovementForTest(1 / 20);
+
+    const z = room.state.players.get('acct_crated')!.z;
+    expect(z, 'walked through the crate').toBeGreaterThan(98);
+    expect(z, 'never set off towards it').toBeLessThan(100);
+
+    client.leave();
+  });
+
+  it('lets a player walk over a bedroll', async () => {
+    // GDD section 12 has you sleep on a bedroll; it is a mat, not an obstacle,
+    // and one you had to walk around would be a hazard in your own base.
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const client = await colyseus.connectTo(room, { accountId: 'acct_bedded' });
+    await client.waitForMessage('session');
+    room.clearInventoryForTest('acct_bedded');
+    room.teleportForTest('acct_bedded', { x: 120, y: 0, z: 100 });
+    room.grantForTest('acct_bedded', 'bedroll', 1);
+    client.send('command', command({ type: 'placeDeployable', definitionId: 'bedroll', x: 120, y: 0, z: 98 }));
+    expect((await client.waitForMessage('commandResult')).accepted).toBe(true);
+
+    client.send('command', WALK_SOUTH);
+    for (let i = 0; i < 40 && !room.isSprintingForTest('acct_bedded'); i += 1) {
+      await room.waitForNextTimestep();
+    }
+    for (let i = 0; i < 60; i += 1) room.advanceMovementForTest(1 / 20);
+
+    expect(room.state.players.get('acct_bedded')!.z).toBeLessThan(97);
+
+    client.leave();
+  });
+
   it('stops a wolf at the wall too, rather than letting it walk into a sealed base', async () => {
     // T20: "no wall attacks/teleports". Giving players collision without
     // giving animals any would be worse than today, because a wall would then

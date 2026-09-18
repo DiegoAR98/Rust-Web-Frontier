@@ -1,5 +1,6 @@
 import { Room, type Client } from '@colyseus/core';
-import { CommandSchema, type Command, type CommandResult } from '@rwf/protocol';
+import { randomUUID } from 'node:crypto';
+import { CommandSchema, JoinOptionsSchema, type Command, type CommandResult } from '@rwf/protocol';
 import { getBuildingPiece, getConsumable, getDeployable, getItem, getRecipe } from '@rwf/content';
 import {
   addToInventory,
@@ -76,6 +77,8 @@ import {
   harvestNode,
   removeFromInventory,
   resolveMove,
+  footprintSegments,
+  DEPLOYABLE_FOOTPRINT_M,
   startQueueEntry,
   stepMovement,
   stepStation,
@@ -343,6 +346,7 @@ function spreadAcrossSlots(
 
 export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private store!: WorldStore;
+  private failed = false;
   private readonly worldItems = new Map<string, WorldItem>();
   private readonly itemPositions = new Map<string, Vec3>();
   private readonly movementByAccount = new Map<string, MovementState>();
@@ -466,6 +470,8 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   private readonly buildAccess = new Map<string, Set<string>>();
   /** Invalidated whenever a piece goes up or a door swings; see barriers(). */
   private barrierCache: GroundSegment[] | null = null;
+  /** barriers() plus what you can walk into but not see through; see movementBarriers. */
+  private movementBarrierCache: GroundSegment[] | null = null;
   /**
    * GDD section 11's raid lock, kept per piece so that "building-wide" can be
    * answered by walking the building the same way ownership is -- a building
@@ -505,7 +511,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     // MatchMaker's merge(clientOptions, handler.options)), and TECHNICAL
     // section 10 is explicit: never evaluate a client-supplied filesystem
     // path. Only the server process's own environment controls this.
-    this.store = new WorldStore(process.env.RWF_DB_PATH ?? ':memory:');
+    this.store = new WorldStore(process.env.RWF_DB_PATH ?? 'runtime/world.sqlite');
     this.state = new WorldState();
 
     // Crash recovery (TECHNICAL section 7): resume from the last
@@ -550,6 +556,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     }
     for (const [accountId, vitals] of this.store.loadPlayerVitals()) {
       this.playerVitals.set(accountId, vitals);
+      this.playerSlots.set(accountId, this.store.loadPlayerSlots(accountId, BACKPACK_SLOTS));
     }
     for (const [corpseId, record] of this.store.loadCorpses()) {
       this.corpses.set(corpseId, {
@@ -650,7 +657,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     // GDD section 10: "Permissions persist and can be revoked immediately."
     for (const [key, list] of this.store.loadDoorAccess()) this.doorAccess.set(key, list);
     for (const [owner, list] of this.store.loadBuildAccess()) this.buildAccess.set(owner, list);
-    this.barrierCache = null;
+    this.invalidateBarriers();
     // Rebuilt after every piece is back, because a link needs both ends to
     // exist and the rows come out of SQLite in no particular order.
     for (const [key, piece] of this.buildingPieces) {
@@ -696,6 +703,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         // it cannot be refunded from here either. Restoring the recipe makes
         // the entry live again.
         continue;
+      }
+      if (!this.playerSlots.has(accountId)) {
+        this.playerSlots.set(accountId, this.store.loadPlayerSlots(accountId, BACKPACK_SLOTS));
       }
       this.craftingByAccount.set(accountId, {
         recipe,
@@ -745,15 +755,47 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     }
 
     this.onMessage('command', CommandSchema, (client, command) => {
-      this.handleCommand(client, command);
+      this.runSafely(() => this.handleCommand(client, command));
+    });
+    this.onMessage('ready', (client) => {
+      const accountId = client.userData?.accountId;
+      if (!accountId || this.clientsByAccount.get(accountId) !== client) return;
+      client.send('session', { sessionEpoch: client.userData.sessionEpoch });
+      client.send('inventory', { slots: this.playerSlots.get(accountId) });
+      client.send('vitals', this.playerVitals.get(accountId));
+      this.sendCrafting(accountId);
+      this.sendChannel(accountId);
+      for (const viewers of [this.stationViewers, this.corpseViewers, this.deployableViewers]) {
+        for (const audience of viewers.values()) audience.delete(accountId);
+      }
+      if (this.deadAccounts.has(accountId)) {
+        const own = [...this.corpses].find(([, corpse]) => corpse.ownerAccountId === accountId);
+        client.send('death', { corpseId: own?.[0] ?? null, tick: this.deadAccounts.get(accountId) });
+      }
     });
 
-    this.setFixedTimestep((ctx) => this.tick(ctx.dt), TICK_RATE_HZ);
+    this.setFixedTimestep((ctx) => this.runSafely(() => this.tick(ctx.dt)), TICK_RATE_HZ);
+  }
+
+  private runSafely(work: () => void): void {
+    if (this.failed) return;
+    try {
+      work();
+    } catch (error) {
+      // A rollback cannot undo mutated in-memory objects. Stop the room and
+      // never checkpoint that divergent state over the last valid save.
+      this.failed = true;
+      console.error('World stopped after a simulation or storage failure', error);
+      void this.disconnect().catch((failure: unknown) => console.error('World shutdown failed', failure));
+    }
   }
 
   onDispose(): void {
-    this.checkpoint();
-    this.store.close();
+    try {
+      if (!this.failed) this.checkpoint();
+    } finally {
+      this.store.close();
+    }
   }
 
   /**
@@ -995,7 +1037,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       // The same walls that stop a player. Without this, collision would make
       // a base worse than no base at all: it would hold the raider out and
       // wave the wolf in. T20: "no wall attacks/teleports".
-      const ground = resolveMove(creature.position, stepped.state.position, this.barriers());
+      const ground = resolveMove(creature.position, stepped.state.position, this.movementBarriers());
       const state = {
         ...stepped.state,
         position: { x: ground.x, y: stepped.state.position.y, z: ground.z },
@@ -1085,7 +1127,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       }
     }
 
-    const corpseId = `corpse_${accountId}_${this.state.tick}`;
+    const corpseId = `corpse_${randomUUID()}`;
     const inventory = buildCorpse(carried, (id) => getItem(id)?.stack ?? 1);
     this.corpses.set(corpseId, {
       ownerAccountId: accountId,
@@ -1196,7 +1238,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       reachM: INTERACT_REACH_M + INTERACT_REACH_TOLERANCE_M,
       occupied,
       ownerDeployableCount,
-      worldEntityCount: this.deployables.size,
+      worldEntityCount: this.deployables.size + this.buildingPieces.size,
     });
     if (refusal === 'out_of_range') return { ...base, accepted: false, reasonCode: 'out_of_range' };
     if (refusal === 'overlap') return { ...base, accepted: false, reasonCode: 'overlap' };
@@ -1219,6 +1261,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       placedAtTick: this.state.tick,
       slots: new Array(definition.slots).fill(null),
     });
+
+    // A crate is something to walk into; see movementBarriers.
+    this.invalidateBarriers();
 
     const replicated = new DeployableState();
     replicated.definitionId = definitionId;
@@ -1383,6 +1428,10 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     }
 
     const links = linkedSiteKeys(site).filter((key) => this.buildingPieces.has(key));
+    const proposedKey = siteKey(site);
+    for (const [otherKey, other] of this.buildingPieces) {
+      if (linkedSiteKeys(other.site).includes(proposedKey)) links.push(otherKey);
+    }
     const building = this.buildingFrom(links);
     if (!this.mayBuildOn(accountId, building)) {
       return { ...base, accepted: false, reasonCode: 'forbidden' };
@@ -1426,7 +1475,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     }
 
     this.lastActivityTick.set(key, this.state.tick);
-    this.barrierCache = null; // a new wall or doorway changes what blocks a reach
+    this.invalidateBarriers(); // a new wall or doorway changes what blocks a reach
     const replicated = new BuildingPieceState();
     replicated.definitionId = definitionId;
     replicated.ownerAccountId = accountId;
@@ -1483,6 +1532,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     sequence: number,
   ): CommandResult {
     const base = { sequence, serverTick: this.state.tick };
+    if (!Object.hasOwn(DOOR_PLACED_HP, definitionId)) {
+      return { ...base, accepted: false, reasonCode: 'not_found' };
+    }
     const key = siteKey(site);
     const frame = this.buildingPieces.get(key);
     if (!frame || frame.site.form !== 'doorway') {
@@ -1523,7 +1575,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     });
 
     // A doorway that now holds a shut door blocks reaches it did not before.
-    this.barrierCache = null;
+    this.invalidateBarriers();
     const placedHp = DOOR_PLACED_HP[definitionId] ?? 0;
     const replicated = new DoorState();
     replicated.definitionId = definitionId;
@@ -1582,7 +1634,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     }
 
     door.open = open;
-    this.barrierCache = null;
+    this.invalidateBarriers();
     const replicated = this.state.doors.get(key);
     if (replicated) replicated.open = open;
     this.store.saveDoor(key, {
@@ -1855,7 +1907,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
    */
   private completeRepair(accountId: string, site: PieceSite, door: boolean): void {
     const plan = this.planRepair(accountId, site, door);
-    if (typeof plan === 'string') return;
+    if (typeof plan === 'string' || !this.canReachThrough(accountId, worldPositionOf(site))) return;
 
     let slots = this.playerSlots.get(accountId) ?? [];
     for (const [id, quantity] of Object.entries(plan.cost)) {
@@ -1866,7 +1918,13 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     const replicated = door ? this.state.doors.get(plan.key) : this.state.buildingPieces.get(plan.key);
     if (replicated) replicated.health += plan.restored;
 
-    this.store.savePlayerSlots(accountId, slots);
+    this.store.runInTransaction(() => {
+      this.store.savePlayerSlots(accountId, slots);
+      if (replicated) {
+        if (door) this.store.saveDoorHealth(plan.key, replicated.health);
+        else this.store.saveBuildingPieceHealth(plan.key, replicated.health, this.lastActivityTick.get(plan.key) ?? 0);
+      }
+    });
     this.clientsByAccount.get(accountId)?.send('inventory', { slots });
   }
 
@@ -1875,7 +1933,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.doors.delete(key);
     this.state.doors.delete(key);
     this.doorAccess.delete(key);
-    this.barrierCache = null;
+    this.invalidateBarriers();
     this.store.runInTransaction(() => {
       this.store.deleteDoor(key);
       this.store.clearDoorAccess(key);
@@ -1915,7 +1973,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         this.store.deleteBuildingPiece(fallenKey);
       }
     });
-    this.barrierCache = null;
+    this.invalidateBarriers();
   }
 
   /**
@@ -2062,6 +2120,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     this.deployables.delete(deployableId);
     this.state.deployables.delete(deployableId);
     this.deployableViewers.delete(deployableId);
+    this.invalidateBarriers();
 
     const bagId = spilled.length > 0 ? `bag_${deployableId}_${this.state.tick}` : null;
     if (bagId) {
@@ -2195,7 +2254,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     const payload = this.deployablePayload(containerId);
     const audience = deployable
       ? [...this.connectedAccounts].filter((accountId) =>
-          this.isWithinReach(accountId, { ...deployable.position }),
+          this.canReachThrough(accountId, { ...deployable.position }),
         )
       : [...(this.deployableViewers.get(containerId) ?? [])];
     for (const accountId of audience) {
@@ -2210,7 +2269,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       const previous = this.deployableViewers.get(containerId) ?? new Set<string>();
       const current = new Set<string>();
       for (const accountId of this.connectedAccounts) {
-        if (!this.isWithinReach(accountId, { ...deployable.position })) continue;
+        if (!this.canReachThrough(accountId, { ...deployable.position })) continue;
         current.add(accountId);
         if (previous.has(accountId)) continue;
         this.clientsByAccount.get(accountId)?.send('container', this.deployablePayload(containerId));
@@ -2243,7 +2302,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     // A removal notice goes only to the players who were being shown the body,
     // not to everyone connected: nobody else was told it existed.
     const audience = corpse
-      ? [...this.connectedAccounts].filter((accountId) => this.isWithinReach(accountId, { ...corpse.position }))
+      ? [...this.connectedAccounts].filter((accountId) => this.canReachThrough(accountId, { ...corpse.position }))
       : [...(this.corpseViewers.get(corpseId) ?? [])];
     for (const accountId of audience) {
       this.clientsByAccount.get(accountId)?.send('corpse', payload);
@@ -2261,7 +2320,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       const previous = this.corpseViewers.get(corpseId) ?? new Set<string>();
       const current = new Set<string>();
       for (const accountId of this.connectedAccounts) {
-        if (!this.isWithinReach(accountId, { ...corpse.position })) continue;
+        if (!this.canReachThrough(accountId, { ...corpse.position })) continue;
         current.add(accountId);
         if (previous.has(accountId)) continue;
         this.clientsByAccount.get(accountId)?.send('corpse', this.corpsePayload(corpseId));
@@ -2530,25 +2589,12 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     // gather: a full pack refuses rather than voiding part of the pool.
     let slots = this.playerSlots.get(accountId) ?? new Array(BACKPACK_SLOTS).fill(null);
     for (const [definitionId, quantity] of entries) {
-      if (countFreeCapacity(slots, definitionId, getItem(definitionId)?.stack ?? 1) < quantity) {
-        return { ...base, accepted: false, reasonCode: 'no_space' };
-      }
+      const added = addToInventory(slots, definitionId, quantity, getItem(definitionId)?.stack ?? 1);
+      if (added.overflow > 0) return { ...base, accepted: false, reasonCode: 'no_space' };
+      slots = added.slots;
     }
-
     this.lastSwingTick.set(accountId, this.state.tick);
     this.chargeSwingCalorie(accountId);
-    for (const [definitionId, quantity] of entries) {
-      const { slots: next, overflow } = addToInventory(
-        slots,
-        definitionId,
-        quantity,
-        getItem(definitionId)?.stack ?? 1,
-      );
-      if (overflow > 0) {
-        throw new Error(`harvest overflow of ${overflow} ${definitionId} despite a capacity check`);
-      }
-      slots = next;
-    }
     this.playerSlots.set(accountId, slots);
     this.store.savePlayerSlots(accountId, slots);
 
@@ -2646,10 +2692,14 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         continue;
       }
 
-      this.playerSlots.set(accountId, next);
-      this.store.savePlayerSlots(accountId, next);
-      if (open.definitionId === 'bandage') this.woundsByAccount.delete(accountId);
-      this.applyConsumable(accountId, open.definitionId);
+      this.store.runInTransaction(() => {
+        this.playerSlots.set(accountId, next);
+        this.store.savePlayerSlots(accountId, next);
+        if (open.definitionId === 'bandage') this.woundsByAccount.delete(accountId);
+        this.applyConsumable(accountId, open.definitionId);
+        this.store.savePlayerVitals(accountId, this.playerVitals.get(accountId)!);
+        this.store.saveStatusEffects(accountId, this.statusEffectsOf(accountId));
+      });
 
       const client = this.clientsByAccount.get(accountId);
       client?.send('inventory', { slots: next });
@@ -2818,13 +2868,49 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     return segments;
   }
 
+  /**
+   * What a step has to get round, which is more than what a reach has to see
+   * past: a crate is solid to walk into but must not occlude anything, because
+   * its own centre lies inside its own footprint and a crate that blocked a
+   * reach would be a crate nobody could open.
+   *
+   * Cached separately from barriers() because it also changes when a crate goes
+   * down or breaks; invalidateBarriers clears both together so a new wall can
+   * never refresh one list and leave the other holding the old copy of it.
+   */
+  private movementBarriers(): GroundSegment[] {
+    if (this.movementBarrierCache) return this.movementBarrierCache;
+    const segments = [...this.barriers()];
+    for (const deployable of this.deployables.values()) {
+      segments.push(
+        ...footprintSegments(deployable.position, DEPLOYABLE_FOOTPRINT_M[deployable.definitionId] ?? 0),
+      );
+    }
+    this.movementBarrierCache = segments;
+    return segments;
+  }
+
+  private invalidateBarriers(): void {
+    this.barrierCache = null;
+    this.movementBarrierCache = null;
+  }
+
+  onAuth(_client: RoomClient, options: unknown): boolean {
+    if (this.failed) return false;
+    const parsed = JoinOptionsSchema.safeParse(options);
+    if (!parsed.success) return false;
+    return this.store.authenticateAccount(parsed.data.accountId, parsed.data.accountToken);
+  }
+
   onJoin(client: RoomClient, options: { accountId?: string }): void {
     const accountId = options?.accountId;
     if (!accountId) {
       throw new Error('accountId is required to join the world');
     }
 
-    const sessionEpoch = this.store.beginSession(accountId);
+    let sessionEpoch = 0;
+    this.store.runInTransaction(() => {
+    sessionEpoch = this.store.beginSession(accountId);
     client.userData = { accountId, sessionEpoch };
     // Deferred one tick: sending synchronously from onJoin can race the
     // client SDK's own post-join message listener registration.
@@ -2855,6 +2941,15 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     }
     if (!this.playerVitals.has(accountId)) {
       this.playerVitals.set(accountId, { calories: CALORIE_SPAWN, health: HEALTH_SPAWN, exposure: 0 });
+    }
+    const movement = this.movementByAccount.get(accountId);
+    if (movement) this.store.savePlayerCheckpoint(accountId, { ...movement.position, yaw: this.state.players.get(accountId)?.yaw ?? 0, grounded: movement.grounded });
+    this.store.savePlayerVitals(accountId, this.playerVitals.get(accountId)!);
+    });
+    this.pendingMove.delete(accountId);
+    this.channelsByAccount.delete(accountId);
+    for (const viewers of [this.stationViewers, this.corpseViewers, this.deployableViewers]) {
+      for (const audience of viewers.values()) audience.delete(accountId);
     }
     this.connectedAccounts.add(accountId); // sleepers (disconnected) do not drain, GDD section 12
     this.clientsByAccount.set(accountId, client);
@@ -3310,7 +3405,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     if (!this.stations.has(stationId) || !config) return;
     const payload = this.stationPayload(stationId);
     for (const accountId of this.connectedAccounts) {
-      if (!this.isWithinReach(accountId, config.position)) continue;
+      if (!this.canReachThrough(accountId, config.position)) continue;
       this.clientsByAccount.get(accountId)?.send('station', payload);
     }
   }
@@ -3519,6 +3614,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       const capacity = countFreeCapacity(currentSlots, entry.recipe.outputId, stackLimit);
       const { entry: nextEntry, producedUnits } = tickQueueEntry(entry, dt, capacity);
 
+      this.store.runInTransaction(() => {
       if (producedUnits > 0) {
         const { slots, overflow } = addToInventory(
           currentSlots,
@@ -3549,6 +3645,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
         // game-loop thread for every crafting player.
         if (producedUnits > 0) this.persistCrafting(accountId, nextEntry);
       }
+      });
     }
   }
 
@@ -3716,13 +3813,16 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
    * occlusion -- that says which of the two a doorway currently is.
    */
   private tickMovement(dt: number): void {
-    for (const [accountId, { action }] of this.pendingMove) {
-      const movement = this.movementByAccount.get(accountId);
+    for (const [accountId, movement] of this.movementByAccount) {
+      const action = this.pendingMove.get(accountId)?.action ?? {
+        type: 'move', axisX: 0, axisY: 0, yaw: this.state.players.get(accountId)?.yaw ?? 0,
+        sprint: false, crouch: false, jump: false,
+      };
       const player = this.state.players.get(accountId);
       if (!movement || !player) continue;
 
       const stepped = stepMovement(movement, action, dt);
-      const ground = resolveMove(movement.position, stepped.position, this.barriers());
+      const ground = resolveMove(movement.position, stepped.position, this.movementBarriers());
       const next: MovementState = {
         ...stepped,
         position: { x: ground.x, y: stepped.position.y, z: ground.z },
@@ -3809,7 +3909,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
       const previous = this.stationViewers.get(stationId) ?? new Set<string>();
       const current = new Set<string>();
       for (const accountId of this.connectedAccounts) {
-        if (!this.isWithinReach(accountId, config.position)) continue;
+        if (!this.canReachThrough(accountId, config.position)) continue;
         current.add(accountId);
         if (previous.has(accountId)) continue;
         this.clientsByAccount.get(accountId)?.send('station', this.stationPayload(stationId));

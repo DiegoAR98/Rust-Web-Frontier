@@ -147,7 +147,10 @@ export function stepStation(
   let next: StationState = { ...state, progressS: state.progressS + dt };
   while (next.progressS >= spec.cycleSeconds) {
     const completed = runCycle(next, spec, stackLimitOf);
-    if (!completed) break;
+    if (!completed) {
+      next = { ...next, progressS: 0 };
+      break;
+    }
     next = { ...completed, progressS: next.progressS - spec.cycleSeconds };
   }
   return next;

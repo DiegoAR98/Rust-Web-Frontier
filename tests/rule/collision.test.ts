@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { resolveMove, wallSegment, type GroundSegment, type PieceSite } from '@rwf/sim';
+import {
+  DEPLOYABLE_FOOTPRINT_M,
+  footprintSegments,
+  resolveMove,
+  wallSegment,
+  type GroundSegment,
+  type PieceSite,
+} from '@rwf/sim';
 
 const wall = (i: number, k: number, axis: 'x' | 'z'): GroundSegment =>
   wallSegment({ form: 'wall', storey: 0, i, k, axis } as PieceSite);
@@ -55,5 +62,38 @@ describe('walking into a wall (GDD section 5)', () => {
     const barriers = [wall(0, 0, 'x')];
     expect(resolveMove({ x: 2, z: 0 }, { x: 2, z: -1 }, barriers)).toEqual({ x: 2, z: -1 });
     expect(resolveMove({ x: 2, z: 0 }, { x: 2, z: 1 }, barriers)).toEqual({ x: 2, z: 1 });
+  });
+});
+
+/**
+ * A crate is a box standing on the ground. Walking through one is the same
+ * wrongness as walking through a wall, and it is what stops a crate being
+ * usable as cover or as something to put in a doorway.
+ */
+describe('walking into a placed box', () => {
+  it('has no footprint for something you are meant to lie on', () => {
+    // A bedroll is a mat. GDD section 12 has you sleep on it, not climb over it.
+    expect(footprintSegments({ x: 0, z: 0 }, DEPLOYABLE_FOOTPRINT_M.bedroll!)).toEqual([]);
+  });
+
+  it('is closed on all four sides', () => {
+    const crate = footprintSegments({ x: 0, z: 0 }, DEPLOYABLE_FOOTPRINT_M.small_crate!);
+    expect(crate).toHaveLength(4);
+    expect(resolveMove({ x: 0, z: -2 }, { x: 0, z: 2 }, crate)).toEqual({ x: 0, z: -2 });
+    expect(resolveMove({ x: 0, z: 2 }, { x: 0, z: -2 }, crate)).toEqual({ x: 0, z: 2 });
+    expect(resolveMove({ x: -2, z: 0 }, { x: 2, z: 0 }, crate)).toEqual({ x: -2, z: 0 });
+    expect(resolveMove({ x: 2, z: 0 }, { x: -2, z: 0 }, crate)).toEqual({ x: 2, z: 0 });
+  });
+
+  it('puts a player beside a crate they walked at, never inside it', () => {
+    // Being inside the footprint is the one state with no way out: every
+    // direction crosses a side.
+    const crate = footprintSegments({ x: 0, z: 0 }, DEPLOYABLE_FOOTPRINT_M.small_crate!);
+    expect(resolveMove({ x: -2, z: -1.5 }, { x: 0, z: 0 }, crate)).toEqual({ x: 0, z: -1.5 });
+  });
+
+  it('lets a player walk past one', () => {
+    const crate = footprintSegments({ x: 0, z: 0 }, DEPLOYABLE_FOOTPRINT_M.small_crate!);
+    expect(resolveMove({ x: 2, z: -2 }, { x: 2, z: 2 }, crate)).toEqual({ x: 2, z: 2 });
   });
 });

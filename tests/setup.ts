@@ -1,5 +1,17 @@
 import '@colyseus/testing'; // installs waitForMessage on the Room prototypes
 import { Room as ClientRoom } from '@colyseus/sdk';
+import { ColyseusTestServer } from '@colyseus/testing';
+import { createHash } from 'node:crypto';
+
+// Tests use isolated in-memory worlds unless a restart fixture sets a file.
+process.env.RWF_DB_PATH = ':memory:';
+const connectTo = ColyseusTestServer.prototype.connectTo;
+ColyseusTestServer.prototype.connectTo = function (room, options = {}) {
+  return connectTo.call(this, room, {
+    accountToken: createHash('sha256').update(String(options.accountId)).digest('hex'),
+    ...options,
+  });
+};
 
 /**
  * Closes a race that failed a random integration file on roughly one run in

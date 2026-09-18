@@ -7,6 +7,36 @@ interface Ground {
 }
 
 /**
+ * The four sides of a square box standing on the ground, as barriers. A size of
+ * zero produces none, which is how something you are meant to walk over -- a
+ * bedroll -- is expressed.
+ *
+ * Deliberately NOT fed into the barrier list that reach and blast occlusion
+ * use: a box's own centre is inside its own footprint, so a crate that occluded
+ * a reach would be a crate nobody could open.
+ *
+ * Known degeneracy, inherited from segmentsCross and the same one that keeps a
+ * wall from welding a player in place: a path that passes exactly through two
+ * opposite corners touches only endpoints, and so is not blocked. It needs the
+ * player's line to hit both corners to floating-point precision, and the price
+ * of closing it is a fudge factor that would start trapping people.
+ */
+export function footprintSegments(centre: Ground, sizeM: number): GroundSegment[] {
+  if (sizeM <= 0) return [];
+  const half = sizeM / 2;
+  const x1 = centre.x - half;
+  const x2 = centre.x + half;
+  const z1 = centre.z - half;
+  const z2 = centre.z + half;
+  return [
+    { x1, z1, x2, z2: z1 },
+    { x1, z1: z2, x2, z2 },
+    { x1, z1, x2: x1, z2 },
+    { x1: x2, z1, x2, z2 },
+  ];
+}
+
+/**
  * Where a step actually ends once the walls are taken into account (GDD
  * section 5: "All collision meshes are shared in meaning between client
  * prediction and server simulation").

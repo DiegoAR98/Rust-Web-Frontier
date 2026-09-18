@@ -4,6 +4,14 @@ export const PROTOCOL_VERSION = 1;
 
 const finite = () => z.number().finite();
 
+export const JoinOptionsSchema = z.object({
+  accountId: z.string().min(1).max(64).regex(/^[a-zA-Z0-9_-]+$/),
+  accountToken: z.string().regex(/^[a-f0-9]{64}$/),
+});
+
+const validPieceAxis = (site: { form: string; axis: string | null }) =>
+  (site.form === 'wall' || site.form === 'doorway') ? site.axis !== null : site.axis === null;
+
 export const MoveIntentSchema = z.object({
   type: z.literal('move'),
   axisX: finite().min(-1).max(1),
@@ -119,7 +127,7 @@ export const PlaceBuildingPieceIntentSchema = z.object({
   i: z.number().int().min(-4096).max(4096),
   k: z.number().int().min(-4096).max(4096),
   axis: z.enum(['x', 'z']).nullable(),
-});
+}).refine(validPieceAxis, 'axis must match the piece form');
 export type PlaceBuildingPieceIntent = z.infer<typeof PlaceBuildingPieceIntentSchema>;
 
 /**
@@ -135,7 +143,7 @@ export const AttackStructureIntentSchema = z.object({
   i: z.number().int().min(-4096).max(4096),
   k: z.number().int().min(-4096).max(4096),
   axis: z.enum(['x', 'z']).nullable(),
-});
+}).refine(validPieceAxis, 'axis must match the piece form');
 export type AttackStructureIntent = z.infer<typeof AttackStructureIntentSchema>;
 
 /**
@@ -150,7 +158,7 @@ export const RepairStructureIntentSchema = z.object({
   i: z.number().int().min(-4096).max(4096),
   k: z.number().int().min(-4096).max(4096),
   axis: z.enum(['x', 'z']).nullable(),
-});
+}).refine(validPieceAxis, 'axis must match the piece form');
 export type RepairStructureIntent = z.infer<typeof RepairStructureIntentSchema>;
 
 /** A swing at a placed deployable (GDD section 11: "Destroying a box produces its loot"). */

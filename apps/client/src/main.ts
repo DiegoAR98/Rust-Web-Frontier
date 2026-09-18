@@ -43,20 +43,19 @@ import {
 } from './input.js';
 import { interpolateTransform, type Transform } from './interpolate.js';
 
-/**
- * M0 stand-in for TECHNICAL section 5's real account/recovery flow: a
- * client-generated ID persisted in localStorage. Good enough to prove
- * reconnect resumes the same body; not the real invite-code/recovery-secret
- * system, which is later-milestone scope.
- */
-function getOrCreateAccountId(): string {
-  const key = 'rwf.accountId';
-  let id = localStorage.getItem(key);
+/** The account ID is public; the independently generated token proves ownership. */
+function getOrCreateAccount(): { accountId: string; accountToken: string } {
+  let id = localStorage.getItem('rwf.accountId');
+  let token = localStorage.getItem('rwf.accountToken');
   if (!id) {
     id = crypto.randomUUID();
-    localStorage.setItem(key, id);
+    localStorage.setItem('rwf.accountId', id);
   }
-  return id;
+  if (!token) {
+    token = Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) => byte.toString(16).padStart(2, '0')).join('');
+    localStorage.setItem('rwf.accountToken', token);
+  }
+  return { accountId: id, accountToken: token };
 }
 
 const MOVE_SEND_HZ = 20; // matches TECHNICAL section 3's simulation rate
@@ -310,7 +309,8 @@ for (const station of STATIONS) {
   stationMeshes.set(station.id, mesh);
 }
 
-const accountId = getOrCreateAccountId();
+let accountId = '';
+let connecting = false;
 let sessionEpoch = 0;
 let sequence = 0;
 let room: Room | undefined;
@@ -405,10 +405,13 @@ function setKey(code: string, pressed: boolean): void {
   }
 }
 
-window.addEventListener('keydown', (e) => setKey(e.code, true));
+window.addEventListener('keydown', (e) => {
+  if (document.hasFocus() && !document.hidden) setKey(e.code, true);
+});
 window.addEventListener('keyup', (e) => setKey(e.code, false));
 
 window.addEventListener('keydown', (e) => {
+  if (e.repeat || !document.hasFocus() || document.hidden) return;
   if (e.code === 'KeyE') attemptTakeItem();
   // GDD section 9's crafting queue. One recipe exists so far, so this is a
   // direct keybind rather than a recipe browser; the browser arrives with the
@@ -453,9 +456,18 @@ window.addEventListener('keydown', (e) => {
   if (placeable) selected = placeable;
 });
 
+function clearInput(): void {
+  for (const key of Object.keys(keys) as Array<keyof KeyState>) keys[key] = false;
+  jumpLatch = NO_JUMP;
+  sendMoveCommand();
+}
+window.addEventListener('blur', clearInput);
+document.addEventListener('visibilitychange', () => { if (document.hidden) clearInput(); });
+
 document.addEventListener('pointerlockchange', () => {
   entered = document.pointerLockElement === canvas;
   if (entered) lookError = undefined;
+  else clearInput();
 });
 
 // Pointer lock failing used to be completely silent, which made a dead
@@ -520,8 +532,29 @@ canvas.addEventListener('click', () => {
 });
 
 async function connect(): Promise<void> {
-  const client = new ColyseusSDK(`${location.protocol === 'https:' ? 'https' : 'http'}://${location.hostname}:2567`);
-  const joined = await client.joinOrCreate('world', { accountId });
+  if (connecting || room) return;
+  connecting = true;
+  let joined: Room;
+  try {
+    const account = getOrCreateAccount();
+    accountId = account.accountId;
+    const endpoint = new URL(location.href);
+    endpoint.port = '2567';
+    endpoint.pathname = '/';
+    endpoint.search = '';
+    endpoint.hash = '';
+    const client = new ColyseusSDK(import.meta.env.VITE_SERVER_URL || endpoint.origin);
+    joined = await client.joinOrCreate('world', account);
+  } catch (error) {
+    disconnectReason = `connection failed: ${error instanceof Error ? error.message : String(error)}`;
+    overlayEl.style.display = '';
+    connecting = false;
+    return;
+  }
+  connecting = false;
+  disconnectReason = undefined;
+  sessionEpoch = 0;
+  sequence = 0;
   room = joined;
 
   joined.onMessage('session', (payload: { sessionEpoch: number }) => {
@@ -545,8 +578,24 @@ async function connect(): Promise<void> {
       clearInterval(sendTimer);
       sendTimer = undefined;
     }
+    if (room !== joined) return;
     room = undefined;
+    sessionEpoch = 0;
+    clearInput();
     disconnectReason = reason;
+    overlayEl.style.display = '';
+    inventorySlots = [];
+    crafting = undefined;
+    channel = undefined;
+    death = undefined;
+    localLastTransform = undefined;
+    localTargetTransform = undefined;
+    for (const meshes of [remoteMeshes, creatureMeshes, carcassMeshes, corpseMeshes, deployableMeshes, pieceMeshes, doorMeshes]) {
+      for (const mesh of meshes.values()) mesh.dispose();
+      meshes.clear();
+    }
+    for (const cache of [remoteLastTransform, remoteTargetTransform, creatureLastTransform, creatureTargetTransform,
+      creaturePositions, carcassPositions, corpsePositions, deployablePositions, stationStates, corpseContents, containerContents]) cache.clear();
   };
   joined.onLeave((code: number) => handleDisconnect(`disconnected (code ${code})`));
   joined.onError((code: number, message?: string) => handleDisconnect(`error ${code}: ${message ?? ''}`));
@@ -789,10 +838,12 @@ async function connect(): Promise<void> {
       deployablePositions.set(key, new Vector3(deployable.x, deployable.y, deployable.z));
     }
   });
+  // Request the handshake only after every handler is installed.
+  joined.send('ready');
 }
 
 function sendMoveCommand(): void {
-  if (!room) return;
+  if (!room || sessionEpoch === 0) return;
   // Space is the one key not read straight off `keys`: a tap shorter than the
   // gap between two of these sends has to survive until one of them.
   const { jump, next } = takeJump(jumpLatch);
@@ -822,7 +873,7 @@ function attemptTakeItem(): void {
 }
 
 function send(action: Record<string, unknown>): void {
-  if (!room) return;
+  if (!room || sessionEpoch === 0) return;
   sequence += 1;
   room.send('command', { protocolVersion: PROTOCOL_VERSION, sessionEpoch, sequence, clientTick: 0, action });
 }
@@ -945,7 +996,7 @@ function nearestDoorway(): { key: string; site: PieceSite } | undefined {
  * the one they mean is the one about to fall over.
  */
 function attemptRepair(): void {
-  if (!room) return;
+  if (!room || sessionEpoch === 0) return;
   let best: { action: Record<string, unknown>; missing: number } | undefined;
   for (const [key, piece] of room.state.buildingPieces.entries()) {
     const site: PieceSite = {
