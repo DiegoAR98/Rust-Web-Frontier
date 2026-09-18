@@ -523,6 +523,11 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     // Crash recovery (TECHNICAL section 7): resume from the last
     // checkpoint rather than starting a fresh world.
     this.state.tick = this.store.loadWorldTick();
+    // Both locks are simulation timers, so they survive a restart rather than
+    // being erased by one (T17). Expired rows are dropped on the way in.
+    this.store.pruneSiteLocks(this.state.tick);
+    for (const [key, until] of this.store.loadSiteLocks('raid')) this.raidLockUntilTick.set(key, until);
+    for (const [key, until] of this.store.loadSiteLocks('socket')) this.socketLockedUntilTick.set(key, until);
     // Or the first decay pass after a restart fires immediately, however
     // recently the last one ran: the tick is restored and this was not, so
     // every restart charged a spare minute of decay. T17 wants no timer to
@@ -1777,6 +1782,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     const until = this.state.tick + RAID_LOCK_TICKS;
     for (const member of this.buildingFrom([key])) {
       this.raidLockUntilTick.set(member, until);
+      // Written at the commit that starts it, not at the next checkpoint: a
+      // force-kill in between would otherwise lift a lock the raider paid for.
+      this.store.setSiteLock(member, 'raid', until);
     }
 
     const replicated = door ? this.state.doors.get(key) : this.state.buildingPieces.get(key);
@@ -1973,7 +1981,9 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
   }
 
   private removeDoor(key: string): void {
-    this.socketLockedUntilTick.set(key, this.state.tick + BROKEN_SOCKET_LOCK_TICKS);
+    const socketUntil = this.state.tick + BROKEN_SOCKET_LOCK_TICKS;
+    this.socketLockedUntilTick.set(key, socketUntil);
+    this.store.setSiteLock(key, 'socket', socketUntil);
     this.doors.delete(key);
     this.state.doors.delete(key);
     this.doorAccess.delete(key);

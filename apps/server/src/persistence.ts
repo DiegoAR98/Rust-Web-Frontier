@@ -465,6 +465,12 @@ export class WorldStore {
         account_id TEXT NOT NULL,
         PRIMARY KEY (site_key, account_id)
       );
+      CREATE TABLE IF NOT EXISTS site_locks (
+        site_key TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        until_tick INTEGER NOT NULL,
+        PRIMARY KEY (site_key, kind)
+      );
       CREATE TABLE IF NOT EXISTS build_access (
         owner_account_id TEXT NOT NULL,
         account_id TEXT NOT NULL,
@@ -1273,6 +1279,34 @@ export class WorldStore {
       return;
     }
     this.db.prepare('DELETE FROM door_access WHERE site_key = ? AND account_id = ?').run(siteKey, accountId);
+  }
+
+  /**
+   * GDD section 11's raid lock and section 10's broken-socket lockout. Both are
+   * timers counted in simulation ticks, and T17 requires that none advance
+   * across a stop -- so they cannot live only in memory, where a restart does
+   * not advance them but erases them, handing the defender back a building the
+   * raider had just paid to lock.
+   */
+  setSiteLock(siteKey: string, kind: 'raid' | 'socket', untilTick: number): void {
+    this.db
+      .prepare(
+        'INSERT INTO site_locks (site_key, kind, until_tick) VALUES (?, ?, ?)'
+          + ' ON CONFLICT(site_key, kind) DO UPDATE SET until_tick = excluded.until_tick',
+      )
+      .run(siteKey, kind, untilTick);
+  }
+
+  loadSiteLocks(kind: 'raid' | 'socket'): Map<string, number> {
+    const rows = this.db
+      .prepare('SELECT site_key, until_tick FROM site_locks WHERE kind = ?')
+      .all(kind) as Array<{ site_key: string; until_tick: number }>;
+    return new Map(rows.map((row) => [row.site_key, row.until_tick]));
+  }
+
+  /** Drops locks the world clock has already passed, so the table cannot grow without bound. */
+  pruneSiteLocks(beforeTick: number): void {
+    this.db.prepare('DELETE FROM site_locks WHERE until_tick <= ?').run(beforeTick);
   }
 
   loadDoorAccess(): Map<string, Set<string>> {
