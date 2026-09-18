@@ -160,7 +160,14 @@ const remoteLastTransform = new Map<string, Transform>();
 const remoteTargetTransform = new Map<string, Transform>();
 
 const creatureMeshes = new Map<string, ReturnType<typeof MeshBuilder.CreateBox>>();
+/**
+ * Where the server last said each animal is. Deliberately the raw server
+ * position and not the blended one below: this is what the aim and the HUD's
+ * distances are measured from, so they agree with what the server will accept.
+ */
 const creaturePositions = new Map<string, Vector3>();
+const creatureLastTransform = new Map<string, Transform>();
+const creatureTargetTransform = new Map<string, Transform>();
 const carcassMeshes = new Map<string, ReturnType<typeof MeshBuilder.CreateBox>>();
 const carcassPositions = new Map<string, Vector3>();
 const corpseMeshes = new Map<string, ReturnType<typeof MeshBuilder.CreateBox>>();
@@ -624,6 +631,8 @@ async function connect(): Promise<void> {
     creatureMeshes.get(key)?.dispose();
     creatureMeshes.delete(key);
     creaturePositions.delete(key);
+    creatureLastTransform.delete(key);
+    creatureTargetTransform.delete(key);
   });
   $(joined.state).carcasses!.onAdd((_carcass: ReplicatedCreature, key: string) => {
     const mesh = MeshBuilder.CreateBox(`carcass_${key}`, { width: 1.2, height: 0.4, depth: 1.6 }, scene);
@@ -729,13 +738,17 @@ async function connect(): Promise<void> {
       remoteTargetTransform.set(key, { x: player.x, y: player.y, z: player.z, yaw: player.yaw });
     }
 
-    // Animals move every tick; the meshes follow the server directly rather
-    // than being interpolated, which is a visible step at 20Hz but keeps what
-    // the HUD calls "in reach" identical to what the server will accept.
-    for (const [key, mesh] of creatureMeshes) {
+    // Animals move every tick, so they get the same blend remote players do:
+    // a wolf closing on you is the thing you look at hardest, and stepping it
+    // at 20 Hz on a 144 Hz display is the most visible stutter in the game.
+    // The mesh is what gets blended; creaturePositions keeps the server's own
+    // answer, so aim and reach are still measured against that.
+    for (const key of creatureMeshes.keys()) {
       const creature = joined.state.creatures.get(key);
       if (!creature) continue;
-      mesh.position.set(creature.x, creature.y + 0.5, creature.z);
+      const target = { x: creature.x, y: creature.y, z: creature.z, yaw: 0 };
+      creatureLastTransform.set(key, creatureTargetTransform.get(key) ?? target);
+      creatureTargetTransform.set(key, target);
       creaturePositions.set(key, new Vector3(creature.x, creature.y, creature.z));
     }
     for (const [key, mesh] of carcassMeshes) {
@@ -1318,6 +1331,20 @@ engine.runRenderLoop(() => {
     const blended = interpolateTransform(from, to, alpha);
     mesh.position.set(blended.x, blended.y + 0.9, blended.z);
     mesh.rotation.y = blended.yaw;
+  }
+
+  for (const [key, mesh] of creatureMeshes) {
+    const from = creatureLastTransform.get(key);
+    const to = creatureTargetTransform.get(key);
+    if (!from || !to) continue;
+    const blended = interpolateTransform(from, to, alpha);
+    mesh.position.set(blended.x, blended.y + 0.5, blended.z);
+    // Facing the way it is travelling, so a wolf reads as coming at you
+    // rather than sliding sideways. The server replicates no creature yaw;
+    // this is drawing, not state.
+    const dx = to.x - from.x;
+    const dz = to.z - from.z;
+    if (dx !== 0 || dz !== 0) mesh.rotation.y = Math.atan2(dx, dz);
   }
 
   if (localLastTransform && localTargetTransform) {
