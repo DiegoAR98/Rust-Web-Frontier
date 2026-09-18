@@ -29,7 +29,16 @@ import {
 } from '@rwf/sim';
 import { AIM_CONE_RAD, pickAimed, type Aimed } from './aim.js';
 import { snapToSite } from './build.js';
-import { clampPitch, computeMoveIntent, wrapYaw, type KeyState } from './input.js';
+import {
+  NO_JUMP,
+  clampPitch,
+  computeMoveIntent,
+  pressJump,
+  releaseJump,
+  takeJump,
+  wrapYaw,
+  type KeyState,
+} from './input.js';
 import { interpolateTransform, type Transform } from './interpolate.js';
 
 /**
@@ -358,6 +367,9 @@ const keys: KeyState = {
   jump: false,
 };
 
+/** A tap of space that has not been sampled yet; see input.ts's JumpLatch. */
+let jumpLatch = NO_JUMP;
+
 function setKey(code: string, pressed: boolean): void {
   switch (code) {
     case 'KeyW': keys.forward = pressed; break;
@@ -366,7 +378,7 @@ function setKey(code: string, pressed: boolean): void {
     case 'KeyD': keys.right = pressed; break;
     case 'ShiftLeft': case 'ShiftRight': keys.sprint = pressed; break;
     case 'ControlLeft': case 'ControlRight': keys.crouch = pressed; break;
-    case 'Space': keys.jump = pressed; break;
+    case 'Space': jumpLatch = pressed ? pressJump(jumpLatch) : releaseJump(jumpLatch); break;
   }
 }
 
@@ -749,7 +761,11 @@ async function connect(): Promise<void> {
 
 function sendMoveCommand(): void {
   if (!room) return;
-  const intent = computeMoveIntent(keys);
+  // Space is the one key not read straight off `keys`: a tap shorter than the
+  // gap between two of these sends has to survive until one of them.
+  const { jump, next } = takeJump(jumpLatch);
+  jumpLatch = next;
+  const intent = computeMoveIntent({ ...keys, jump });
   sequence += 1;
   room.send('command', {
     protocolVersion: PROTOCOL_VERSION,

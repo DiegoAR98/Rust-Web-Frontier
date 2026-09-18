@@ -49,6 +49,37 @@ export function clampPitch(pitch: number): number {
   return Math.min(MAX_PITCH_RAD, Math.max(-MAX_PITCH_RAD, pitch));
 }
 
+/**
+ * A jump waiting to be sent. Move intent is sampled on a 20 Hz timer rather
+ * than per frame, so a press and release that both land inside one 50 ms
+ * window would otherwise never be sent: the key was down for none of the
+ * samples. On a 144 Hz display that is seven frames of holding space and no
+ * jump, which reads as the game ignoring you.
+ *
+ * `held` is the key's actual state, which keeps a held space bouncing exactly
+ * as it did before. `pending` is the tap that has not been sent yet.
+ */
+export interface JumpLatch {
+  held: boolean;
+  pending: boolean;
+}
+
+export const NO_JUMP: JumpLatch = { held: false, pending: false };
+
+export function pressJump(_latch: JumpLatch): JumpLatch {
+  return { held: true, pending: true };
+}
+
+export function releaseJump(latch: JumpLatch): JumpLatch {
+  // The pending tap survives the release; that is the whole point of it.
+  return { held: false, pending: latch.pending };
+}
+
+/** What this sample should carry, and what is left for the next one. */
+export function takeJump(latch: JumpLatch): { jump: boolean; next: JumpLatch } {
+  return { jump: latch.held || latch.pending, next: { held: latch.held, pending: false } };
+}
+
 /** Converts raw held-key state into the bounded axis intent GDD section 5 specifies. */
 export function computeMoveIntent(keys: KeyState): MoveIntent {
   const axisY = (keys.forward ? 1 : 0) - (keys.back ? 1 : 0);
