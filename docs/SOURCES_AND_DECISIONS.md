@@ -341,3 +341,29 @@ Prompted by a plain report that the game did not feel good to play. Nothing here
 **Player-visible consequence.** A wall now stops people and animals; a door is the way into a base rather than a formality; a click hits what the crosshair is on; a tapped jump is no longer swallowed by the 20 Hz send timer; animals move smoothly instead of stepping; the ground extends past the respawn anchors, carries a checker so that walking looks like walking, and has a sky over it that darkens at night.
 
 **Modified acceptance cases.** T11's "through-wall loot denied" is unchanged but no longer the only thing holding a base together, since the walls it names are now solid. T20's "no wall attacks/teleports" and its "lose path" clause are now met for walls. What remains unmet is going *round* one: a blocked animal presses at the wall until it gives up and then goes home, rather than finding a way in, which needs the nav data TECHNICAL's collision row describes and D40's real wander. T18 is untouched and remains M3's.
+
+### 2026-09-17 - What an adversarial review found after the playability pass
+
+A review of the whole client and room across five dimensions, with every finding sent to a separate agent whose only job was to refute it. Forty-two claims, twenty survived. One of the survivors was a defect introduced the same morning.
+
+**GDD section 7 has a line-of-sight rule for swings, and D64 said it did not.** The sentence is "Server-validated swing timing, reach and line of sight determine every successful hit." D64 recorded the opposite reading and left every swing on plain distance. That was survivable while animals could also hit through walls; once they could not (D80), it became a free kill box - a player stood inside a hut could beat a wolf to death through the wall it was unable to cross.
+
+**Crouch was unusable in a browser.** GDD section 5's control table gives Ctrl, and Ctrl+W closes the tab. Crouch-walking forward is the most natural way to use crouch, and the only way crouch currently does anything, so the documented binding ended the session. Ctrl+A, Ctrl+S and Ctrl+D are reserved too, so the whole Ctrl+WASD quadrant is unusable.
+
+**There was no stone in the world.** The seeds were wood and metal ore. `stone` is half of the stone hatchet and an input to the campfire, the furnace and arrows, so GDD section 5's "0-5 minutes: learn movement, hit a pile, craft stone hatchet" described something nobody could do, and the crafting tree began with an impossible step.
+
+**A deployable could be placed through a wall.** T11's "through-wall loot denied" is about reaching in; putting something in is the same question and was never asked. A raider outside a sealed cabin could plant a bedroll inside it and respawn there whenever they liked.
+
+**A defect introduced the same day.** The hurt vignette triggered on any health decrease at all. Vitals are sent every tick and every continuous drain lowers health on every one of them, so it never faded: starving, bleeding or standing in the hot-ore zone pinned it at 0.743 opacity, within 0.007 of the value reserved for being dead. A pinned overlay cannot flash, so a wolf bite during any of that produced no change at all - which is the one signal it was added to give.
+
+| ID | Decision | Status and reason |
+|---|---|---|
+| D84 | Crouch is C, not Ctrl | Required by the platform, and it overrides GDD section 5's binding table. A browser reserves Ctrl+W/A/S/D and a page cannot take them back, so the documented binding closes the tab. GDD section 22 already promises rebinding (T24, M5); until that exists the default has to be one the browser will allow. The hatchet craft moves from C to U, crafting being the one of the two that is not time-critical |
+| D85 | Line of sight applies to every swing, superseding D64 | Required reading, and a correction: section 7's "swing timing, reach and line of sight determine every successful hit" is the rule D64 said did not exist. A swing at the barrier itself still lands, because that segment ends on the wall rather than crossing it. D64's other reason - keeping a wall scan off the swing path - is answered by the barrier cache and the one-second swing interval |
+| D86 | Placing something through a wall is refused as out_of_range | Required by T11 read symmetrically. The refusal code is the honest one: the spot is not somewhere this player can reach |
+| D87 | Stone is seeded as a second rock rather than as CONTENT's multi-resource node | Proposed, and explicitly a stand-in that leaves **D35** open. CONTENT section 6's mixed rock pays three resources from one node and the node model carries one; splitting the stone out uses CONTENT's own figures and needs no migration, where changing the model needs one |
+| D88 | The vitals message carries bleeding and poison, and the death recap carries a cause | Proposed. Section 6 gives bleeding a cure and the HUD advertises its key, which is unusable without knowing there is a wound; section 12's recap named none of the six things that can kill a player, so every death read the same and taught nothing |
+
+**Player-visible consequence.** Crouch no longer ends the session; a wall is cover from a swing as well as from a bite; the first tool can be crafted; a raider cannot plant a respawn inside a base they cannot enter; the red flash means a hit again rather than sitting on permanently; and the HUD says when you are bleeding, what is under the crosshair, how hurt it is, and what killed you.
+
+**Modified acceptance cases.** T11 now covers placement as well as looting. T20's "no wall attacks" is met on both sides rather than only against animals. GDD section 5's opening five minutes are reachable for the first time. T24's rebinding is unaffected and remains M5's.

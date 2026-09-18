@@ -2,7 +2,7 @@ import { boot, type ColyseusTestServer } from '@colyseus/testing';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import appConfig from '@rwf/server/app.config';
 import { PROTOCOL_VERSION } from '@rwf/protocol';
-import { CELL_SIZE_M, type PieceSite } from '@rwf/sim';
+import { CELL_SIZE_M, siteKey, type PieceSite } from '@rwf/sim';
 import type { WorldRoom } from '@rwf/server/world-room';
 
 let colyseus: ColyseusTestServer;
@@ -244,13 +244,14 @@ describe('WorldRoom reaching a corpse through a wall (T11)', () => {
 });
 
 /**
- * Occlusion is for reaching *for* things. GDD gives no rule against swinging
- * at what is on the other side of a wall, and T20's "no wall attacks" is a
- * constraint on animals rather than on players -- so the swing commands stay
- * on the plain distance check.
+ * GDD section 7: "Server-validated swing timing, reach and line of sight
+ * determine every successful hit." D64 read the opposite into the document and
+ * left swings on plain distance; D85 corrects it. Once animals could not bite
+ * through a wall, the asymmetry was also a free kill box -- a player stood
+ * inside could beat a wolf to death through the wall it could not cross.
  */
-describe('WorldRoom swinging near a wall (D64)', () => {
-  it('still lets a player hit a node on the far side of their own wall', async () => {
+describe('WorldRoom swinging near a wall (D85)', () => {
+  it('refuses a node on the far side of a wall', async () => {
     const room = (await colyseus.createRoom('world', {})) as WorldRoom;
     const owner = await wallUp(room, 'acct_swing', WALL, 'wood_wall');
     // A wood pile just outside the wall, with the player just inside it.
@@ -260,8 +261,57 @@ describe('WorldRoom swinging near a wall (D64)', () => {
     owner.send('command', command({ type: 'hitNode', nodeId: 'node_wall' }));
     const result = await owner.waitForMessage('commandResult');
 
+    expect(result.accepted).toBe(false);
+    expect(result.reasonCode).toBe('out_of_range');
+    expect(room.countForTest('acct_swing', 'wood')).toBe(0);
+
+    owner.leave();
+  });
+
+  it('still pays out when the player steps round to the same side of it', async () => {
+    // The control: the refusal above has to be the wall, not the distance.
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const owner = await wallUp(room, 'acct_swing_ok', WALL, 'wood_wall');
+    room.spawnNode('node_open', 'wood', 150, 10, { x: 42, y: 0.5, z: 39 });
+    room.teleportForTest('acct_swing_ok', { x: 42, y: 0, z: 38 });
+
+    owner.send('command', command({ type: 'hitNode', nodeId: 'node_open' }));
+    const result = await owner.waitForMessage('commandResult');
+
     expect(result.accepted, result.reasonCode).toBe(true);
-    expect(room.countForTest('acct_swing', 'wood')).toBeGreaterThan(0);
+    expect(room.countForTest('acct_swing_ok', 'wood')).toBeGreaterThan(0);
+
+    owner.leave();
+  });
+
+  it('refuses a wolf on the far side, so a wall is not a free kill box', async () => {
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const owner = await wallUp(room, 'acct_boxer', WALL, 'wood_wall');
+    room.teleportForTest('acct_boxer', { x: 42, y: 0, z: 41 });
+    room.spawnCreature('wolf_outside', 'wolf', { x: 42, y: 0, z: 39 });
+
+    owner.send('command', command({ type: 'attackCreature', creatureId: 'wolf_outside' }));
+    const result = await owner.waitForMessage('commandResult');
+
+    expect(result.accepted).toBe(false);
+    expect(result.reasonCode).toBe('out_of_range');
+    expect(room.creatureForTest('wolf_outside')!.health).toBe(100);
+
+    owner.leave();
+  });
+
+  it('still lets a player break the wall that is in the way', async () => {
+    // Otherwise line of sight would make every wall indestructible: the piece
+    // a swing aims at must not count as the barrier blocking that swing.
+    const room = (await colyseus.createRoom('world', {})) as WorldRoom;
+    const owner = await wallUp(room, 'acct_breaker', WALL, 'wood_wall');
+    room.teleportForTest('acct_breaker', { x: 42, y: 0, z: 41 });
+
+    owner.send('command', command({ type: 'attackStructure', door: false, ...WALL }));
+    const result = await owner.waitForMessage('commandResult');
+
+    expect(result.accepted, result.reasonCode).toBe(true);
+    expect(room.state.buildingPieces.get(siteKey(WALL))!.health).toBeLessThan(1000);
 
     owner.leave();
   });

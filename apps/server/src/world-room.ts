@@ -1754,7 +1754,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     if (!door && getBuildingPiece(piece.definitionId)?.combatImmune) {
       return { ...base, accepted: false, reasonCode: 'forbidden' };
     }
-    if (!this.isWithinReach(accountId, worldPositionOf(site) as Vec3)) {
+    if (!this.canReachThrough(accountId, worldPositionOf(site) as Vec3)) {
       return { ...base, accepted: false, reasonCode: 'out_of_range' };
     }
     if (this.isSwingOnCooldown(accountId)) return { ...base, accepted: false, reasonCode: 'rate_limited' };
@@ -2115,7 +2115,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     const deployable = this.deployables.get(deployableId);
     const replicated = this.state.deployables.get(deployableId);
     if (!deployable || !replicated) return { ...base, accepted: false, reasonCode: 'not_found' };
-    if (!this.isWithinReach(accountId, { ...deployable.position })) {
+    if (!this.canReachThrough(accountId, { ...deployable.position })) {
       return { ...base, accepted: false, reasonCode: 'out_of_range' };
     }
     if (this.isSwingOnCooldown(accountId)) return { ...base, accepted: false, reasonCode: 'rate_limited' };
@@ -2591,7 +2591,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     const base = { sequence, serverTick: this.state.tick };
     const creature = this.creatures.get(creatureId);
     if (!creature) return { ...base, accepted: false, reasonCode: 'not_found' };
-    if (!this.isWithinReach(accountId, creature.position)) {
+    if (!this.canReachThrough(accountId, creature.position)) {
       return { ...base, accepted: false, reasonCode: 'out_of_range' };
     }
     if (this.isSwingOnCooldown(accountId)) return { ...base, accepted: false, reasonCode: 'rate_limited' };
@@ -2626,7 +2626,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     const base = { sequence, serverTick: this.state.tick };
     const carcass = this.carcasses.get(carcassId);
     if (!carcass) return { ...base, accepted: false, reasonCode: 'not_found' };
-    if (!this.isWithinReach(accountId, carcass.position)) {
+    if (!this.canReachThrough(accountId, carcass.position)) {
       return { ...base, accepted: false, reasonCode: 'out_of_range' };
     }
     if (this.isSwingOnCooldown(accountId)) return { ...base, accepted: false, reasonCode: 'rate_limited' };
@@ -2869,7 +2869,11 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
    * absorbs the latency between the client deciding it is in range and the
    * command landing.
    */
-  /** Plain distance. What a swing uses; see canReachThrough for the rest. */
+  /**
+   * Plain distance, with no wall in the question. Everything a player aims at
+   * goes through canReachThrough now (D85); this is what that check is built
+   * on, and what the server uses where the target is the barrier itself.
+   */
   private isWithinReach(accountId: string, target: Vec3): boolean {
     const movement = this.movementByAccount.get(accountId);
     if (!movement) return false;
@@ -2885,11 +2889,12 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
    * decoration and its door is the only thing doing any work, which
    * contradicts GDD section 8's "doors supply security".
    *
-   * Used by everything that reaches *for* something -- containers, corpses,
-   * stations, doors and world items. Swings deliberately do not: GDD has no
-   * rule against hitting what is on the far side of a wall, and T20's "no
-   * wall attacks" constrains animals rather than players, so denying it would
-   * be inventing a rule. It also keeps the wall scan off the 20 Hz swing path.
+   * Used by everything a player aims at: containers, corpses, stations, doors,
+   * world items and -- since D85 -- every swing. GDD section 7 is explicit
+   * that "swing timing, reach and line of sight determine every successful
+   * hit", which D64 had read the other way round. A swing at the barrier
+   * itself still lands: the segment from the player ends *on* that wall
+   * rather than crossing it, so a wall never blocks the blow aimed at it.
    */
   private canReachThrough(accountId: string, target: Vec3): boolean {
     if (!this.isWithinReach(accountId, target)) return false;
@@ -3531,7 +3536,7 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     if (!node || !config) {
       return { ...base, accepted: false, reasonCode: 'not_found' };
     }
-    if (!this.isWithinReach(accountId, config.position)) {
+    if (!this.canReachThrough(accountId, config.position)) {
       return { ...base, accepted: false, reasonCode: 'out_of_range' };
     }
     const lastSwing = this.lastSwingTick.get(accountId);
