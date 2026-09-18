@@ -14,6 +14,14 @@ export const PLACEMENT_CLEARANCE_M = 1;
  * always going to refuse, and the key looked broken.
  */
 export const INTERACT_REACH_M = 2.5;
+/**
+ * Slack the server allows on that reach, because the client decides it is in
+ * range from a position that is always a little behind the server's. Shared
+ * for the same reason the reach itself is: a client that aims at the bare
+ * reach under-reaches, and silently ignores targets the server would have
+ * accepted -- which looks exactly like a broken key.
+ */
+export const INTERACT_REACH_TOLERANCE_M = 1;
 /** GDD section 10: "max 400 structural pieces and 100 deployables per owner". */
 export const DEPLOYABLES_PER_OWNER = 100;
 /** GDD section 10: "a 6000-world-entity build/deployable cap bound growth". */

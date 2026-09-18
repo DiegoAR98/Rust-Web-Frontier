@@ -80,6 +80,7 @@ import {
   footprintSegments,
   DEPLOYABLE_FOOTPRINT_M,
   INTERACT_REACH_M,
+  INTERACT_REACH_TOLERANCE_M,
   startQueueEntry,
   stepMovement,
   stepStation,
@@ -131,13 +132,7 @@ export const MOVE_INTENT_GRACE_TICKS = 5;
 const DEFAULT_YIELD_PER_HIT: Record<string, number> = { wood: 10 };
 // The placeholder hot-ore zone lives in @rwf/sim; see HAZARD_ZONE_CENTER there.
 // INTERACT_REACH_M now lives in @rwf/sim, so the client aims at the same figure.
-/**
- * Slack on the server's reach check. The client decides it is in range from
- * the position it has, which is always a little behind the server's; at
- * SPRINT 5.5 m/s a ~180ms round trip is about a metre of travel. Generous
- * enough never to refuse honest play, far too tight to farm from across the map.
- */
-const INTERACT_REACH_TOLERANCE_M = 1;
+// INTERACT_REACH_TOLERANCE_M now lives in @rwf/sim beside the reach itself.
 /**
  * How far a builder can snap a piece. GDD section 10 gives no figure, and the
  * interact reach is too short for it: a 4 m cell's centre is 2.8 m from the

@@ -18,6 +18,7 @@ import { PROTOCOL_VERSION } from '@rwf/protocol';
 import {
   CREATURE_SPECS,
   INTERACT_REACH_M,
+  INTERACT_REACH_TOLERANCE_M,
   PLACEMENT_CLEARANCE_M,
   HAZARD_ZONE_CENTER,
   HAZARD_ZONE_RADIUS_M,
@@ -229,6 +230,9 @@ const PIECE_MAX_HP: Record<string, number> = {
 const DOOR_MAX_HP: Record<string, number> = { wood_door: 500, metal_door: 1000 };
 /** CONTENT section 7's placed HP for deployables, on the same footing. */
 const DEPLOYABLE_MAX_HP: Record<string, number> = { small_crate: 250, bedroll: 200 };
+
+/** The furthest the server will accept a repair from, so the picker matches it. */
+const REPAIR_PICK_REACH_M = INTERACT_REACH_M + INTERACT_REACH_TOLERANCE_M;
 
 /** The box each structural form is drawn as, in metres (GDD section 10's grid). */
 const PIECE_SHAPES: Record<string, { width: number; height: number; depth: number }> = {
@@ -1028,10 +1032,12 @@ function attemptRepair(): void {
       axis: piece.axis === '' ? null : (piece.axis as 'x' | 'z'),
     };
     const at = worldPositionOf(site);
-    // The server's own reach, not a rounder number: aiming past it made P a
-    // dead key wherever a more damaged wall sat just out of range, since the
-    // client picked that one and the server refused it every time.
-    if (Vector3.Distance(camera.position, new Vector3(at.x, at.y, at.z)) > INTERACT_REACH_M) continue;
+    // What the server actually accepts, tolerance included. Aiming further
+    // made P a dead key wherever a more damaged wall sat out of range -- the
+    // client picked that one and the server refused it every time -- but
+    // aiming at the bare reach is the same fault mirrored, silently skipping
+    // walls the server would have taken. A refusal at least says so.
+    if (Vector3.Distance(camera.position, new Vector3(at.x, at.y, at.z)) > REPAIR_PICK_REACH_M) continue;
 
     const door = room.state.doors.get(key);
     const candidates: Array<{ health: number; max: number; door: boolean }> = [
