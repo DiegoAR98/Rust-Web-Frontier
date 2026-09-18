@@ -15,11 +15,8 @@ interface Ground {
  * use: a box's own centre is inside its own footprint, so a crate that occluded
  * a reach would be a crate nobody could open.
  *
- * Known degeneracy, inherited from segmentsCross and the same one that keeps a
- * wall from welding a player in place: a path that passes exactly through two
- * opposite corners touches only endpoints, and so is not blocked. It needs the
- * player's line to hit both corners to floating-point precision, and the price
- * of closing it is a fudge factor that would start trapping people.
+ * Corner intersections block movement too, preventing a diagonal through
+ * opposite corners from bypassing the footprint.
  */
 export function footprintSegments(centre: Ground, sizeM: number): GroundSegment[] {
   if (sizeM <= 0) return [];
@@ -53,13 +50,13 @@ export function footprintSegments(centre: Ground, sizeM: number): GroundSegment[
  * the step does not happen, which is what being sealed in a room is.
  */
 export function resolveMove(from: Ground, to: Ground, barriers: GroundSegment[]): Ground {
-  if (!isReachBlocked(from, to, barriers)) return to;
+  if (!isReachBlocked(from, to, barriers, true)) return to;
 
   const alongX = { x: to.x, z: from.z };
-  if (!isReachBlocked(from, alongX, barriers)) return alongX;
+  if (!isReachBlocked(from, alongX, barriers, true)) return alongX;
 
   const alongZ = { x: from.x, z: to.z };
-  if (!isReachBlocked(from, alongZ, barriers)) return alongZ;
+  if (!isReachBlocked(from, alongZ, barriers, true)) return alongZ;
 
   return from;
 }

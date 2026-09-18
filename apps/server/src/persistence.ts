@@ -546,6 +546,13 @@ export class WorldStore {
    * transaction key exists to provide, so the whole thing commits or none of
    * it does.
    */
+  loadOutcome(key: TransactionKey): string | undefined {
+    const row = this.db.prepare(
+      'SELECT outcome FROM transactions WHERE account_id = ? AND session_epoch = ? AND sequence = ?',
+    ).get(key.accountId, key.sessionEpoch, key.sequence) as TransactionRow | undefined;
+    return row?.outcome;
+  }
+
   commitOutcome(key: TransactionKey, computeOutcome: () => string): string {
     if (!Number.isSafeInteger(key.sessionEpoch) || !Number.isSafeInteger(key.sequence)) {
       throw new RangeError('transaction key requires safe-integer sessionEpoch and sequence');

@@ -27,11 +27,11 @@ function cross(ax: number, az: number, bx: number, bz: number): number {
 }
 
 /**
- * Whether two ground segments properly cross. Touching at an endpoint or
- * lying along the same line does not count: a player standing exactly on a
- * wall's line, past its end, has not reached through anything.
+ * Whether a path crosses a barrier, including its corners. Reach can end on
+ * a barrier (to operate a door); movement cannot land on one and then step
+ * through on the next tick. Starting on a barrier still permits escape.
  */
-function segmentsCross(a: GroundSegment, b: GroundSegment): boolean {
+function segmentsCross(a: GroundSegment, b: GroundSegment, includeDestination: boolean): boolean {
   const rx = a.x2 - a.x1;
   const rz = a.z2 - a.z1;
   const sx = b.x2 - b.x1;
@@ -41,7 +41,7 @@ function segmentsCross(a: GroundSegment, b: GroundSegment): boolean {
 
   const t = cross(b.x1 - a.x1, b.z1 - a.z1, sx, sz) / denominator;
   const u = cross(b.x1 - a.x1, b.z1 - a.z1, rx, rz) / denominator;
-  return t > 0 && t < 1 && u > 0 && u < 1;
+  return t > 0 && (includeDestination ? t <= 1 : t < 1) && u >= 0 && u <= 1;
 }
 
 /**
@@ -58,7 +58,8 @@ export function isReachBlocked(
   from: { x: number; z: number },
   to: { x: number; z: number },
   barriers: GroundSegment[],
+  includeDestination = false,
 ): boolean {
   const reach: GroundSegment = { x1: from.x, z1: from.z, x2: to.x, z2: to.z };
-  return barriers.some((barrier) => segmentsCross(reach, barrier));
+  return barriers.some((barrier) => segmentsCross(reach, barrier, includeDestination));
 }

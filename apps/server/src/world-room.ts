@@ -3012,6 +3012,13 @@ export class WorldRoom extends Room<{ state: WorldState; client: RoomClient }> {
     }
 
     const key = { accountId, sessionEpoch: command.sessionEpoch, sequence: command.sequence };
+    if (command.action.type !== 'move' && this.deadAccounts.has(accountId)) {
+      const prior = this.store.loadOutcome(key);
+      if (prior !== undefined) {
+        client.send('commandResult', JSON.parse(prior) as CommandResult);
+        return;
+      }
+    }
 
     // GDD section 12 marks a dead account dead until it respawns: it has no
     // live character, so nothing but the respawn itself can be acted on.
